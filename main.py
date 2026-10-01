@@ -1,5 +1,6 @@
 """出席ツールの実行入口。"""
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -8,20 +9,26 @@ from src.config import ConfigurationError, load_config
 from src.credentials import CredentialError, get_credentials
 from src.logging_utils import setup_logging
 from src.verification import AttendanceError
-from src.room import RoomError, ask_room
+from src.room import RoomError, ask_room, parse_room
 
 
 VERSION = "0.1.0"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="att", description="大学の出席画面を確認・登録します。")
+    parser.add_argument("room", nargs="?", help="教室番号（例: 642、731）。省略時は入力します。")
+    parser.add_argument("--check", action="store_true", help="登録せずに状態だけ確認します。")
+    args = parser.parse_args(argv)
     base = Path(__file__).resolve().parent
     started = time.monotonic()
     logger = setup_logging(base)
     logger.info("起動 version=%s", VERSION)
     try:
         config = load_config(base / "config.json")
-        room, route = ask_room()
+        room, route = parse_room(args.room) if args.room is not None else ask_room()
+        if args.check:
+            config["dry_run"] = True
         student_id, password = get_credentials(config, base / "config.json")
         try:
             from src.browser import open_page

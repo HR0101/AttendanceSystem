@@ -1,0 +1,14 @@
+#!/bin/sh
+script_path=$0
+while [ -L "$script_path" ]; do
+  link_target=$(readlink "$script_path") || exit 1
+  case "$link_target" in
+    /*) script_path=$link_target ;;
+    *) script_path=$(dirname "$script_path")/$link_target ;;
+  esac
+done
+tool_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd) || exit 1
+if [ -x "$tool_dir/.venv/bin/python" ]; then
+  exec "$tool_dir/.venv/bin/python" "$tool_dir/main.py" "$@"
+fi
+exec python3 "$tool_dir/main.py" "$@"
