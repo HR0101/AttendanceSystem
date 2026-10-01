@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# Environment & Local settings
+config.json
+browser_data/
+logs/
+
+# Original HTML and assets
+*.html
+*_files/
+
+# OS & Archives
+.DS_Store
+*.zip
