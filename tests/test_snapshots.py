@@ -83,6 +83,32 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result, "履修登録なし（出席操作なし）")
         self.assertEqual(attempted_posts, [])
 
+    def test_scheduled_course_mismatch_stops_before_click(self):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        html = (ROOT / "出席確認画面未出席.html").read_text(encoding="utf-8")
+        html = re.sub(r"学籍番号：[^ ]+ でログイン中", "学籍番号：TEST001 でログイン中", html)
+        attempted_posts = []
+
+        def serve(route):
+            if route.request.method != "GET":
+                attempted_posts.append(route.request.url)
+                route.abort()
+            elif route.request.url.endswith("/attendance/class_room/7301"):
+                route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8")
+            else:
+                route.abort()
+
+        page.route("**/*", serve)
+        config = {
+            "login_url": "https://attendance.is.chibatech.ac.jp/attendance/login",
+            "top_url": "https://attendance.is.it-chiba.ac.jp/attendance/top",
+            "dry_run": False,
+        }
+        with self.assertRaises(AttendanceError):
+            run_attendance(page, config, "TEST001", "dummy", "731", "7301", Mock(), "別の授業", "10:00")
+        self.assertEqual(attempted_posts, [])
+
     def test_login_id_k_prefix_matches_displayed_student_id(self):
         page = self.page_for("出席確認画面履修登録なし.html")
         require_student_identity(page, "K24G1111")

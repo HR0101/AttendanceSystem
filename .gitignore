@@ -6,6 +6,7 @@ __pycache__/
 
 # Environment & Local settings
 config.json
+schedule.json
 browser_data/
 logs/
 

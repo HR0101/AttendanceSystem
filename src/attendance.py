@@ -14,7 +14,7 @@ def _require_known_page(page, config: dict, route: str) -> None:
         raise AttendanceError("想定外の画面です。画面の変更または追加認証を確認してください。")
 
 
-def run_attendance(page, config: dict, student_id: str, password: str, room: str, route: str, logger) -> str:
+def run_attendance(page, config: dict, student_id: str, password: str, room: str, route: str, logger, expected_course: str | None = None, expected_start: str | None = None) -> str:
     login = urlparse(config["login_url"])
     room_url = urlunparse(("https", login.netloc, f"/attendance/class_room/{route}", "", "", ""))
     logger.info("段階=教室URLへアクセス")
@@ -51,6 +51,10 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
     if no_active_class(page):
         return "出席受付対象なし（受付時間外の可能性・出席操作なし）"
     values = require_target(page, room)
+    if expected_course and values["授業名"] != normalized(expected_course):
+        raise AttendanceError("予定した授業名と画面の授業名が一致しません。")
+    if expected_start and values["開始時刻"] != expected_start:
+        raise AttendanceError("予定した開始時刻と画面の開始時刻が一致しません。")
     logger.info("対象授業を確認")
     if enrollment_warning(page):
         if is_attended(page):

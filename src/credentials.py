@@ -15,7 +15,7 @@ class CredentialError(Exception):
     pass
 
 
-def get_credentials(config: dict, path: Path) -> tuple[str, str]:
+def get_credentials(config: dict, path: Path, interactive: bool = True) -> tuple[str, str]:
     if sys.platform != "darwin":
         raise CredentialError("認証情報の保存には macOS Keychain が必要です。")
     try:
@@ -29,6 +29,8 @@ def get_credentials(config: dict, path: Path) -> tuple[str, str]:
 
     student_id = config.get("student_id", "").strip()
     if not student_id:
+        if not interactive:
+            raise CredentialError("学生番号が未設定です。手動で一度起動してください。")
         student_id = input("学生番号: ").strip()
         if not student_id or any(char.isspace() for char in student_id):
             raise CredentialError("学生番号を確認してください。")
@@ -37,6 +39,8 @@ def get_credentials(config: dict, path: Path) -> tuple[str, str]:
     try:
         password = keyring.get_password(SERVICE, student_id)
         if password is None:
+            if not interactive:
+                raise CredentialError("Keychainにパスワードがありません。手動で一度起動してください。")
             password = getpass.getpass("パスワード (macOS Keychain に保存): ")
             if not password:
                 raise CredentialError("パスワードが入力されていません。")
