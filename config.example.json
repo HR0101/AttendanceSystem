@@ -3,7 +3,7 @@
   "top_url": "https://attendance.is.it-chiba.ac.jp/attendance/top",
   "student_id": "",
   "browser": {
-    "headless": false,
+    "headless": true,
     "timeout_ms": 15000
   },
   "dry_run": false
