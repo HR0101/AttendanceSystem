@@ -15,7 +15,7 @@ from src.verification import (
 
 CONFIG = {
     "login_url": "https://attendance.is.chibatech.ac.jp/attendance/login",
-    "top_url": "https://attendance.is.it-chiba.ac.jp/attendance/top",
+    "top_url": "https://attendance.is.chibatech.ac.jp/attendance/top",
     "dry_run": False,
 }
 

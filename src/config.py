@@ -31,6 +31,8 @@ def load_config(path: Path) -> dict:
             raise ConfigurationError(f"{key} のパスを確認してください。")
         if parsed.query or parsed.fragment:
             raise ConfigurationError(f"{key} にクエリやフラグメントは指定できません。")
+    if urlparse(config["login_url"]).hostname != urlparse(config["top_url"]).hostname:
+        raise ConfigurationError("login_url と top_url のホスト名を一致させてください。")
     student_id = config.get("student_id", "")
     if not isinstance(student_id, str):
         raise ConfigurationError("student_id は文字列にしてください。")
