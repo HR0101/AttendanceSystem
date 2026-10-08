@@ -24,7 +24,8 @@ def require_student_identity(page, login_id: str) -> None:
         raise AttendanceError("ログイン中の学籍番号が入力したIDと一致しません。")
 
 
-def require_target(page, room: str) -> dict:
+def require_target(page) -> dict:
+    """授業情報を読む。QRのURL番号と授業の教室名は独立した情報。"""
     if page.locator(".table_list").count() != 1:
         raise AttendanceError("授業情報の表を特定できません。")
     rows = page.locator(".table_list tr")
@@ -36,8 +37,6 @@ def require_target(page, room: str) -> dict:
     for label in ("授業名", "時限", "教室名", "開始時刻", "終了時刻"):
         if not values.get(label):
             raise AttendanceError(f"授業情報の {label} を確認できません。")
-    if not re.search(rf"(?<!\d){re.escape(room)}(?!\d)", values["教室名"]):
-        raise AttendanceError("画面の教室番号が入力値と一致しません。")
     return values
 
 

@@ -60,18 +60,18 @@ class SnapshotTests(unittest.TestCase):
 
     def test_unattended_page(self):
         page = self.page_for(attendance_html())
-        self.assertEqual(require_target(page, "731")["授業名"], "テスト授業")
+        self.assertEqual(require_target(page)["授業名"], "テスト授業")
         self.assertFalse(is_attended(page))
         self.assertFalse(enrollment_warning(page))
 
     def test_attended_page(self):
         page = self.page_for(attendance_html(attended=True))
-        require_target(page, "731")
+        require_target(page)
         self.assertTrue(is_attended(page))
 
     def test_unenrolled_page(self):
         page = self.page_for(attendance_html(unenrolled=True))
-        require_target(page, "731")
+        require_target(page)
         self.assertTrue(enrollment_warning(page))
         self.assertFalse(is_attended(page))
 
@@ -81,7 +81,7 @@ class SnapshotTests(unittest.TestCase):
         page.set_content('<div class="panel active">画面の仕様が変更されました。</div>')
         self.assertFalse(no_active_class(page))
 
-    def run_with_mocked_page(self, html, expected_course=None, expected_start=None):
+    def run_with_mocked_page(self, html, expected_course=None, expected_start=None, *, room="731", route_id="7301", config=None, on_snapshot=None, expected_values=None, posted_html=None):
         page = self.browser.new_page()
         self.addCleanup(page.close)
         attempted_posts = []
@@ -89,16 +89,20 @@ class SnapshotTests(unittest.TestCase):
         def serve(route):
             if route.request.method != "GET":
                 attempted_posts.append(route.request.url)
-                route.abort()
-            elif route.request.url.endswith("/attendance/class_room/7301"):
+                if posted_html is not None:
+                    route.fulfill(status=200, body=posted_html, content_type="text/html; charset=utf-8")
+                else:
+                    route.abort()
+            elif route.request.url.endswith(f"/attendance/class_room/{route_id}"):
                 route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8")
             else:
                 route.abort()
 
         page.route("**/*", serve)
         result = run_attendance(
-            page, CONFIG, "TEST001", "dummy", "731", "7301", Mock(),
+            page, CONFIG if config is None else config, "TEST001", "dummy", room, route_id, Mock(),
             expected_course, expected_start,
+            on_snapshot=on_snapshot, expected_values=expected_values,
         )
         return result, attempted_posts
 
@@ -118,10 +122,39 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(AttendanceError):
             require_student_identity(page, "K99X0001")
 
-    def test_wrong_room_stops(self):
-        page = self.page_for(attendance_html())
+    def test_qr_number_can_differ_from_classroom(self):
+        html = attendance_html().replace("７３１講義室", "４３２講義室")
+        snapshot = Mock()
+        result, posts = self.run_with_mocked_page(html, room="435", route_id="435", config=dict(CONFIG, dry_run=True), on_snapshot=snapshot)
+        self.assertEqual(result, "未出席（確認のみ）")
+        self.assertEqual(snapshot.call_args.args[0]["教室名"], "432講義室")
+        self.assertEqual(posts, [])
+
+    def test_registration_with_different_qr_and_classroom(self):
+        html = attendance_html().replace("７３１講義室", "４３２講義室")
+        values = require_target(self.page_for(html))
+        html = html.replace('<button id="attend">', '<button type="button" id="attend" onclick="document.querySelector(\'#confirmModal\').hidden=false">')
+        html += '<div id="confirmModal" hidden><div class="dialog_body">テスト授業 2-3限 432講義室 10:00 12:00</div><form method="post"><button id="ok_confirmModal">登録</button></form></div>'
+        posted_html = attendance_html(attended=True).replace("７３１講義室", "４３２講義室")
+        result, posts = self.run_with_mocked_page(html, room="435", route_id="435", expected_values=values, posted_html=posted_html)
+        self.assertEqual(result, "出席登録成功")
+        self.assertEqual(posts, [CONFIG["top_url"].replace("/top", "/class_room/435")])
+
+    def test_changed_classroom_stops_before_registration(self):
+        html = attendance_html().replace("７３１講義室", "４３２講義室")
+        values = require_target(self.page_for(html))
+        changed = html.replace("４３２講義室", "４３３講義室")
+        with self.assertRaisesRegex(AttendanceError, "授業情報が変更"):
+            self.run_with_mocked_page(changed, room="435", route_id="435", expected_values=values)
+
+    def test_wrong_url_stops(self):
+        from src.attendance import _require_known_page
+        page = Mock(url=CONFIG["top_url"].replace("/top", "/class_room/432"))
         with self.assertRaises(AttendanceError):
-            require_target(page, "642")
+            _require_known_page(page, CONFIG, "435", require_room=True)
+        page.url = CONFIG["top_url"]
+        with self.assertRaises(AttendanceError):
+            _require_known_page(page, CONFIG, "435", require_room=True)
 
     def test_login_button_requires_keyup(self):
         page = self.page_for("""<input id="userid" name="username">
