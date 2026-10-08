@@ -36,6 +36,8 @@ def load_config(path: Path) -> dict:
     student_id = config.get("student_id", "")
     if not isinstance(student_id, str):
         raise ConfigurationError("student_id は文字列にしてください。")
+    from .users import validate_users
+    validate_users(config)
     browser = config.get("browser", {})
     if not isinstance(browser, dict) or not isinstance(browser.get("headless"), bool):
         raise ConfigurationError("browser.headless は true または false にしてください。")
