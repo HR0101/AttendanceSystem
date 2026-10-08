@@ -8,6 +8,64 @@ from .credentials import CredentialError, SERVICE, _save_private_json, keychain_
 from .users import get_users, select_user, valid_username
 
 
+def add_user(base, name, student_id, password):
+    path = base / "config.json"
+    config = load_config(path)
+    users = get_users(config)
+    default = select_user(config)
+    if not valid_username(name):
+        raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
+    if not student_id or not student_id.isascii() or not student_id.isalnum():
+        raise CredentialError("学生番号は半角英数字で入力してください。")
+    if any(u["username"] == name or u["student_id"] == student_id for u in users):
+        raise CredentialError("そのユーザーネームまたは学生番号は登録済みです。")
+    if not password:
+        raise CredentialError("パスワードが入力されていません。")
+    backend = keychain_backend()
+    try:
+        backend.set_password(SERVICE, student_id, password)
+        if backend.get_password(SERVICE, student_id) != password:
+            raise CredentialError("Keychain への保存を確認できません。")
+    except CredentialError:
+        raise
+    except Exception as exc:
+        raise CredentialError("Keychain の操作に失敗しました。") from exc
+    config["users"] = users + [{"username": name, "student_id": student_id}]
+    config["default_user"] = default["username"] if default else name
+    _save_private_json(path, config)
+    return config
+
+
+def use_user(base, name):
+    path = base / "config.json"
+    config = load_config(path)
+    user = select_user(config, name)
+    config["users"] = get_users(config)
+    config["default_user"] = user["username"]
+    _save_private_json(path, config)
+    return config
+
+
+def rename_user(base, name, new_name):
+    path = base / "config.json"
+    config = load_config(path)
+    user = select_user(config, name)
+    default = select_user(config)
+    users = get_users(config)
+    if not valid_username(new_name):
+        raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
+    if any(u["username"] == new_name and u["student_id"] != user["student_id"] for u in users):
+        raise CredentialError("そのユーザーネームは登録済みです。")
+    for entry in users:
+        if entry["student_id"] == user["student_id"]:
+            entry["username"] = new_name
+    if default == user:
+        config["default_user"] = new_name
+    config["users"] = users
+    _save_private_json(path, config)
+    return config
+
+
 def user_command(base, argv):
     parser = argparse.ArgumentParser(prog="att user", description="利用者を管理します。")
     commands = parser.add_subparsers(dest="action", required=True)
@@ -44,37 +102,18 @@ def user_command(base, argv):
                 raise CredentialError("学生番号は半角英数字で入力してください。")
             if any(u["username"] == name or u["student_id"] == student_id for u in users):
                 raise CredentialError("そのユーザーネームまたは学生番号は登録済みです。表示名の変更には att user rename を使ってください。")
-            backend = keychain_backend()
             password = getpass.getpass("パスワード (macOS Keychain に保存): ")
-            if not password:
-                raise CredentialError("パスワードが入力されていません。")
             try:
-                backend.set_password(SERVICE, student_id, password)
-                if backend.get_password(SERVICE, student_id) != password:
-                    raise CredentialError("Keychain への保存を確認できません。")
+                add_user(base, name, student_id, password)
             finally:
                 del password
-            users.append({"username": name, "student_id": student_id})
-            config["default_user"] = default["username"] if default else name
             message = f"ユーザー「{name}」を登録しました。"
         elif args.action == "use":
-            user = select_user(config, args.username)
-            config["default_user"] = user["username"]
-            message = f"既定ユーザーを「{user['username']}」に変更しました。"
+            use_user(base, args.username)
+            message = f"既定ユーザーを「{args.username}」に変更しました。"
         else:
-            user = select_user(config, args.username)
-            if not valid_username(args.new_name):
-                raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
-            if any(u["username"] == args.new_name and u["student_id"] != user["student_id"] for u in users):
-                raise CredentialError("そのユーザーネームは登録済みです。")
-            for entry in users:
-                if entry["student_id"] == user["student_id"]:
-                    entry["username"] = args.new_name
-            if default == user:
-                config["default_user"] = args.new_name
+            rename_user(base, args.username, args.new_name)
             message = f"ユーザーネームを「{args.new_name}」に変更しました。"
-        config["users"] = users
-        _save_private_json(path, config)
         print(message)
         return 0
     except (ConfigurationError, CredentialError, OSError) as exc:

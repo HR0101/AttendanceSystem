@@ -14,8 +14,8 @@ from src.verification import (
 
 
 CONFIG = {
-    "login_url": "https://attendance.is.chibatech.ac.jp/attendance/login",
-    "top_url": "https://attendance.is.chibatech.ac.jp/attendance/top",
+    "login_url": "https://attendance.example.test/attendance/login",
+    "top_url": "https://attendance.example.test/attendance/top",
     "dry_run": False,
 }
 
@@ -81,7 +81,7 @@ class SnapshotTests(unittest.TestCase):
         page.set_content('<div class="panel active">画面の仕様が変更されました。</div>')
         self.assertFalse(no_active_class(page))
 
-    def run_with_mocked_page(self, html, expected_course=None, expected_start=None, *, room="731", route_id="7301", config=None, on_snapshot=None, expected_values=None, posted_html=None):
+    def run_with_mocked_page(self, html, expected_course=None, expected_start=None, *, room="731", route_id="7301", config=None, on_snapshot=None, expected_values=None, posted_html=None, redirect_to_top=False):
         page = self.browser.new_page()
         self.addCleanup(page.close)
         attempted_posts = []
@@ -94,6 +94,13 @@ class SnapshotTests(unittest.TestCase):
                 else:
                     route.abort()
             elif route.request.url.endswith(f"/attendance/class_room/{route_id}"):
+                if redirect_to_top:
+                    # Playwright のHTTPリダイレクトは後続リクエストに route が
+                    # 適用されないため、通信せずに遷移後のURLを再現する。
+                    route.fulfill(status=200, body=html + "<script>history.replaceState(null, '', '/attendance/top');</script>", content_type="text/html; charset=utf-8")
+                else:
+                    route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8")
+            elif redirect_to_top and route.request.url == CONFIG["top_url"]:
                 route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8")
             else:
                 route.abort()
@@ -147,14 +154,36 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(AttendanceError, "授業情報が変更"):
             self.run_with_mocked_page(changed, room="435", route_id="435", expected_values=values)
 
+    def test_attended_classroom_redirected_to_top_updates_snapshot(self):
+        html = attendance_html(attended=True).replace("７３１講義室", "４３２講義室")
+        snapshot = Mock()
+        result, posts = self.run_with_mocked_page(html, room="435", route_id="435", on_snapshot=snapshot, redirect_to_top=True)
+        self.assertEqual(result, "出席済み")
+        self.assertEqual(snapshot.call_args.args[0]["教室名"], "432講義室")
+        self.assertTrue(snapshot.call_args.args[1])
+        self.assertEqual(posts, [])
+
+    def test_unattended_classroom_redirected_to_top_can_be_checked(self):
+        snapshot = Mock()
+        result, posts = self.run_with_mocked_page(attendance_html(), config=dict(CONFIG, dry_run=True), on_snapshot=snapshot, redirect_to_top=True)
+        self.assertEqual(result, "未出席（確認のみ）")
+        self.assertFalse(snapshot.call_args.args[1])
+        self.assertEqual(posts, [])
+
+    def test_changed_course_after_redirect_still_stops(self):
+        with self.assertRaisesRegex(AttendanceError, "予定した授業名"):
+            self.run_with_mocked_page(attendance_html(), expected_course="別の授業", redirect_to_top=True)
+
     def test_wrong_url_stops(self):
         from src.attendance import _require_known_page
         page = Mock(url=CONFIG["top_url"].replace("/top", "/class_room/432"))
         with self.assertRaises(AttendanceError):
-            _require_known_page(page, CONFIG, "435", require_room=True)
+            _require_known_page(page, CONFIG, "435")
         page.url = CONFIG["top_url"]
+        _require_known_page(page, CONFIG, "435")
+        page.url = "https://unexpected.test/attendance/top"
         with self.assertRaises(AttendanceError):
-            _require_known_page(page, CONFIG, "435", require_room=True)
+            _require_known_page(page, CONFIG, "435")
 
     def test_login_button_requires_keyup(self):
         page = self.page_for("""<input id="userid" name="username">

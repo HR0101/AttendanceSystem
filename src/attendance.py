@@ -5,15 +5,13 @@ from urllib.parse import urlparse, urlunparse
 from .verification import AttendanceError, enrollment_warning, is_attended, no_active_class, normalized, require_student_identity, require_target
 
 
-def _require_known_page(page, config: dict, route: str, require_room: bool = False) -> None:
+def _require_known_page(page, config: dict, route: str) -> None:
     current = urlparse(page.url)
     allowed = {urlparse(config[key]).hostname for key in ("login_url", "top_url")}
     if current.scheme != "https" or current.hostname not in allowed:
         raise AttendanceError("想定外のサイトへ移動しました。手動認証が必要な場合は画面を確認してください。")
     if current.path not in ("/attendance/login", "/attendance/top", f"/attendance/class_room/{route}"):
         raise AttendanceError("想定外の画面です。画面の変更または追加認証を確認してください。")
-    if require_room and current.path != f"/attendance/class_room/{route}":
-        raise AttendanceError("指定したQR番号の出席画面を確認できません。")
 
 
 def run_attendance(page, config: dict, student_id: str, password: str, room: str, route: str, logger, expected_course: str | None = None, expected_start: str | None = None, on_snapshot=None, expected_values: dict | None = None) -> str:
@@ -46,7 +44,6 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
     _require_known_page(page, config, route)
     if urlparse(page.url).path == "/attendance/login":
         raise AttendanceError("教室URLへのアクセス後にログイン画面へ戻りました。")
-    _require_known_page(page, config, route, require_room=True)
     require_student_identity(page, student_id)
     if page.locator("#errorModal").count():
         raise AttendanceError("出席画面にエラーが表示されています。")
