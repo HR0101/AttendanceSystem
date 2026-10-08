@@ -12,6 +12,7 @@ from src.logging_utils import setup_logging
 from src.verification import AttendanceError
 from src.room import RoomError, ask_room, parse_room
 from src.scheduler import ScheduleError, agent_installed, due_course, install_agent, load_schedule, remove_agent
+from src.users import select_user
 
 
 VERSION = "0.1.0"
@@ -34,7 +35,7 @@ def schedule_command(argv: list[str]) -> int:
         config = load_config(base / "config.json")
         if not config["browser"]["headless"]:
             raise ScheduleError("自動実行には browser.headless を true にしてください。")
-        if not config["student_id"]:
+        if select_user(config) is None:
             raise ScheduleError("自動実行の前に手動でログインし、学生番号を保存してください。")
         path = install_agent(base, schedule)
         print(f"自動実行を登録しました: {path}")
@@ -48,12 +49,27 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "schedule":
         return schedule_command(argv[1:])
+    if argv and argv[0] == "user":
+        from src.user_commands import user_command
+        return user_command(Path(__file__).resolve().parent, argv[1:])
     parser = argparse.ArgumentParser(prog="att", description="大学の出席画面を確認・登録します。")
     parser.add_argument("room", nargs="?", help="教室番号（例: 642、731）。省略時は入力します。")
     parser.add_argument("--check", action="store_true", help="登録せずに状態だけ確認します。")
+    parser.add_argument("--ui", action="store_true", help="ターミナル内に出席確認画面を開きます。")
+    parser.add_argument("--demo", action="store_true", help="接続せずに出席確認画面を試します。")
+    parser.add_argument("--user", metavar="NAME", help="登録済みのユーザーネームを指定します。省略時は既定ユーザー。")
     parser.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     base = Path(__file__).resolve().parent
+    if args.demo and not args.ui:
+        parser.error("--demo は --ui と一緒に指定してください。")
+    if args.scheduled and args.user:
+        parser.error("自動実行は既定ユーザーを使います。att user use で変更してください。")
+    if (args.demo or args.ui) and args.scheduled:
+        parser.error("画面モードと自動実行は同時に指定できません。")
+    if args.ui:
+        from src.terminal_ui import launch_ui
+        return launch_ui(base, args.room, args.demo, args.check, args.user)
     started = time.monotonic()
     logger = setup_logging(base)
     logger.info("起動 version=%s", VERSION)
@@ -77,9 +93,10 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("自動実行対象 開始=%s 教室=%s", expected_start, room)
         else:
             room, route = parse_room(args.room) if args.room is not None else ask_room()
+        student_id, password = get_credentials(config, base / "config.json", interactive=not args.scheduled, username=args.user)
+        print(f"ユーザー: {config['_active_username']}（学生番号: {student_id}）")
         if args.check:
             config["dry_run"] = True
-        student_id, password = get_credentials(config, base / "config.json", interactive=not args.scheduled)
         try:
             from src.browser import open_page
             from src.attendance import run_attendance
