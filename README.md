@@ -5,12 +5,43 @@ macOS で、本人が受講する授業の出席画面を確認し、出席登�
 ## 動作環境
 
 - macOS、Python 3.10 以降
+- zsh または bash（自動セットアップ対応）
 - インターネット接続と対象大学の出席システムを利用できるアカウント
 - 初回セットアップ用のターミナル
 
 GUIはターミナル内で動作します。幅62文字・高さ24行以上が必要で、幅106文字以上では操作ガイドと今回の操作履歴も表示します。
 
 ## 使い方
+
+### ダウンロード・初回セットアップ
+
+Python 3.10以降を用意し、次のコマンドで取得・セットアップします。
+
+```sh
+git clone https://github.com/HR0101/AttendanceSystem.git
+cd AttendanceSystem
+bash install.sh
+```
+
+ZIPで取得する場合は、[GitHubリポジトリ](https://github.com/HR0101/AttendanceSystem)の「Code → Download ZIP」からダウンロード・展開し、フォルダ内の [install.command](install.command) をダブルクリックしてください。展開したフォルダで `bash install.sh` を実行する方法も使えます。
+
+セットアップは仮想環境・依存ライブラリ・Chromiumを導入し、初回のみ `config.json` を作成します。`att` コマンドの登録とPATH設定も自動で行うため、エイリアスやPATHを手動で設定する必要はありません。管理者権限は不要で、既存の設定ファイルや同名の別コマンドは上書きしません。
+
+### セットアップ後の起動
+
+新しいターミナルを開き、次を実行してください。`att` はどのフォルダからでも使えます。
+
+```sh
+att user add             # 自分の認証情報を登録
+att --ui                 # GUIを開く
+att --check 642          # 指定教室の出席状態を確認（登録しない）
+```
+
+今のターミナルですぐ使いたい場合や `att: command not found` が出る場合は、セットアップ完了時に表示される `source` コマンドを実行してください。通常のzsh環境では `source ~/.zshrc`、bashでは `source ~/.bash_profile` です。
+
+セットアップは `~/.local/bin/att` にリンクを作り、zshでは `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashでは `~/.bash_profile` にPATH設定を追加します。ダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行してください。
+
+### 詳しい操作方法
 
 セットアップ、出席登録、ユーザー管理、自動実行のコマンドとGUIの操作は、[コマンド・操作早見表（COMMANDS.md）](COMMANDS.md)にまとめています。
 
