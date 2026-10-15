@@ -1,6 +1,7 @@
 """画面で表示した授業の照合と登録可否を確認する。"""
 
 import unittest
+import curses
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
@@ -121,6 +122,32 @@ class TerminalUITests(unittest.TestCase):
         ui.poll()
         self.assertEqual(ui.status()[0], "現在の受付対象なし")
         self.assertFalse(ui.can_register())
+
+    def test_main_screen_can_open_schedule_without_attendance_lookup(self):
+        ui = self.demo_screen()
+        ui.room = ""
+        screen = Mock(getmaxyx=Mock(return_value=(24, 62)))
+        # Tabでも上キーでも、新しいボタンに移動して予定を開ける。
+        for keys in (("\t", "\t", "\t"), (curses.KEY_UP,)):
+            ui.selected = 0
+            ui.modal = None
+            screen.get_wch.side_effect = [*keys, "\n", "\x1b", "q"]
+
+            def open_schedule():
+                ui.modal = "schedule"
+
+            with patch.object(ui.schedule_panel, "open", side_effect=open_schedule) as open_panel, patch.object(ui, "start") as start, patch("src.terminal_ui.curses.has_colors", return_value=False):
+                self.assertEqual(ui.run(screen), 0)
+                open_panel.assert_called_once()
+                start.assert_not_called()
+
+    def test_schedule_button_is_visible_at_supported_widths(self):
+        ui = self.demo_screen()
+        for width in (62, 80, 120):
+            screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+            ui.draw(screen)
+            labels = [call.args[2] for call in screen.addstr.call_args_list]
+            self.assertIn(" [ スケジュール登録 S ] ", labels)
 
 
 if __name__ == "__main__":

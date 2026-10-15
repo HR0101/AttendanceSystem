@@ -2,7 +2,7 @@
 
 [READMEに戻る](README.md)
 
-コマンドはプロジェクトのフォルダ内で実行します。例の `642`・ユーザーネーム・学生番号は自分のものに置き換えてください。教室番号には、QRの出席URL用の番号を指定します。
+セットアップ後は、どのフォルダでも `att` で実行できます。以下の `./att` は `att` に置き換えられます。例の `642`・ユーザーネーム・学生番号は自分のものに置き換えてください。教室番号には、QRの出席URL用の番号を指定します。
 
 <a id="setup"></a>
 
@@ -11,14 +11,21 @@
 ```sh
 git clone https://github.com/HR0101/AttendanceSystem.git
 cd AttendanceSystem
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m playwright install chromium
-cp config.example.json config.json
-./att --check 642
+bash install.sh
 ```
 
-最後のコマンドで初回の認証情報を入力します。ZIPで取得した場合は、展開したフォルダで `git clone` と `cd` を除くコマンドを実行してください。
+Python 3.10以降が必要です。ZIPで取得した場合は、展開したフォルダで `bash install.sh` を実行するか、`install.command` をダブルクリックしてください。
+
+セットアップは仮想環境・依存ライブラリ・Chromiumを準備し、初回のみ `config.json` を作ります。`~/.local/bin/att` にリンクを作り、zshなら `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashなら `~/.bash_profile` にPATH設定を追加します。管理者権限は不要です。既存の設定ファイルを保持し、同名の別コマンドは上書きしません。
+
+完了後は新しいターミナルを開いて実行します。今のターミナルですぐ使う場合は、セットアップ完了時に表示される `source` コマンドを実行してください。
+
+```sh
+att user add             # 自分の認証情報を登録
+att --ui                 # GUIを開く
+```
+
+ダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行します。
 
 <a id="attendance"></a>
 
@@ -37,6 +44,8 @@ cp config.example.json config.json
 `./attendance` でも同じコマンドを使えます。`start.command` のダブルクリックでも起動できます。
 
 ### GUIの基本操作
+
+メイン画面の「スケジュール登録 S」をTab・↑↓で選び、Enterを押すと予定画面が開きます。教室番号の入力・授業情報の取得前でも利用できます。Sキーでも直接開けます。
 
 | キー | 操作 |
 | --- | --- |
@@ -85,7 +94,7 @@ cp config.example.json config.json
 ## 自動出席の予定
 
 ```sh
-./att --ui                # 起動後、Sで予定画面を開く
+./att --ui                # 「スケジュール登録」を選択してEnter（Sでも開く）
 ./att schedule status     # 自動実行の状態を確認
 ./att schedule install    # 自動実行を開始・設定を反映
 ./att schedule remove     # 自動実行を停止

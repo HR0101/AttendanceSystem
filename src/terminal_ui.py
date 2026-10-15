@@ -331,6 +331,8 @@ class AttendanceScreen:
         label = "[ 出席済み ]" if self.attended and self.values else "[ 出席で登録する ]"
         canvas.button(18, left, label, self.selected == 2, self.can_register())
         canvas.put(18, left + 27, f"最終確認 {self.updated}", curses.A_DIM, main_width - 27)
+        canvas.button(19, left, "[ スケジュール登録 S ]", self.selected == 3, not self.busy)
+        canvas.put(19, left + 30, "曜日・時刻・教室を設定", curses.A_DIM, main_width - 30)
         for index, line in enumerate(wrap_text(self.message, main_width - 2)[:2]):
             canvas.put(20 + index, left + 1, line, color(3 if self.failed else 1), main_width - 2)
 
@@ -482,7 +484,7 @@ class AttendanceScreen:
             if key in ("q", "Q", "\x03"):
                 return 0
             if key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
-                self.selected = (self.selected + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % 3
+                self.selected = (self.selected + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % 4
             elif key in ("r", "R"):
                 self.start()
             elif key in ("u", "U"):
@@ -496,7 +498,9 @@ class AttendanceScreen:
                 self.demo_attended.discard((self.student_id, self.room))
                 self.start()
             elif key in ("\n", "\r", curses.KEY_ENTER):
-                if self.selected == 2:
+                if self.selected == 3:
+                    self.schedule_panel.open()
+                elif self.selected == 2:
                     if self.can_register():
                         self.confirm = True
                         self.confirm_selection = 0
