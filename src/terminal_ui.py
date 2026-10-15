@@ -16,6 +16,7 @@ from .room import RoomError, parse_room
 from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
 from .users import get_users, select_user, valid_username
+from .schedule_ui import SchedulePanel
 
 
 class AttendanceScreen:
@@ -39,6 +40,7 @@ class AttendanceScreen:
         self.confirm_selection = 0
         self.demo_state = "unattended"
         self.demo_attended = set()
+        self.schedule_panel = SchedulePanel(self)
 
     def clear_target(self):
         self.values = {}
@@ -116,6 +118,7 @@ class AttendanceScreen:
         threading.Thread(target=work, daemon=True).start()
 
     def poll(self):
+        self.schedule_panel.poll()
         while True:
             try:
                 kind, data = self.events.get_nowait()
@@ -223,6 +226,9 @@ class AttendanceScreen:
         self.form_values = ["", "", ""] if action == "add" else [users[self.user_index]["username"]]
 
     def handle_modal(self, key):
+        if self.modal == "schedule":
+            self.schedule_panel.handle(key)
+            return
         if key == "\x1b":
             self.form_values = []
             self.modal = None
@@ -305,7 +311,7 @@ class AttendanceScreen:
         mode = "DEMO / 接続なし" if self.demo else "確認のみ" if self.config.get("dry_run") else "出席登録"
         canvas.put(1, left + total - 20, mode, color(4), 20)
         canvas.put(2, left, f"{name}  {'[既定]' if is_default else '[今回のユーザー]'}", curses.A_BOLD, main_width - 1)
-        canvas.put(3, left, f"学生番号 {self.student_id}    U: ユーザー管理", curses.A_DIM, main_width - 1)
+        canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー  S: 予定", curses.A_DIM, main_width - 1)
         canvas.button(5, left, f"QR番号 [ {self.room or '___'} ]", self.selected == 0)
         canvas.button(5, left + 28, "[ 更新 R ]", self.selected == 1, not self.busy)
         title, tone, detail = self.status()
@@ -331,7 +337,7 @@ class AttendanceScreen:
         if wide:
             side = left + main_width + 2
             canvas.box(5, side, 30, 7, "操作ガイド", color(1))
-            for row, text in enumerate(("Enter  選択項目を実行", "R      授業を更新", "U      ユーザー管理", "H      ヘルプ", "Q      終了"), 6):
+            for row, text in enumerate(("Enter  選択項目を実行", "R      授業を更新", "U      ユーザー管理", "S      自動出席の予定", "H ヘルプ / Q 終了"), 6):
                 canvas.put(row, side + 2, text, width=26)
             canvas.box(13, side, 30, min(height - 17, 14), "今回の操作履歴", color(1))
             if not self.history:
@@ -344,7 +350,7 @@ class AttendanceScreen:
             canvas.box(23, left, main_width, height - 26, "今回の操作履歴", color(1))
             for index, (stamp, qr, message) in enumerate(list(self.history)[:height - 28]):
                 canvas.put(24 + index, left + 2, f"{stamp}  QR {qr}  {message}", width=main_width - 4)
-        canvas.put(height - 2, left, "Tab/↑↓ 選択  Enter 実行  R 更新  U ユーザー  H ヘルプ  Q 終了", curses.A_DIM, total)
+        canvas.put(height - 2, left, "Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 H ヘルプ Q 終了", curses.A_DIM, total)
         if self.demo and height >= 26:
             canvas.put(height - 3, left, "デモ: 1 未出席 / 2 出席済 / 3 受付なし / 4 履修なし / 5 エラー", curses.A_DIM, total)
 
@@ -368,6 +374,9 @@ class AttendanceScreen:
         canvas.put(top + 13, left + 3, "Tab/←→ 選択  Enter 決定  Esc 戻る", curses.A_DIM, width - 6)
 
     def draw_modal(self, canvas):
+        if self.modal == "schedule":
+            self.schedule_panel.draw(canvas)
+            return
         width = min(canvas.width - 6, 72)
         left = (canvas.width - width) // 2
         height = min(canvas.height - 4, 20)
@@ -416,7 +425,7 @@ class AttendanceScreen:
                 canvas.put(top + 6 + index, left + 3, line)
             canvas.put(top + 11, left + 3, "Enter: 既定ユーザーに設定", color(4))
         else:
-            guide = ("QR番号: 数字入力 / Backspaceで削除", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 状態を再取得   U: ユーザー管理", "登録確認: Tab・←→で選択してEnter", "QR番号と授業の教室名は異なる場合があります。", "GUIでのユーザー切替は今回の画面だけに反映。", "既定の変更はユーザー管理の D から。", "通信中は完了までお待ちください。")
+            guide = ("QR番号: 数字入力 / Backspaceで削除", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "登録確認: Tab・←→で選択してEnter", "QR番号と授業の教室名は異なる場合があります。", "GUIでのユーザー切替は今回の画面だけに反映。", "既定の変更はユーザー管理の D から。", "通信中は完了までお待ちください。")
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
@@ -478,6 +487,8 @@ class AttendanceScreen:
                 self.start()
             elif key in ("u", "U"):
                 self.open_users()
+            elif key in ("s", "S"):
+                self.schedule_panel.open()
             elif key in ("h", "H", "?"):
                 self.modal = "help"
             elif self.demo and self.selected != 0 and key in ("1", "2", "3", "4", "5"):
