@@ -9,6 +9,8 @@ config.json
 schedule.json
 browser_data/
 logs/
+.updates/
+dist/
 
 # Original HTML and assets
 *.html

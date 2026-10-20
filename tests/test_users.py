@@ -111,6 +111,60 @@ class UserTests(unittest.TestCase):
         with patch("main.load_schedule", return_value=schedule), patch("main.agent_installed", return_value=False), redirect_stdout(io.StringIO()):
             self.assertEqual(main.main(["schedule", "status"]), 0)
 
+    def test_password_change_targets_selected_user_and_preserves_config(self):
+        config = dict(CONFIG, users=[{"username": "太郎", "student_id": "OLD001"},
+                                     {"username": "花子", "student_id": "NEW001"}], default_user="太郎")
+        self.path.write_text(json.dumps(config))
+        before = self.path.read_bytes()
+        passwords = {"OLD001": "unchanged", "NEW001": "old-password"}
+        backend = Mock()
+        backend.set_password.side_effect = lambda service, account, value: passwords.update({account: value})
+        backend.get_password.side_effect = lambda service, account: passwords[account]
+        output = io.StringIO()
+        with patch("src.user_commands.keychain_backend", return_value=backend), \
+                patch("src.user_commands.getpass.getpass", side_effect=[" new password! "] * 2), redirect_stdout(output):
+            self.assertEqual(user_command(self.base, ["password", "花子"]), 0)
+        backend.set_password.assert_called_once_with(SERVICE, "NEW001", " new password! ")
+        self.assertEqual(passwords["OLD001"], "unchanged")
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn(" new password! ", output.getvalue())
+        with patch("src.credentials.keychain_backend", return_value=backend):
+            self.assertEqual(get_credentials(load_config(self.path), self.path, interactive=False, username="花子"),
+                             ("NEW001", " new password! "))
+
+    def test_password_change_without_name_uses_default(self):
+        backend = Mock(get_password=Mock(return_value="new-password"))
+        with patch("src.user_commands.keychain_backend", return_value=backend), \
+                patch("src.user_commands.getpass.getpass", side_effect=["new-password"] * 2):
+            self.assertEqual(self.command("password"), 0)
+        backend.set_password.assert_called_once_with(SERVICE, "OLD001", "new-password")
+
+    def test_password_mismatch_empty_and_cancel_do_not_write_keychain(self):
+        before = self.path.read_bytes()
+        for inputs in (["secret", "different"], [""], ["secret", KeyboardInterrupt()], [EOFError()]):
+            with self.subTest(inputs=len(inputs)), patch("src.user_commands.keychain_backend") as backend, \
+                    patch("src.user_commands.getpass.getpass", side_effect=inputs):
+                self.assertEqual(self.command("password"), 1)
+                backend.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_unknown_password_target_does_not_prompt(self):
+        with patch("src.user_commands.getpass.getpass") as prompt, patch("src.user_commands.keychain_backend") as backend:
+            self.assertEqual(self.command("password", "未登録"), 1)
+            prompt.assert_not_called()
+            backend.assert_not_called()
+
+    def test_password_keychain_failure_is_reported_without_secret(self):
+        before = self.path.read_bytes()
+        for backend in (Mock(set_password=Mock(side_effect=RuntimeError("private-password"))),
+                        Mock(get_password=Mock(return_value="old-password"))):
+            output = io.StringIO()
+            with patch("src.user_commands.keychain_backend", return_value=backend), \
+                    patch("src.user_commands.getpass.getpass", side_effect=["private-password"] * 2), redirect_stdout(output):
+                self.assertEqual(user_command(self.base, ["password"]), 1)
+            self.assertNotIn("private-password", output.getvalue())
+            self.assertEqual(self.path.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
