@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+from contextlib import redirect_stdout, redirect_stderr
 import os
 from pathlib import Path
 import shutil
@@ -11,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import zipfile
 
 from src import updater as u
@@ -217,12 +218,12 @@ class UpdaterTests(unittest.TestCase):
     def test_old_and_prerelease_versions_are_ignored(self):
         for changes in ({"tag_name": "v0.0.1"}, {"prerelease": True}):
             message, fetch = self.prepare(**changes)
-            self.assertEqual(message, "最新版です。")
+            self.assertTrue(message.startswith("更新なし:"))
             self.assertEqual(fetch.call_count, 1)
 
     def test_no_release_and_offline_do_not_break_background(self):
         with patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, 404, "", {}, None)):
-            self.assertIn("ありません", u.prepare_update(self.base, force=True))
+            self.assertIn("更新なし: 公開済みの正式リリース", u.prepare_update(self.base, force=True))
         with patch.object(u, "prepare_update", side_effect=OSError("offline")):
             u.background_update(self.base)
         self.assertEqual(u.fingerprint(self.base), self.original)
@@ -232,6 +233,59 @@ class UpdaterTests(unittest.TestCase):
         with patch.object(u, "fetch") as fetch:
             self.assertIsNone(u.prepare_update(self.base))
             fetch.assert_not_called()
+
+    def test_current_release_is_explicitly_reported_as_no_update(self):
+        message, _ = self.prepare(tag_name="v" + VERSION)
+        self.assertIn("更新なし: 最新版です", message)
+        self.assertIn(VERSION, message)
+
+    def test_failures_show_reason_and_return_nonzero(self):
+        cases = [
+            (URLError("private-details"), "接続できません"),
+            (URLError(TimeoutError()), "タイムアウト"),
+            (HTTPError(u.API_URL, 403, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.API_URL, 429, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.API_URL, 503, "", {}, None), "サーバーでエラー"),
+            (zipfile.BadZipFile("private-details"), "更新データに問題"),
+            (PermissionError("private-details"), "保存する権限"),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__, expected=expected), \
+                    patch.object(u, "prepare_update", side_effect=error), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(u.run_application(self.base, ["update"]), 1)
+            message = output.getvalue()
+            self.assertIn("更新失敗:", message)
+            self.assertIn(expected, message)
+            self.assertNotIn("更新なし", message)
+            self.assertNotIn("private-details", message)
+
+    def test_missing_release_is_success_but_missing_asset_is_failure(self):
+        with patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, 404, "", {}, None)), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(u.run_application(self.base, ["update"]), 0)
+        self.assertIn("更新なし:", output.getvalue())
+        with patch.object(u, "fetch", side_effect=[json.dumps({"tag_name": "v" + NEXT, "assets": []}).encode()]), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(u.run_application(self.base, ["update"]), 1)
+        self.assertIn("更新失敗:", errors.getvalue())
+        self.assertIn("新版 v" + NEXT, errors.getvalue())
+        self.assertIn("更新用ZIPがありません", errors.getvalue())
+
+    def test_background_notice_includes_same_failure_reason(self):
+        with patch.object(u, "prepare_update", side_effect=URLError("offline")), redirect_stdout(io.StringIO()):
+            u.background_update(self.base)
+        message = u.read_json(self.base / ".updates/notice.json")["message"]
+        self.assertIn("更新失敗:", message)
+        self.assertIn("接続できません", message)
+
+    def test_running_downloader_is_reported_as_waiting(self):
+        with u.file_lock(self.base / ".updates/download.lock", exclusive=True), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(u.run_application(self.base, ["update"]), 1)
+        self.assertIn("更新待機:", errors.getvalue())
+        self.assertNotIn("更新なし", errors.getvalue())
+        self.assertNotIn("読み書き", errors.getvalue())
 
     def test_rolled_back_release_is_not_automatically_reinstalled(self):
         u.write_json(self.base / ".updates/check.json", {"skip_version": NEXT})
