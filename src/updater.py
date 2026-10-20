@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import zipfile
 
@@ -33,6 +33,40 @@ REQUIRED = ROOT_FILES | {"src/__init__.py", "src/updater.py", "src/version.py"}
 
 class UpdateError(Exception):
     pass
+
+
+def update_failure_message(exc):
+    """通信・配布・保存の失敗を、更新なしという結果と区別して表示する。"""
+    if isinstance(exc, UpdateError):
+        if str(exc).startswith("更新失敗:"):
+            return str(exc)
+        reason = str(exc)
+    elif isinstance(exc, HTTPError):
+        if exc.code in (403, 429):
+            reason = f"GitHubへのアクセスが拒否または制限されました（HTTP {exc.code}）。時間をおいて再実行してください。"
+        elif exc.code >= 500:
+            reason = f"配布サーバーでエラーが発生しました（HTTP {exc.code}）。時間をおいて再実行してください。"
+        elif exc.code == 404:
+            reason = "更新ファイルが見つかりません（HTTP 404）。配布元のリリースを確認してください。"
+        else:
+            reason = f"配布サーバーとの通信に失敗しました（HTTP {exc.code}）。"
+    elif isinstance(exc, TimeoutError) or (isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)):
+        reason = "通信がタイムアウトしました。インターネット接続を確認して再実行してください。"
+    elif isinstance(exc, URLError):
+        reason = "配布サーバーに接続できません。インターネット接続を確認して再実行してください。"
+    elif isinstance(exc, (json.JSONDecodeError, zipfile.BadZipFile, SyntaxError)):
+        reason = "配布された更新データに問題があります。配布元の修正後に再実行してください。"
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        reason = "更新版の起動確認がタイムアウトしました。att update で再試行してください。"
+    elif isinstance(exc, BlockingIOError):
+        return "更新待機: 別の更新処理が実行中です。完了後に att update を再実行してください。"
+    elif isinstance(exc, PermissionError):
+        reason = "更新ファイルを保存する権限がありません。インストール先のアクセス権を確認してください。"
+    elif isinstance(exc, OSError):
+        reason = "更新ファイルの読み書きに失敗しました。空き容量とアクセス権を確認してください。"
+    else:
+        reason = f"更新処理で予期しないエラーが発生しました（{type(exc).__name__}）。att update で再試行してください。"
+    return f"更新失敗: {reason}"
 
 
 def version_tuple(value):
@@ -167,7 +201,7 @@ def prepare_update(base, force=False):
         except HTTPError as exc:
             if exc.code == 404:
                 write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
-                return "公開済みの更新はありません。"
+                return "更新なし: 公開済みの正式リリースが見つかりません。現在のバージョンを継続します。"
             raise
         if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
             raise UpdateError("リリース情報の形式が不正です。")
@@ -175,16 +209,21 @@ def prepare_update(base, force=False):
         if not force and release.get("tag_name", "").removeprefix("v") == state.get("skip_version"):
             write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
             return None
-        if release.get("draft") or release.get("prerelease") or version_tuple(release.get("tag_name")) <= version_tuple(VERSION):
+        if release.get("draft") or release.get("prerelease"):
             write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
-            return "最新版です。"
+            return "更新なし: 自動更新の対象となる正式リリースがありません。"
+        if version_tuple(release["tag_name"]) <= version_tuple(VERSION):
+            write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
+            if version_tuple(release["tag_name"]) == version_tuple(VERSION):
+                return f"更新なし: 最新版です（現在 {VERSION}／公開版 {release['tag_name']}）。"
+            return f"更新なし: 使用中の {VERSION} は公開版 {release['tag_name']} より新しいバージョンです。"
         tag = release["tag_name"]
         raw_assets = release.get("assets", [])
         if not isinstance(raw_assets, list) or not all(isinstance(a, dict) for a in raw_assets):
             raise UpdateError("リリース情報の形式が不正です。")
         assets = [a for a in raw_assets if a.get("name") == ASSET_NAME]
         if len(assets) != 1:
-            raise UpdateError("リリースに更新用ZIPがありません。")
+            raise UpdateError(f"新版 {tag} は公開されていますが、更新用ZIPがありません。配布元の準備完了後に再実行してください。")
         asset = assets[0]
         url = asset.get("browser_download_url", "")
         if url != f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}":
@@ -301,11 +340,10 @@ def update_command(base, argv):
         return 0
     print("更新を確認しています…")
     try:
-        print(prepare_update(base, force=True) or "最新版です。")
-    except UpdateError:
-        raise
+        message = prepare_update(base, force=True)
+        print(message or "更新確認を見送りました。時間をおいて再実行してください。")
     except Exception as exc:
-        raise UpdateError(f"更新を取得できませんでした（{type(exc).__name__}）。時間をおいて att update を再実行してください。") from exc
+        raise UpdateError(update_failure_message(exc)) from exc
     return 0
 
 
@@ -381,7 +419,7 @@ def run_application(base, argv=None):
                                 code = 1
             return code
     except (UpdateError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
-        print(f"更新処理を停止しました: {exc}", file=sys.stderr)
+        print(update_failure_message(exc), file=sys.stderr)
         return 1
 
 
@@ -403,11 +441,10 @@ def background_update(base):
                 print(message, flush=True)
     except BlockingIOError:
         pass
-    except UpdateError as exc:
-        print(str(exc), flush=True)
-        write_json(base / ".updates/notice.json", {"message": str(exc)})
-    except Exception:
-        print("更新を見送りました。現在の版を継続します。att update で詳細を確認してください。", flush=True)
+    except Exception as exc:
+        message = update_failure_message(exc)
+        print(message, flush=True)
+        write_json(base / ".updates/notice.json", {"message": message})
 
 
 if __name__ == "__main__":
