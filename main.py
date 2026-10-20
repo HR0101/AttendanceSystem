@@ -1,5 +1,11 @@
 """出席ツールの実行入口。"""
 
+# アプリのモジュールを読み込む前に、更新との排他制御を開始する。
+if __name__ == "__main__":
+    from pathlib import Path
+    from src.updater import run_application
+    raise SystemExit(run_application(Path(__file__).resolve().parent))
+
 import argparse
 import sys
 import time
@@ -13,9 +19,7 @@ from src.verification import AttendanceError
 from src.room import RoomError, ask_room, parse_room
 from src.scheduler import ScheduleError, agent_installed, due_course, install_agent, load_schedule, remove_agent
 from src.users import select_user
-
-
-VERSION = "0.1.0"
+from src.version import VERSION
 
 
 def schedule_command(argv: list[str]) -> int:
@@ -53,12 +57,14 @@ def main(argv: list[str] | None = None) -> int:
         from src.user_commands import user_command
         return user_command(Path(__file__).resolve().parent, argv[1:])
     parser = argparse.ArgumentParser(prog="att", description="大学の出席画面を確認・登録します。")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("room", nargs="?", help="教室番号（例: 642、731）。省略時は入力します。")
     parser.add_argument("--check", action="store_true", help="登録せずに状態だけ確認します。")
     parser.add_argument("--ui", action="store_true", help="ターミナル内に出席確認画面を開きます。")
     parser.add_argument("--demo", action="store_true", help="接続せずに出席確認画面を試します。")
     parser.add_argument("--user", metavar="NAME", help="登録済みのユーザーネームを指定します。省略時は既定ユーザー。")
     parser.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    parser.epilog = "更新: att update ／ 更新前の版に戻す: att update --rollback"
     args = parser.parse_args(argv)
     base = Path(__file__).resolve().parent
     if args.demo and not args.ui:
@@ -123,7 +129,3 @@ def main(argv: list[str] | None = None) -> int:
             print("処理を停止しました。通信または画面状態を確認し、logs を参照してください。", file=sys.stderr)
     logger.info("異常終了 所要時間=%.1f秒", time.monotonic() - started)
     return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
