@@ -2,11 +2,13 @@
 
 import unittest
 import curses
+from pathlib import Path
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 from src.terminal_ui import AttendanceScreen, fit_text
 from src.verification import AttendanceError
+from src.credentials import CredentialError
 
 
 class TerminalUITests(unittest.TestCase):
@@ -148,6 +150,87 @@ class TerminalUITests(unittest.TestCase):
             ui.draw(screen)
             labels = [call.args[2] for call in screen.addstr.call_args_list]
             self.assertIn(" [ スケジュール登録 S ] ", labels)
+
+    def test_password_form_masks_both_fields_and_cancel_discards_input(self):
+        ui = self.demo_screen()
+        ui.open_users()
+        ui.user_index = 1
+        ui.handle_modal("p")
+        self.assertEqual(ui.modal, "password")
+        self.assertEqual(ui.form_values, ["", ""])
+        ui.form_values = ["new-private-password", "confirmation-secret"]
+        for width in (62, 80, 120):
+            screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+            ui.draw(screen)
+            drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+            self.assertNotIn("new-private-password", drawn)
+            self.assertNotIn("confirmation-secret", drawn)
+            self.assertIn("two / TWO001", drawn)
+            self.assertIn("********************", drawn)
+        ui.handle_modal("\x1b")
+        self.assertEqual(ui.form_values, [])
+        self.assertIsNone(ui.modal)
+
+    def test_password_form_requires_matching_nonempty_confirmation(self):
+        ui = self.demo_screen()
+        ui.open_form("password")
+        ui.form_index = 1
+        with patch.object(ui, "account_action") as save:
+            for fields in (["", ""], ["one", "two"]):
+                ui.form_values = fields
+                ui.handle_modal("\n")
+                self.assertTrue(ui.form_error)
+                save.assert_not_called()
+            ui.form_values = ["new-password"] * 2
+            ui.handle_modal("\n")
+            save.assert_called_once_with("password", "one", password="new-password")
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_password_change_refreshes_active_password_only(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        for name in ("one", "two"):
+            with self.subTest(name=name):
+                ui = self.demo_screen()
+                ui.demo = False
+                ui.base = Path("/unused-test-path")
+                ui.password = "old-active-password"
+                with patch("src.user_commands.change_password", return_value=ui.config.copy()) as save:
+                    ui.account_action("password", name, password="new-password")
+                    self.assertEqual(ui.form_values, [])
+                    ui.poll()
+                    save.assert_called_once_with(ui.base, name, "new-password")
+                self.assertEqual(ui.password, "new-password" if name == "one" else "old-active-password")
+                self.assertEqual(ui.student_id, "ONE001")
+                self.assertEqual(ui.config["default_user"], "one")
+                self.assertTrue(ui.attended)
+                self.assertFalse(ui.busy)
+                self.assertIn("更新しました", ui.message)
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_failed_password_change_preserves_active_credentials(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        ui = self.demo_screen()
+        ui.demo = False
+        ui.base = Path("/unused-test-path")
+        ui.password = "old-password"
+        with patch("src.user_commands.change_password", side_effect=CredentialError("保存できません。")):
+            ui.account_action("password", "one", password="new-password")
+            ui.poll()
+        self.assertEqual(ui.password, "old-password")
+        self.assertEqual(ui.form_values, [])
+        self.assertFalse(ui.busy)
+        self.assertEqual(ui.form_error, "保存できません。")
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_demo_password_change_does_not_touch_keychain(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        ui = self.demo_screen()
+        with patch("src.user_commands.change_password") as save:
+            ui.account_action("password", "one", password="demo-password")
+            ui.poll()
+            save.assert_not_called()
+        self.assertEqual(ui.password, "")
+        self.assertEqual(ui.form_values, [])
 
 
 if __name__ == "__main__":
