@@ -122,12 +122,15 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(AttendanceError):
             self.run_with_mocked_page(attendance_html(), "別の授業", "10:00")
 
-    def test_login_id_k_prefix_matches_displayed_student_id(self):
+    def test_login_id_letter_prefix_matches_displayed_student_id(self):
         page = self.page_for(attendance_html().replace("TEST001", "99X0000"))
-        require_student_identity(page, "K99X0000")
+        for prefix in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
+            with self.subTest(prefix=prefix):
+                require_student_identity(page, prefix + "99X0000")
         require_student_identity(page, "99X0000")
-        with self.assertRaises(AttendanceError):
-            require_student_identity(page, "K99X0001")
+        for login_id in ("K99X0001", "T99X0001", "Y99X0001", "199X0000", "KT99X0000"):
+            with self.subTest(login_id=login_id), self.assertRaises(AttendanceError):
+                require_student_identity(page, login_id)
 
     def test_qr_number_can_differ_from_classroom(self):
         html = attendance_html().replace("７３１講義室", "４３２講義室")
