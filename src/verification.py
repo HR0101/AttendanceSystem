@@ -20,7 +20,8 @@ def require_student_identity(page, login_id: str) -> None:
     if not match:
         raise AttendanceError("ログイン中の学籍番号を読み取れません。")
     shown_id = match.group(1)
-    if shown_id != login_id and not (login_id.startswith("K") and shown_id == login_id[1:]):
+    # 大学側の表示ではログインID先頭の英字が省略される。
+    if shown_id != login_id and not (re.match(r"^[A-Za-z]", login_id) and shown_id == login_id[1:]):
         raise AttendanceError("ログイン中の学籍番号が入力したIDと一致しません。")
 
 
