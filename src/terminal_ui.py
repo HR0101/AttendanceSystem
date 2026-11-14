@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,9 @@ class AttendanceScreen:
         self.checked = self.failed = False
         self.modal = None
         self.user_index = 0
+        self.selected_user_ids = {student_id}
+        self.pending_user_ids = set()
+        self.user_results = {}
         self.form_values = []
         self.form_index = 0
         self.form_error = ""
@@ -44,12 +48,38 @@ class AttendanceScreen:
 
     def clear_target(self):
         self.values = {}
+        self.user_results = {}
         self.attended = self.unenrolled = self.checked = self.failed = self.confirm = False
         self.updated = "未確認"
+
+    def selected_users(self):
+        users = get_users(self.config)
+        if not users:
+            users = [{"username": self.config.get("_active_username", self.student_id), "student_id": self.student_id}]
+        return [user for user in users if user["student_id"] in self.selected_user_ids]
+
+    def registration_targets(self):
+        users = self.selected_users()
+        if len(users) == 1:
+            return users if self.values and not (self.attended or self.unenrolled or self.failed) else []
+        return [user for user in users if (result := self.user_results.get(user["student_id"], {})).get("values")
+                and not (result.get("attended") or result.get("unenrolled") or result.get("failed"))]
 
     def status(self):
         if self.busy:
             return "|/-\\"[int(time.monotonic() * 8) % 4] + " 処理中", 1, "完了までお待ちください"
+        if len(self.selected_user_ids) > 1 and self.checked:
+            total = len(self.selected_user_ids)
+            attended = sum(result.get("attended", False) for result in self.user_results.values())
+            errors = sum(result.get("failed", False) for result in self.user_results.values())
+            ready = len(self.registration_targets())
+            if attended == total:
+                return f"全員出席済み（{total}人）", 2, "Uでユーザーごとの結果を確認できます"
+            title = f"登録可能 {ready}人 / 選択 {total}人" if ready else "ユーザーごとの結果を確認してください"
+            detail = f"出席済み {attended}人 / 対象外 {total - attended - ready - errors}人 / エラー {errors}人"
+            if self.config.get("dry_run"):
+                detail = "確認のみモードです。Uで個別の結果を確認できます"
+            return title, 3 if errors else 4, detail
         if self.failed:
             return "確認できませんでした", 3, "R で再試行できます"
         if self.unenrolled:
@@ -63,9 +93,11 @@ class AttendanceScreen:
         return "授業を確認しましょう", 1, "QR番号を入力して Enter を押してください"
 
     def can_register(self):
-        return bool(self.values) and not (self.busy or self.attended or self.unenrolled or self.config.get("dry_run", False))
+        return bool(self.registration_targets()) and not (self.busy or self.config.get("dry_run", False))
 
     def start(self, register=False):
+        if self.busy:
+            return
         try:
             room, route = parse_room(self.room)
         except RoomError as exc:
@@ -73,49 +105,94 @@ class AttendanceScreen:
             return
         if register and not self.can_register():
             return
+        targets = self.registration_targets() if register else self.selected_users()
+        if not targets:
+            return
+        expected = {user["student_id"]: dict(self.user_results[user["student_id"]]["values"]
+                    if len(self.selected_user_ids) > 1 else self.values) for user in targets} if register else {}
+        if not register:
+            self.clear_target()
         self.busy, self.confirm = True, False
         self.failed = False
-        self.message = "出席登録中…" if register else "ログインして授業情報を取得中…"
-        expected = dict(self.values) if register else {}
+        self.message = f"{len(targets)}人の出席登録中…" if register else f"{len(targets)}人の授業情報を取得中…"
         # 古い授業情報は、新しい取得に成功するまで登録に利用しない。
         self.values = {}
         self.selected = 1
+        for user in targets:
+            self.user_results[user["student_id"]] = {"values": {}, "attended": False, "unenrolled": False,
+                                                    "failed": False, "result": "処理中…"}
 
-        def work():
+        def work_user(user):
+            student_id = user["student_id"]
+            values_expected = expected.get(student_id, {})
             try:
                 if self.demo:
                     if self.demo_state == "error":
                         raise AttendanceError("デモの通信エラーです。Rで再確認できます。")
                     if register:
-                        self.demo_attended.add((self.student_id, room))
-                    attended = self.demo_state == "attended" or (self.student_id, room) in self.demo_attended
+                        self.demo_attended.add((student_id, room))
+                    attended = self.demo_state == "attended" or (student_id, room) in self.demo_attended
                     unenrolled = self.demo_state == "unenrolled"
                     values = {} if self.demo_state == "empty" else {"授業名": "システムズエンジニアリング（デモ）", "時限": "2-3限", "教室名": f"{'432' if room == '435' else room}講義室", "開始時刻": "10:00", "終了時刻": "12:00"}
-                    self.events.put(("snapshot", (values, attended, unenrolled)))
+                    self.events.put(("user_snapshot", (student_id, values, attended, unenrolled)))
                     result = "出席受付対象なし（デモ）" if not values else "履修登録なし（デモ）" if unenrolled else "デモ: 出席済み" if attended else "デモ: 未出席（大学には接続していません）"
-                    self.events.put(("result", result))
                 else:
                     from .attendance import run_attendance
                     from .browser import open_page
                     config = dict(self.config, dry_run=not register)
+                    if student_id == self.student_id:
+                        password = self.password
+                    else:
+                        if self.base is None:
+                            raise CredentialError("設定ファイルの場所を確認できません。")
+                        _, password = get_credentials(config, self.base / "config.json", interactive=False, username=user["username"])
                     with open_page(config) as page:
                         result = run_attendance(
-                            page, config, self.student_id, self.password, room, route, self.logger,
-                            expected.get("授業名"), expected.get("開始時刻"),
+                            page, config, student_id, password, room, route, self.logger,
+                            values_expected.get("授業名"), values_expected.get("開始時刻"),
                             on_snapshot=lambda values, attended, unenrolled: self.events.put(
-                                ("snapshot", (values, attended, unenrolled))),
-                            expected_values=expected if register else None,
+                                ("user_snapshot", (student_id, values, attended, unenrolled))),
+                            expected_values=values_expected if register else None,
                         )
-                    self.logger.info("画面操作 結果=%s", result)
-                    self.events.put(("result", result))
+                self.logger.info("画面操作 結果=%s", result)
+                self.events.put(("user_result", (student_id, result)))
             except (ConfigurationError, CredentialError, AttendanceError, RoomError) as exc:
                 self.logger.error("画面操作停止 種別=%s", type(exc).__name__)
-                self.events.put(("error", str(exc)))
+                self.events.put(("user_error", (student_id, str(exc))))
             except Exception as exc:
                 self.logger.error("画面操作停止 種別=%s", type(exc).__name__)
-                self.events.put(("error", "通信または画面状態を確認してください。詳細は logs を参照してください。"))
+                self.events.put(("user_error", (student_id, "通信または画面状態を確認してください。詳細は logs を参照してください。")))
+
+        def work():
+            if len(targets) == 1:
+                work_user(targets[0])
+            else:
+                # Playwrightは各スレッドで起動し、ユーザー間でセッションを共有しない。
+                with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
+                    list(executor.map(work_user, targets))
+            self.events.put(("complete", register))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def complete_attendance(self, register):
+        users = self.selected_users()
+        results = [self.user_results[user["student_id"]] for user in users]
+        self.values = next((dict(result["values"]) for result in results if result["values"] and not result["failed"]), {})
+        for result in results:
+            if result["values"] and result["values"] != self.values:
+                result.update(values={}, failed=True, attended=False, unenrolled=False,
+                              result="授業情報が他のユーザーと異なります。Rで再確認してください。")
+        self.attended = all(result["attended"] for result in results)
+        self.unenrolled = all(result["unenrolled"] for result in results)
+        self.failed = any(result["failed"] for result in results)
+        self.checked, self.busy = True, False
+        self.updated = datetime.now().strftime("%H:%M:%S")
+        if len(users) == 1:
+            self.message = results[0]["result"]
+        else:
+            attended = sum(result["attended"] for result in results)
+            self.message = f"{'一括登録' if register else '確認'}完了: 出席済み {attended}/{len(users)}人。Uで個別結果を確認できます。"
+        self.history.appendleft((self.updated, self.room, self.message))
 
     def poll(self):
         self.schedule_panel.poll()
@@ -127,13 +204,33 @@ class AttendanceScreen:
             if kind == "snapshot":
                 self.values, self.attended, self.unenrolled = data
                 self.checked = True
+            elif kind == "user_snapshot":
+                student_id, values, attended, unenrolled = data
+                self.user_results[student_id].update(values=dict(values), attended=attended, unenrolled=unenrolled)
+            elif kind in ("user_result", "user_error"):
+                student_id, result = data
+                state = self.user_results[student_id]
+                state["result"] = result
+                if kind == "user_error":
+                    state.update(values={}, failed=True, attended=False, unenrolled=False)
+                elif result in ("出席登録成功", "出席済み", "デモ: 出席済み"):
+                    state["attended"] = True
+                elif result.startswith("履修登録なし"):
+                    state["unenrolled"] = True
+                if len(self.selected_user_ids) > 1:
+                    name = next(user["username"] for user in self.selected_users() if user["student_id"] == student_id)
+                    self.history.appendleft((datetime.now().strftime("%H:%M:%S"), self.room, f"{name}: {result}"))
+            elif kind == "complete":
+                self.complete_attendance(data)
             elif kind == "account":
-                config, student_id, password, action = data
+                config, student_id, password, action, selection = data
                 config["dry_run"] = self.config.get("dry_run", False)
                 self.config, self.student_id, self.password = config, student_id, password
+                if selection is not None:
+                    self.selected_user_ids = selection
                 self.busy = False
                 self.modal = None
-                self.message = {"switch": "ユーザーを切り替えました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": "既定ユーザーを変更しました。通常実行・自動実行に反映されます。"}[action]
+                self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": "既定ユーザーを変更しました。通常実行・自動実行に反映されます。"}[action]
                 if action == "switch" and self.room:
                     self.start()
             elif kind == "account_error":
@@ -210,7 +307,8 @@ class AttendanceScreen:
                 elif action == "password" and not self.demo and select_user(config, name)["student_id"] == current_id:
                     current_password = password
                 config["_active_username"] = next((u["username"] for u in get_users(config) if u["student_id"] == current_id), current_id)
-                self.events.put(("account", (config, current_id, current_password, action)))
+                selected = {current_id} if action == "switch" else None
+                self.events.put(("account", (config, current_id, current_password, action, selected)))
             except (ConfigurationError, CredentialError, OSError) as exc:
                 self.events.put(("account_error", str(exc)))
             except Exception:
@@ -221,8 +319,27 @@ class AttendanceScreen:
     def open_users(self):
         self.modal = "users"
         self.form_error = ""
+        self.pending_user_ids = set(self.selected_user_ids)
         users = get_users(self.config)
-        self.user_index = next((i for i, u in enumerate(users) if u["student_id"] == self.student_id), 0)
+        self.user_index = next((i for i, u in enumerate(users) if u["student_id"] in self.selected_user_ids), 0)
+
+    def apply_user_selection(self):
+        if not self.pending_user_ids:
+            self.form_error = "出席するユーザーを1人以上選択してください。"
+            return
+        if self.pending_user_ids == self.selected_user_ids:
+            self.modal = None
+            return
+        users = [user for user in get_users(self.config) if user["student_id"] in self.pending_user_ids]
+        if len(users) == 1 and users[0]["student_id"] != self.student_id:
+            self.account_action("switch", users[0]["username"])
+            return
+        self.selected_user_ids = set(self.pending_user_ids)
+        self.clear_target()
+        self.modal = None
+        self.message = f"{len(users)}人のユーザーを選択しました。QR番号を入力して確認してください。"
+        if self.room:
+            self.start()
 
     def open_form(self, action):
         users = get_users(self.config)
@@ -240,7 +357,7 @@ class AttendanceScreen:
             return
         if key == "\x1b":
             self.form_values = []
-            self.modal = None
+            self.modal = "users" if self.modal == "user_result" else None
             return
         enter = key in ("\n", "\r", curses.KEY_ENTER)
         if self.modal == "help":
@@ -251,8 +368,14 @@ class AttendanceScreen:
             users = get_users(self.config)
             if key in (curses.KEY_UP, curses.KEY_DOWN) and users:
                 self.user_index = (self.user_index + (1 if key == curses.KEY_DOWN else -1)) % len(users)
+            elif key == " " and users:
+                student_id = users[self.user_index]["student_id"]
+                self.pending_user_ids.symmetric_difference_update({student_id})
+                self.form_error = ""
             elif enter and users:
-                self.account_action("switch", users[self.user_index]["username"])
+                self.apply_user_selection()
+            elif key in ("v", "V") and users:
+                self.modal = "user_result"
             elif key in ("a", "A"):
                 self.open_form("add")
             elif key in ("n", "N"):
@@ -331,8 +454,13 @@ class AttendanceScreen:
         canvas.put(1, left + 13, "/ 出席確認", curses.A_BOLD)
         mode = "DEMO / 接続なし" if self.demo else "確認のみ" if self.config.get("dry_run") else "出席登録"
         canvas.put(1, left + total - 20, mode, color(4), 20)
-        canvas.put(2, left, f"{name}  {'[既定]' if is_default else '[今回のユーザー]'}", curses.A_BOLD, main_width - 1)
-        canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー  S: 予定", curses.A_DIM, main_width - 1)
+        if len(self.selected_user_ids) > 1:
+            names = "、".join(user["username"] for user in self.selected_users())
+            canvas.put(2, left, f"選択中 {len(self.selected_user_ids)}人: {names}", curses.A_BOLD, main_width - 1)
+            canvas.put(3, left, "U: ユーザー選択・個別結果  S: 予定", curses.A_DIM, main_width - 1)
+        else:
+            canvas.put(2, left, f"{name}  {'[既定]' if is_default else '[今回のユーザー]'}", curses.A_BOLD, main_width - 1)
+            canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー選択  S: 予定", curses.A_DIM, main_width - 1)
         canvas.button(5, left, f"QR番号 [ {self.room or '___'} ]", self.selected == 0)
         canvas.button(5, left + 28, "[ 更新 R ]", self.selected == 1, not self.busy)
         title, tone, detail = self.status()
@@ -350,6 +478,8 @@ class AttendanceScreen:
         canvas.put(15, left + 3, f"時間  {self.values.get('開始時刻', '--:--')} ～ {self.values.get('終了時刻', '--:--')}", width=main_width - 6)
 
         label = "[ 出席済み ]" if self.attended and self.values else "[ 出席で登録する ]"
+        if len(self.selected_user_ids) > 1 and not self.attended:
+            label = f"[ {len(self.registration_targets())}人を出席登録 ]"
         canvas.button(18, left, label, self.selected == 2, self.can_register())
         canvas.put(18, left + 27, f"最終確認 {self.updated}", curses.A_DIM, main_width - 27)
         canvas.button(19, left, "[ スケジュール登録 S ]", self.selected == 3, not self.busy)
@@ -387,11 +517,17 @@ class AttendanceScreen:
         width = min(canvas.width - 6, 68)
         left, top = (canvas.width - width) // 2, max(1, (canvas.height - 15) // 2)
         canvas.box(top, left, width, 15, "出席登録の確認", color(4))
-        canvas.put(top + 2, left + 3, self.config.get("_active_username", self.student_id), curses.A_BOLD, width - 6)
+        targets = self.registration_targets()
+        names = "、".join(user["username"] for user in targets)
+        lines = wrap_text(names, width - 6)
+        for index, line in enumerate(lines[:2]):
+            if index == 1 and len(lines) > 2:
+                line = fit_text(line, width - 8) + "…"
+            canvas.put(top + 2 + index, left + 3, line, curses.A_BOLD, width - 6)
         for index, label in enumerate(("授業名", "教室名", "時限", "開始時刻", "終了時刻"), 4):
             canvas.put(top + index, left + 3, label, curses.A_DIM)
             canvas.put(top + index, left + 15, self.values.get(label, "--"), curses.A_BOLD, width - 18)
-        canvas.put(top + 10, left + 3, "このユーザーで、上記の授業に出席登録します。", width=width - 6)
+        canvas.put(top + 10, left + 3, f"{len(targets)}人を登録します（対象外 {len(self.selected_user_ids) - len(targets)}人）。", width=width - 6)
         canvas.button(top + 12, left + 3, "[ 戻る ]", self.confirm_selection == 0)
         canvas.button(top + 12, left + 20, "[ 出席登録 ]", self.confirm_selection == 1)
         canvas.put(top + 13, left + 3, "Tab/←→ 選択  Enter 決定  Esc 戻る", curses.A_DIM, width - 6)
@@ -404,24 +540,36 @@ class AttendanceScreen:
         left = (canvas.width - width) // 2
         height = min(canvas.height - 4, 20)
         top = (canvas.height - height) // 2
-        title = {"users": "ユーザー管理", "add": "ユーザー登録", "rename": "ユーザーネームの変更", "password": "保存パスワードの変更", "default": "既定ユーザーを変更", "help": "操作ヘルプ"}[self.modal]
+        title = {"users": "ユーザー選択・管理", "user_result": "ユーザーごとの結果", "add": "ユーザー登録", "rename": "ユーザーネームの変更", "password": "保存パスワードの変更", "default": "既定ユーザーを変更", "help": "操作ヘルプ"}[self.modal]
         canvas.box(top, left, width, height, title, color(1))
         if self.modal == "users":
             users = get_users(self.config)
             default = select_user(self.config)
-            canvas.put(top + 2, left + 3, "Enterで今回のユーザーを切り替えます。", width=width - 6)
-            count = height - 9
+            canvas.put(top + 2, left + 3, f"Space 選択/解除  Enter 決定（{len(self.pending_user_ids)}人）", width=width - 6)
+            count = max(1, (height - 9) // 2)
             self.user_index = min(self.user_index, max(0, len(users) - 1))
             first = max(0, self.user_index - count + 1)
             for index, user in enumerate(users[first:first + count], first):
-                row = top + 4 + index - first
-                tags = (" [使用中]" if user["student_id"] == self.student_id else "") + (" [既定]" if user == default else "")
+                row = top + 4 + (index - first) * 2
+                tags = " [既定]" if user == default else ""
+                marker = "[x]" if user["student_id"] in self.pending_user_ids else "[ ]"
                 attr = curses.A_REVERSE if index == self.user_index else 0
                 canvas.fill(row, left + 2, width - 4, 1, attr)
-                canvas.put(row, left + 3, f"{user['username']} / {user['student_id']}{tags}", attr, width - 6)
+                canvas.put(row, left + 3, f"{marker} {user['username']} / {user['student_id']}{tags}", attr, width - 6)
+                result = self.user_results.get(user["student_id"], {}).get("result", "未確認")
+                canvas.put(row + 1, left + 7, result, curses.A_DIM, width - 10)
             canvas.put(top + height - 4, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
-            canvas.put(top + height - 5, left + 3, "D 既定に設定", color(1), width - 6)
+            canvas.put(top + height - 5, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
             canvas.put(top + height - 3, left + 3, self.form_error or "既定ユーザーは通常実行・自動実行に使われます。", color(3) if self.form_error else curses.A_DIM, width - 6)
+        elif self.modal == "user_result":
+            user = get_users(self.config)[self.user_index]
+            canvas.put(top + 2, left + 3, f"{user['username']} / {user['student_id']}", curses.A_BOLD, width - 6)
+            result = self.user_results.get(user["student_id"], {})
+            details = result.get("result", "未確認です。ユーザーを選択して授業情報を取得してください。")
+            if result.get("values"):
+                details += "\n\n" + "\n".join(f"{label}: {value}" for label, value in result["values"].items())
+            for index, line in enumerate(wrap_text(details, width - 6)[:height - 7]):
+                canvas.put(top + 4 + index, left + 3, line, width=width - 6)
         elif self.modal in ("add", "rename", "password"):
             fields = (("ユーザーネーム", "学生番号", "パスワード") if self.modal == "add" else
                       ("新しいパスワード", "新しいパスワード（確認）") if self.modal == "password" else ("新しいユーザーネーム",))
@@ -454,7 +602,7 @@ class AttendanceScreen:
                 canvas.put(top + 6 + index, left + 3, line)
             canvas.put(top + 11, left + 3, "Enter: 既定ユーザーに設定", color(4))
         else:
-            guide = ("QR番号: 数字入力 / Backspaceで削除", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "登録確認: Tab・←→で選択してEnter", "QR番号と授業の教室名は異なる場合があります。", "GUIでのユーザー切替は今回の画面だけに反映。", "既定の変更はユーザー管理の D から。", "通信中は完了までお待ちください。")
+            guide = ("QR番号: 数字入力 / Backspaceで削除", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで適用", "登録確認: Tab・←→で選択してEnter", "QR番号と授業の教室名は異なる場合があります。", "GUIの選択は今回だけ。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
@@ -522,7 +670,8 @@ class AttendanceScreen:
                 self.modal = "help"
             elif self.demo and self.selected != 0 and key in ("1", "2", "3", "4", "5"):
                 self.demo_state = {"1": "unattended", "2": "attended", "3": "empty", "4": "unenrolled", "5": "error"}[key]
-                self.demo_attended.discard((self.student_id, self.room))
+                for student_id in self.selected_user_ids:
+                    self.demo_attended.discard((student_id, self.room))
                 self.start()
             elif key in ("\n", "\r", curses.KEY_ENTER):
                 if self.selected == 3:

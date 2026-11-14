@@ -4,12 +4,15 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import importlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -28,7 +31,11 @@ ROOT_FILES = frozenset({
     "requirements.txt", "config.example.json", "schedule.example.json", "README.md",
     "COMMANDS.md", "LICENSE",
 })
-REQUIRED = ROOT_FILES | {"src/__init__.py", "src/updater.py", "src/version.py"}
+REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
+    "__init__", "attendance", "browser", "config", "credentials", "logging_utils", "room",
+    "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "updater", "user_commands",
+    "users", "verification", "version",
+)}
 
 
 class UpdateError(Exception):
@@ -52,8 +59,16 @@ def update_failure_message(exc):
             reason = f"配布サーバーとの通信に失敗しました（HTTP {exc.code}）。"
     elif isinstance(exc, TimeoutError) or (isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)):
         reason = "通信がタイムアウトしました。インターネット接続を確認して再実行してください。"
+    elif isinstance(exc, URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
+        reason = "HTTPS証明書を検証できません。Pythonの証明書設定とネットワークの認証・プロキシ設定を確認してください。"
+    elif isinstance(exc, URLError) and isinstance(exc.reason, socket.gaierror):
+        reason = "配布サーバーの名前を解決できません（DNS）。インターネット接続とDNS設定を確認してください。"
+    elif isinstance(exc, URLError) and isinstance(exc.reason, ssl.SSLError):
+        reason = "HTTPS接続の確立に失敗しました。ネットワークの認証・プロキシ設定を確認してください。"
     elif isinstance(exc, URLError):
         reason = "配布サーバーに接続できません。インターネット接続を確認して再実行してください。"
+    elif isinstance(exc, (http.client.IncompleteRead, ConnectionError)):
+        reason = "更新データの受信中に接続が切れました。インターネット接続を確認して再実行してください。"
     elif isinstance(exc, (json.JSONDecodeError, zipfile.BadZipFile, SyntaxError)):
         reason = "配布された更新データに問題があります。配布元の修正後に再実行してください。"
     elif isinstance(exc, subprocess.TimeoutExpired):
@@ -162,6 +177,34 @@ def fetch(url, limit, deadline):
                 raise UpdateError("更新ファイルが上限サイズを超えています。")
 
 
+def pending_metadata(base):
+    """中断・破損した準備データは破棄し、次のダウンロードを妨げない。"""
+    pending = base / ".updates/pending"
+    if pending.is_symlink():
+        raise UpdateError("更新の一時領域が通常のフォルダではありません。インストール先を確認してください。")
+    if not pending.exists():
+        return None
+    if not pending.is_dir():
+        raise UpdateError("更新の一時領域が通常のフォルダではありません。インストール先を確認してください。")
+    metadata = read_json(pending / "metadata.json")
+    try:
+        if not isinstance(metadata, dict):
+            raise ValueError
+        version_tuple(metadata.get("version"))
+        for key in ("before", "files"):
+            files = metadata.get(key)
+            if not isinstance(files, dict) or not files or not all(
+                    isinstance(name, str) and allowed(name) and isinstance(digest, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", digest) for name, digest in files.items()):
+                raise ValueError
+        if not REQUIRED.issubset(metadata["files"]):
+            raise ValueError
+    except (ValueError, UpdateError):
+        shutil.rmtree(pending)
+        return None
+    return metadata
+
+
 def validate_payload(archive, destination, tag):
     with zipfile.ZipFile(archive) as package:
         entries = package.infolist()
@@ -189,10 +232,19 @@ def prepare_update(base, force=False):
     """通信と検証だけを行う。起動中のコードは変更しない。"""
     updates = base / ".updates"
     with file_lock(updates / "download.lock", exclusive=True, blocking=False):
-        if (updates / "pending/metadata.json").exists():
+        had_pending = (updates / "pending").exists()
+        if pending_metadata(base) is not None:
             return "更新の準備ができています。終了時に適用します。"
         state = read_json(updates / "check.json", {})
-        if not force and time.time() - state.get("checked_at", 0) < state.get("interval", 86400):
+        if not isinstance(state, dict):
+            state = {}
+        if had_pending:
+            state.pop("checked_at", None)
+        checked_at, interval = state.get("checked_at", 0), state.get("interval", 86400)
+        now = time.time()
+        valid_clock = (type(checked_at) in (int, float) and 0 <= checked_at <= now
+                       and type(interval) in (int, float) and 0 < interval <= 86400)
+        if not force and valid_clock and now - checked_at < interval:
             return None
         write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 3600})
         deadline = time.monotonic() + 25
@@ -262,15 +314,27 @@ def prepare_update(base, force=False):
 def recover(base):
     """中断された更新は次回のアプリ読込前に元のファイルへ戻す。"""
     transaction = base / ".updates/transaction"
-    journal = read_json(transaction / "journal.json")
-    if not journal:
+    if not (transaction / "journal.json").exists():
         return
-    for name, mode in journal.items():
-        target = safe_target(base, name)
+    journal = read_json(transaction / "journal.json")
+    # 復元途中でバックアップ不足が判明しないよう、変更前に全件を確認する。
+    restored = []
+    try:
+        if not isinstance(journal, dict) or not journal:
+            raise ValueError
+        for name, mode in journal.items():
+            if not isinstance(name, str) or (mode is not None and (type(mode) is not int or not 0 <= mode <= 0o7777)):
+                raise ValueError
+            target = safe_target(base, name)
+            data = None if mode is None else safe_target(transaction / "files", name).read_bytes()
+            restored.append((target, mode, data))
+    except (ValueError, OSError, UpdateError) as exc:
+        raise UpdateError("更新前の版の復元データが破損または不足しています。.updates/transaction を保持して確認してください。") from exc
+    for target, mode, data in restored:
         if mode is None:
             target.unlink(missing_ok=True)
         else:
-            atomic_write(target, (transaction / "files" / name).read_bytes(), mode)
+            atomic_write(target, data, mode)
     clear_caches(base)
     shutil.rmtree(transaction)
     shutil.rmtree(base / ".updates/pending", ignore_errors=True)
@@ -286,7 +350,7 @@ def apply_pending(base):
     """呼出側が実行ロックを排他的に保持している時だけ呼ぶ。"""
     updates = base / ".updates"
     pending = updates / "pending"
-    metadata = read_json(pending / "metadata.json")
+    metadata = pending_metadata(base)
     if not metadata:
         return None
     from .version import VERSION
@@ -380,9 +444,12 @@ def run_application(base, argv=None):
                 fcntl.flock(runtime, fcntl.LOCK_SH)
             if automatic:
                 notice = read_json(updates / "notice.json", {})
-                if notice.get("message"):
+                if isinstance(notice, dict) and isinstance(notice.get("message"), str) and notice["message"]:
                     print(f"更新のお知らせ: {notice['message']}", file=sys.stderr)
-                    (updates / "notice.json").unlink(missing_ok=True)
+                    try:
+                        (updates / "notice.json").unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 # 別プロセスなので短いCLI操作が終了してもダウンロードを完了できる。
                 try:
                     with (updates / "updater.log").open("a") as log:
@@ -404,15 +471,17 @@ def run_application(base, argv=None):
                     try:
                         fcntl.flock(runtime, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
-                        if (updates / "pending").exists():
-                            print("別の処理が実行中のため更新は次回終了時に適用します。", file=sys.stderr)
+                        if (updates / "pending").exists() or (updates / "rollback.json").exists():
+                            print("更新待機: 別の処理が実行中のため更新は次回終了時に適用します。", file=sys.stderr)
+                            if manual_update:
+                                code = 1
                     else:
                         try:
                             message = finish_update(base)
                             if message:
                                 print(message, file=sys.stderr)
-                        except Exception:
-                            print("更新を適用できませんでした。att update で再試行してください。", file=sys.stderr)
+                        except Exception as exc:
+                            print(update_failure_message(exc), file=sys.stderr)
                             if (updates / "transaction/journal.json").exists():
                                 raise UpdateError("復元が未完了です。次回起動時に復元を再試行します。")
                             if manual_update:
@@ -444,7 +513,10 @@ def background_update(base):
     except Exception as exc:
         message = update_failure_message(exc)
         print(message, flush=True)
-        write_json(base / ".updates/notice.json", {"message": message})
+        try:
+            write_json(base / ".updates/notice.json", {"message": message})
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

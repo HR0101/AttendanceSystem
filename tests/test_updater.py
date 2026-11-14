@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
@@ -337,6 +338,96 @@ class UpdaterTests(unittest.TestCase):
                 u.background_update(self.base)
         self.assertEqual(u.fingerprint(self.base), self.original)
         self.assertTrue((self.base / ".updates/pending").exists())
+
+    def test_background_http_rejection_preserves_files_and_retries_after_one_hour(self):
+        for status in (403, 429):
+            with self.subTest(status=status), \
+                    patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, status, "", {}, None)) as fetch, \
+                    redirect_stdout(io.StringIO()):
+                u.write_json(self.base / ".updates/check.json", {})
+                u.background_update(self.base)
+                notice = u.read_json(self.base / ".updates/notice.json")
+                self.assertIn(f"HTTP {status}", notice["message"])
+                self.assertIn("更新失敗:", notice["message"])
+                state = u.read_json(self.base / ".updates/check.json")
+                self.assertEqual(state["interval"], 3600)
+                self.assertEqual(u.fingerprint(self.base), self.original)
+                self.assert_private_preserved()
+                self.assertFalse((self.base / ".updates/pending").exists())
+                self.assertIsNone(u.prepare_update(self.base))
+                fetch.assert_called_once()
+                # 手動確認は待機時間内でも再試行できる。
+                with self.assertRaises(HTTPError):
+                    u.prepare_update(self.base, force=True)
+                self.assertEqual(fetch.call_count, 2)
+
+    def test_detached_background_download_apply_and_rollback_for_git_and_zip_installs(self):
+        fixture = Path(self.temp.name) / "transport"
+        fixture.mkdir()
+        # ネットワーク境界だけを模擬する。起動・ダウンロード処理・検証・
+        # プロセス間のロック・適用・復元には実際の実装を使う。
+        (fixture / "sitecustomize.py").write_text('''
+import io
+import os
+from pathlib import Path
+import time
+import urllib.request
+
+fixture = Path(os.environ["ATTENDANCE_TEST_TRANSPORT"])
+def fixture_open(request, timeout=None):
+    if request.full_url.endswith("/releases/latest"):
+        return io.BytesIO((fixture / "release.json").read_bytes())
+    if request.full_url.endswith("/attendance-update.zip"):
+        time.sleep(0.3)
+        return io.BytesIO((fixture / "release.zip").read_bytes())
+    raise AssertionError("Unexpected network request")
+urllib.request.urlopen = fixture_open
+''')
+        environment = dict(os.environ, PYTHONPATH=str(fixture), ATTENDANCE_TEST_TRANSPORT=str(fixture))
+        environment.pop("ATTENDANCE_NO_UPDATE", None)
+        # 出席処理だけを省略し、通常起動と同じ更新ライフサイクルを動かす。
+        command = [sys.executable, "-c", (
+            "from pathlib import Path; import main; "
+            "from src.updater import run_application; "
+            "main.main = lambda argv: 0; "
+            "raise SystemExit(run_application(Path.cwd(), ['--check', '731']))"
+        )]
+        for installation in ("git", "zip"):
+            with self.subTest(installation=installation):
+                if installation == "zip":
+                    shutil.rmtree(self.base / ".git")
+                    self.private.pop(".git/config")
+                u.write_json(self.base / ".updates/check.json", {})
+                data = self.archive()
+                (fixture / "release.zip").write_bytes(data)
+                (fixture / "release.json").write_text(json.dumps({
+                    "tag_name": "v" + NEXT, "draft": False, "prerelease": False,
+                    "assets": [{"name": u.ASSET_NAME,
+                                "browser_download_url": f"https://github.com/{u.REPOSITORY}/releases/download/v{NEXT}/{u.ASSET_NAME}",
+                                "digest": "sha256:" + hashlib.sha256(data).hexdigest()}],
+                }))
+                result = subprocess.run(command, cwd=self.base, env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if (NEXT in (self.base / "src/version.py").read_text()
+                            and (self.base / ".updates/backup/journal.json").exists()
+                            and not (self.base / ".updates/pending").exists()):
+                        break
+                    time.sleep(0.02)
+                log = (self.base / ".updates/updater.log").read_text()
+                self.assertTrue((self.base / ".updates/backup/journal.json").exists(), log)
+                result = subprocess.run([sys.executable, str(self.base / "main.py"), "--version"],
+                                        cwd=self.base, env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(NEXT, result.stdout)
+                self.assert_private_preserved()
+                result = subprocess.run([sys.executable, str(self.base / "main.py"), "update", "--rollback"],
+                                        cwd=self.base, env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(u.fingerprint(self.base), self.original)
+                self.assert_private_preserved()
 
     def test_version_order_is_numeric(self):
         self.assertGreater(u.version_tuple("v0.10.0"), u.version_tuple("0.9.9"))
