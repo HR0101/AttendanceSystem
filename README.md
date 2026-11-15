@@ -77,6 +77,8 @@ att update --rollback    # 直前の更新前の版へ戻す
 
 `src/version.py` の `VERSION` を上げて変更をGitHubへ反映し、その値に一致する `vX.Y.Z` タグをpushしてください。`.github/workflows/release.yml` が全テストを実行し、個人設定を含まない `attendance-update.zip` を作成して正式リリースに添付します。利用者は次回の更新確認で取得します。通常のコミットをpushするだけでは更新を配信しません。
 
+リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` も再生成してください（[手順](COMMANDS.md#tests)）。`requirements.lock` は更新用ZIPに含めません。旧版の自動更新が未知のファイルを拒否するためです。`requirements.txt` を変更したリリースは、従来どおり自動適用されません。
+
 ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.2.1` を実行します。生成先は `dist/attendance-update.zip` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
 
 <a id="configuration"></a>
