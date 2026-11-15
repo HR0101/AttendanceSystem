@@ -34,7 +34,14 @@ fi
 [ -x "$tool_dir/.venv/bin/python" ] || fail ".venv が不完全です。.venv を確認してください。"
 "$tool_dir/.venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
     || fail ".venv の Python は 3.10 以降である必要があります。"
-"$tool_dir/.venv/bin/python" -m pip install -r "$tool_dir/requirements.txt"
+# ロックファイルがあれば、記録したハッシュと一致するパッケージだけを導入する。
+if [ -f "$tool_dir/requirements.lock" ]; then
+    "$tool_dir/.venv/bin/python" -m pip install --require-hashes -r "$tool_dir/requirements.lock"
+else
+    echo "警告: requirements.lock がないため、ハッシュを検証せずに requirements.txt から導入します。" >&2
+    echo "      最新版を取得すると、検証付きで導入できます。" >&2
+    "$tool_dir/.venv/bin/python" -m pip install -r "$tool_dir/requirements.txt"
+fi
 "$tool_dir/.venv/bin/python" -m playwright install chromium
 
 if [ ! -e "$tool_dir/config.json" ] && [ ! -L "$tool_dir/config.json" ]; then

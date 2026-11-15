@@ -18,7 +18,7 @@ class InstallerTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.project = self.base / "tool with spaces"
         self.project.mkdir()
-        for name in ("install.sh", "att", "config.example.json", "requirements.txt"):
+        for name in ("install.sh", "att", "config.example.json", "requirements.txt", "requirements.lock"):
             shutil.copy2(ROOT / name, self.project / name)
         self.home = self.base / "home with spaces"
         self.home.mkdir()
@@ -99,6 +99,26 @@ fi
         self.assertFalse((self.home / ".local/bin/att").is_symlink())
         self.assertFalse((self.home / ".zshrc").exists())
         self.assertFalse((self.project / "config.json").exists())
+
+    def test_dependencies_are_installed_from_hashed_lock(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pip_calls = [line for line in self.log.read_text().splitlines() if line.startswith("-m pip install")]
+        self.assertEqual(len(pip_calls), 1)
+        self.assertTrue(pip_calls[0].startswith("-m pip install --require-hashes -r "))
+        self.assertEqual(Path(pip_calls[0].split(" -r ", 1)[1]).resolve(),
+                         (self.project / "requirements.lock").resolve())
+
+    def test_missing_lock_falls_back_with_warning(self):
+        (self.project / "requirements.lock").unlink()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("requirements.lock がないため", result.stderr)
+        pip_calls = [line for line in self.log.read_text().splitlines() if line.startswith("-m pip install")]
+        self.assertEqual(len(pip_calls), 1)
+        self.assertNotIn("--require-hashes", pip_calls[0])
+        self.assertEqual(Path(pip_calls[0].split(" -r ", 1)[1]).resolve(),
+                         (self.project / "requirements.txt").resolve())
 
     def test_shell_profiles(self):
         for shell, profile in (("/bin/bash", self.home / ".bash_profile"),
