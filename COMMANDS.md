@@ -187,3 +187,19 @@ cp schedule.example.json schedule.json # 初めて予定ファイルを作る場
 ```
 
 テストは匿名の模擬画面を使い、大学システムにはアクセスしません。
+
+### 依存ライブラリのロックファイル
+
+`install.sh` とCIは、`requirements.lock` に記録した版とSHA-256ハッシュに一致するパッケージだけを導入します（`pip install --require-hashes`）。`requirements.txt` を変更したときや依存ライブラリを更新するときは、[uv](https://docs.astral.sh/uv/) で次を実行して再生成し、両方をコミットしてください。
+
+```sh
+uv pip compile requirements.txt --universal --generate-hashes --python-version 3.10 --exclude-newer "14 days" --no-header -o requirements.lock
+```
+
+`--universal` はmacOSとCI（Linux）、Python 3.10以降の差をまとめて記録します。`--exclude-newer "14 days"` は、公開から14日未満の版を避けます（公開直後に乗っ取られた版の混入対策）。再生成したら、追加・変更されたパッケージ名が正規のものかを確認してください。
+
+既知の脆弱性は、CIで `pip-audit` が確認します。手元で確認する場合は次を実行します。
+
+```sh
+uvx pip-audit@2.10.1 -r requirements.lock --require-hashes --disable-pip
+```

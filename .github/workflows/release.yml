@@ -5,24 +5,31 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+# 既定では権限を与えず、必要なジョブにだけ付与する。
+permissions: {}
 
 jobs:
+  test:
+    # 外部パッケージを導入して全テストを実行するジョブには、書き込み権限を与えない。
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
   release:
+    # 外部パッケージを導入しないジョブで、更新用ZIPの作成と公開だけを行う。
+    needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          python-version: '3.11'
-      - run: python -m pip install -r requirements.txt
-      - run: python -m playwright install --with-deps chromium
-      - run: python -m unittest discover -s tests
+          persist-credentials: false
       - name: Build update archive
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python scripts/build_release.py "$RELEASE_TAG"
+        # build_release.py は標準ライブラリだけを使うため、ランナー標準の python3 で実行する。
+        run: python3 scripts/build_release.py "$RELEASE_TAG"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

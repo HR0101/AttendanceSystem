@@ -304,6 +304,8 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(u.REQUIRED.issubset(names))
         self.assertTrue(all(u.allowed(name) for name in names))
         self.assertTrue(set(self.private).isdisjoint(names))
+        # 旧版の更新処理は未知のファイルを拒否するため、ロックファイルは更新用ZIPに含めない。
+        self.assertNotIn("requirements.lock", names)
         u.validate_payload(archive, Path(self.temp.name) / "verified", "v" + VERSION)
 
     def test_scheduled_demo_and_help_do_not_start_or_apply_updates(self):
