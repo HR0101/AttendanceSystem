@@ -1,11 +1,11 @@
-"""登録・一覧・既定ユーザー切替・表示名と保存パスワードの変更。"""
+"""ユーザー管理のCLIと、UIから使う設定・Keychainの保存操作。"""
 
 import argparse
 import getpass
 
 from .config import ConfigurationError, load_config
 from .credentials import CredentialError, SERVICE, _save_private_json, keychain_backend
-from .users import get_users, select_user, valid_username
+from .users import change_student_id_config, get_users, remove_user_config, select_user, valid_username
 
 
 def add_user(base, name, student_id, password):
@@ -84,6 +84,70 @@ def change_password(base, name, password):
     except Exception as exc:
         raise CredentialError("Keychain の操作に失敗しました。") from exc
     return config
+
+
+def _set_saved_password(backend, student_id, password):
+    try:
+        if password is None:
+            if backend.get_password(SERVICE, student_id) is not None:
+                backend.delete_password(SERVICE, student_id)
+        else:
+            backend.set_password(SERVICE, student_id, password)
+        if backend.get_password(SERVICE, student_id) != password:
+            raise CredentialError("Keychain の変更を確認できません。")
+    except CredentialError:
+        raise
+    except Exception as exc:
+        raise CredentialError("Keychain の操作に失敗しました。") from exc
+
+
+def _save_account_change(path, config, backend, before, after):
+    try:
+        for student_id, password in after.items():
+            _set_saved_password(backend, student_id, password)
+        _save_private_json(path, config)
+    except BaseException:
+        try:
+            # 元の番号を先に復元してから、新番号のコピーを取り除く。
+            for student_id, password in before.items():
+                _set_saved_password(backend, student_id, password)
+        except Exception as exc:
+            raise CredentialError("設定変更を完了できず、保存認証情報の復元にも失敗しました。Keychainの状態を確認してください。") from exc
+        raise
+    return config
+
+
+def _saved_password(backend, student_id):
+    try:
+        return backend.get_password(SERVICE, student_id)
+    except Exception as exc:
+        raise CredentialError("Keychain の操作に失敗しました。") from exc
+
+
+def remove_user(base, name):
+    path = base / "config.json"
+    original = load_config(path)
+    user = select_user(original, name)
+    config = remove_user_config(original, name)
+    backend = keychain_backend()
+    password = _saved_password(backend, user["student_id"])
+    return _save_account_change(path, config, backend, {user["student_id"]: password}, {user["student_id"]: None})
+
+
+def change_student_id(base, name, student_id):
+    path = base / "config.json"
+    original = load_config(path)
+    user = select_user(original, name)
+    config = change_student_id_config(original, name, student_id)
+    if user["student_id"] == student_id:
+        return original
+    backend = keychain_backend()
+    password = _saved_password(backend, user["student_id"])
+    if _saved_password(backend, student_id) is not None:
+        raise CredentialError("その学籍番号の認証情報がKeychainにあります。上書きせずに変更を中止しました。")
+    return _save_account_change(path, config, backend,
+                                {user["student_id"]: password, student_id: None},
+                                {student_id: password, user["student_id"]: None})
 
 
 def user_command(base, argv):
