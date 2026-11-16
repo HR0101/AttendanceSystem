@@ -11,7 +11,8 @@ from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
     load_schedule, registration_time, remove_agent, save_schedule, schedule_data, validate_schedule,
 )
-from .terminal_layout import color, text_width
+from .terminal_layout import color
+from .text_input import TextCursor
 from .users import select_user
 
 
@@ -26,6 +27,7 @@ class SchedulePanel:
         self.index = 0
         self.mode = "list"
         self.fields = []
+        self.editors = []
         self.field_index = 0
         self.message = ""
         self.events = queue.Queue()
@@ -57,12 +59,14 @@ class SchedulePanel:
             self.data, self.active, self.message = result
             self.mode = "list"
             self.fields = []
+            self.editors = []
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
 
     def open(self):
         self.owner.modal = "schedule"
         self.mode = "list"
         self.fields = []
+        self.editors = []
         self.data = None
 
         def read():
@@ -138,6 +142,7 @@ class SchedulePanel:
             self.fields = [course["course_name"], course["weekday"], course["start_time"], course["room"], course.get("register_time", ""), course.get("register_until", "")]
         else:
             self.fields = [self.owner.values.get("授業名", ""), list(WEEKDAYS)[date.today().weekday()], self.owner.values.get("開始時刻", ""), self.owner.room, "", ""]
+        self.editors = [TextCursor(value) for value in self.fields]
 
     def submit(self):
         candidate = copy.deepcopy(self.data)
@@ -162,6 +167,7 @@ class SchedulePanel:
                 self.owner.modal = None
             else:
                 self.mode, self.fields, self.message = "list", [], ""
+                self.editors = []
             return
         if self.data is None:
             if key in ("r", "R"):
@@ -179,12 +185,10 @@ class SchedulePanel:
                 self.submit()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
                 self.field_index = (self.field_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.fields)
-            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                self.fields[self.field_index] = self.fields[self.field_index][:-1]
-            elif key == "\x15":
-                self.fields[self.field_index] = ""
-            elif isinstance(key, str) and key.isprintable() and len(self.fields[self.field_index]) < 1000:
-                self.fields[self.field_index] += key
+            else:
+                if len(self.editors) != len(self.fields):
+                    self.editors = [TextCursor(value) for value in self.fields]
+                self.fields[self.field_index] = self.editors[self.field_index].edit(self.fields[self.field_index], key, limit=1000)
             return
         if key in (curses.KEY_UP, curses.KEY_DOWN) and courses:
             self.index = (self.index + (1 if key == curses.KEY_DOWN else -1)) % len(courses)
@@ -240,11 +244,10 @@ class SchedulePanel:
             for i, label in enumerate(labels):
                 row = 2 + i * (2 if len(labels) == 6 else 3)
                 put(row, label, curses.A_DIM)
-                value = self.fields[i]
-                while text_width(value) > width - 9:
-                    value = value[1:]
-                put(row + 1, value + ("_" if i == self.field_index else ""), curses.A_REVERSE if i == self.field_index else 0)
-            put(height - 5, "Tab/↑↓で移動、最後の項目でEnter: 保存", color(1))
+                if len(self.editors) != len(self.fields):
+                    self.editors = [TextCursor(value) for value in self.fields]
+                self.editors[i].draw(canvas, top + row + 1, left + 3, self.fields[i], width - 6, active=i == self.field_index)
+            put(height - 5, "Tab/↑↓:項目 ←→:編集 最後でEnter:保存", color(1))
         # 長いエラーでも2行で読み取れるようにする。
         from .terminal_layout import wrap_text
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
