@@ -29,6 +29,7 @@ class ReleaseManifestTests(unittest.TestCase):
         manifest = u.validate_manifest(json.loads(manifest_path.read_text()))
         data = archive.read_bytes()
         self.assertEqual(manifest["version"], fixtures.VERSION)
+        self.assertEqual(manifest["release_notes"], (fixtures.ROOT / "updates" / f"{fixtures.VERSION}.md").read_text())
         self.assertEqual(manifest["archive"], {"name": u.ASSET_NAME, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o644)
         with zipfile.ZipFile(archive) as package:
@@ -43,6 +44,7 @@ class ReleaseManifestTests(unittest.TestCase):
         script.parent.mkdir()
         shutil.copy2(fixtures.ROOT / "scripts/build_release.py", script)
         shutil.copy2(fixtures.ROOT / "requirements.lock", self.fixture.base / "requirements.lock")
+        shutil.copytree(fixtures.ROOT / "updates", self.fixture.base / "updates")
         result = subprocess.run([sys.executable, str(script), "v" + fixtures.VERSION],
                                 cwd=self.fixture.base, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)

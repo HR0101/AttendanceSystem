@@ -315,12 +315,12 @@ class UpdaterMatrixTests(unittest.TestCase):
                 notice.parent.mkdir(parents=True)
                 notice.write_bytes(state)
                 app = Mock(main=Mock(return_value=0))
-                with patch.object(u.importlib, "import_module", return_value=app), patch.object(u.subprocess, "Popen"), redirect_stderr(io.StringIO()):
+                with patch.object(u.importlib, "import_module", return_value=app), patch.object(u, "check_update", return_value=None), redirect_stderr(io.StringIO()):
                     self.assertEqual(u.run_application(fixture.base, ["--ui"]), 0)
                 app.main.assert_called_once()
 
     def test_cache_notice_permission_failure_does_not_raise_second_exception(self):
-        with self.installation() as fixture, patch.object(u, "prepare_update", side_effect=URLError("offline")), \
+        with self.installation() as fixture, patch.object(u, "check_update", side_effect=URLError("offline")), \
                 patch.object(u, "write_json", side_effect=PermissionError()), redirect_stdout(io.StringIO()) as output:
             u.background_update(fixture.base)
             self.assertIn("更新失敗:", output.getvalue())
@@ -332,7 +332,7 @@ class UpdaterMatrixTests(unittest.TestCase):
         for args in cases:
             with self.subTest(args=args), self.installation() as fixture:
                 with patch.object(u.importlib, "import_module", return_value=Mock(main=Mock(return_value=0))), \
-                        patch.object(u.subprocess, "Popen") as launch, patch.object(u, "finish_update") as finish, \
+                        patch.object(u, "check_update") as check, patch.object(u, "finish_update") as finish, \
                         redirect_stdout(io.StringIO()):
                     if args[0] == "update":
                         with self.assertRaises(SystemExit) as result:
@@ -340,18 +340,18 @@ class UpdaterMatrixTests(unittest.TestCase):
                         self.assertEqual(result.exception.code, 0)
                     else:
                         self.assertEqual(u.run_application(fixture.base, args), 0)
-                    launch.assert_not_called()
+                    check.assert_not_called()
                     finish.assert_not_called()
 
-    def test_runtime_environment_opt_out_and_background_launch_failure_preserve_app(self):
-        for mode in ("disabled", "launch_failed"):
+    def test_runtime_environment_opt_out_and_check_failure_preserve_app(self):
+        for mode in ("disabled", "check_failed"):
             with self.subTest(mode=mode), self.installation() as fixture:
                 app = Mock(main=Mock(return_value=7))
                 with patch.object(u.importlib, "import_module", return_value=app), \
-                        patch.object(u.subprocess, "Popen", side_effect=OSError("cannot launch")) as launch, \
+                        patch.object(u, "check_update", side_effect=URLError("offline")) as check, \
                         patch.dict(u.os.environ, {"ATTENDANCE_NO_UPDATE": "1"} if mode == "disabled" else {}, clear=True):
                     self.assertEqual(u.run_application(fixture.base, ["--check", "731"]), 7)
-                self.assertEqual(launch.call_count, 0 if mode == "disabled" else 1)
+                self.assertEqual(check.call_count, 0 if mode == "disabled" else 1)
                 app.main.assert_called_once()
 
     def test_runtime_manual_update_deferral_returns_waiting_status(self):
@@ -509,7 +509,7 @@ class UpdaterMatrixTests(unittest.TestCase):
                 self.assertFalse(pending.exists())
                 self.assert_unchanged(fixture)
 
-    def test_runtime_saved_notice_is_shown_even_if_it_cannot_be_deleted(self):
+    def test_runtime_legacy_error_notice_stays_silent_without_requiring_deletion(self):
         for writable in (True, False):
             with self.subTest(writable=writable), self.installation() as fixture:
                 notice = fixture.base / ".updates/notice.json"
@@ -523,11 +523,11 @@ class UpdaterMatrixTests(unittest.TestCase):
 
                 app = Mock(main=Mock(return_value=0))
                 with patch.object(u.importlib, "import_module", return_value=app), \
-                        patch.object(u.subprocess, "Popen"), patch.object(Path, "unlink", fail_notice), \
+                        patch.object(u, "check_update", return_value=None), patch.object(Path, "unlink", fail_notice), \
                         redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(u.run_application(fixture.base, ["--ui"]), 0)
-                self.assertIn("前回のDNSエラー", errors.getvalue())
-                self.assertEqual(notice.exists(), not writable)
+                self.assertEqual(errors.getvalue(), "")
+                self.assertTrue(notice.exists())
                 app.main.assert_called_once()
 
     def test_runtime_smoke_timeout_is_reported_with_its_specific_reason(self):
@@ -545,7 +545,7 @@ class UpdaterMatrixTests(unittest.TestCase):
             with self.subTest(state=state), self.installation() as fixture:
                 if state == "recovering":
                     u.write_json(fixture.base / ".updates/transaction/journal.json", {"main.py": 0o644})
-                    with patch.object(u, "prepare_update") as prepare:
+                    with patch.object(u, "check_update") as prepare:
                         u.background_update(fixture.base)
                         prepare.assert_not_called()
                 else:

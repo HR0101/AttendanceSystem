@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from src.updater import ASSET_NAME, MANIFEST_NAME, REQUIRED, allowed, atomic_write, managed_files, validate_manifest, version_tuple
 from src.version import VERSION
 from src.dependencies import read_spec
+from src.release_notes import read_notes
 
 
 def build(tag, output):
@@ -22,6 +23,7 @@ def build(tag, output):
     spec = read_spec(ROOT)
     if (ROOT / "requirements.lock").read_text(encoding="utf-8") != spec["text"]:
         raise ValueError("配布用ロック情報が古いため scripts/generate_dependency_lock.py を実行してください。")
+    notes = read_notes(ROOT, VERSION)
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in sorted(names):
@@ -32,6 +34,7 @@ def build(tag, output):
     manifest = validate_manifest({
         "schema_version": 1,
         "version": VERSION,
+        "release_notes": notes,
         "archive": {"name": ASSET_NAME, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
     })
     atomic_write(output.parent / MANIFEST_NAME, (json.dumps(manifest, indent=2) + "\n").encode(), 0o644)

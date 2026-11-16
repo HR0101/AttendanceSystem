@@ -172,7 +172,7 @@ class DependencyUpdateTests(unittest.TestCase):
         u.write_json(self.base / ".updates/runtime.json", {"id": "../../bad"})
         with u.file_lock(self.base / ".updates/runtime.lock") as runtime, patch.dict(os.environ, dict(os.environ)), \
                 patch.object(d, "prepare_environment", return_value=state), patch.object(u.os, "execv") as execute:
-            u.activate_runtime(self.base, ["user", "list"], runtime)
+            u.activate_runtime(self.base, ["update"], runtime)
             self.assertEqual(Path(execute.call_args.args[0]), u.runtime_directory(self.base, state) / "bin/python")
             self.assertEqual(u.read_runtime_state(self.base), state)
         for args in (["--help"], ["--version"], ["update", "--rollback"], ["--ui", "--demo"]):
@@ -199,7 +199,7 @@ class DependencyUpdateTests(unittest.TestCase):
         with u.file_lock(self.base / ".updates/runtime.lock") as runtime, patch.dict(os.environ, dict(os.environ)), \
                 patch.object(d, "read_spec", side_effect=[first, second]), patch.object(d, "prepare_environment", return_value=new) as prepare, \
                 patch.object(u.os, "execv"):
-            u.activate_runtime(self.base, ["user", "list"], runtime)
+            u.activate_runtime(self.base, ["update"], runtime)
         self.assertEqual(prepare.call_args.args[1], second)
 
     def test_interrupted_update_recovers_even_if_dependency_module_is_broken(self):

@@ -41,7 +41,7 @@ ROOT_FILES = frozenset({
 })
 REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
     "__init__", "attendance", "browser", "config", "credentials", "dependencies", "dependency_lock", "logging_utils", "room",
-    "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "updater", "user_commands",
+    "release_notes", "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "updater", "user_commands",
     "users", "verification", "version",
 )}
 
@@ -230,28 +230,34 @@ def runtime_environment(base, state):
 
 def activate_runtime(base, argv, runtime):
     # ヘルプ・復元・デモはネットワークや依存パッケージの準備なしで利用できる。
-    if any(flag in argv for flag in ("--help", "-h", "--version", "--demo", "--rollback")):
+    if any(flag in argv for flag in ("--help", "-h", "--version", "--demo", "--rollback", "--notes")):
         return
+    invalid_state = False
     try:
         state = read_runtime_state(base)
     except UpdateError:
         if not (base / "src/dependencies.py").is_file():
             raise
         state = None
+        invalid_state = True
     if (base / "src/dependencies.py").is_file():
         from .dependencies import read_spec, prepare_environment
         spec = read_spec(base)
         if state is None or state["lock_hash"] != spec["lock_hash"]:
-            print("依存パッケージの準備のため、実行中の出席処理があれば終了を待ちます…", flush=True)
-            fcntl.flock(runtime, fcntl.LOCK_UN)
-            fcntl.flock(runtime, fcntl.LOCK_EX)
-            try:
-                spec = read_spec(base)
-                print("依存パッケージとChromiumを準備しています…", flush=True)
-                state = prepare_environment(base, spec)
-                set_runtime_state(base, state)
-            finally:
-                fcntl.flock(runtime, fcntl.LOCK_SH)
+            if argv != ["update"]:
+                if invalid_state or state is not None:
+                    raise UpdateError("依存パッケージの環境が不正、または現在の版と一致しません。att update で再準備してください。")
+            else:
+                print("依存パッケージの準備のため、実行中の出席処理があれば終了を待ちます…", flush=True)
+                fcntl.flock(runtime, fcntl.LOCK_UN)
+                fcntl.flock(runtime, fcntl.LOCK_EX)
+                try:
+                    spec = read_spec(base)
+                    print("依存パッケージとChromiumを準備しています…", flush=True)
+                    state = prepare_environment(base, spec)
+                    set_runtime_state(base, state)
+                finally:
+                    fcntl.flock(runtime, fcntl.LOCK_SH)
     if state is not None:
         directory = runtime_directory(base, state)
         os.environ.update(runtime_environment(base, state))
@@ -339,6 +345,12 @@ def validate_manifest(manifest):
         raise UpdateError("更新ファイルのチェックサムを確認できません。")
     if type(size) is not int or not 0 < size <= MAX_ARCHIVE:
         raise UpdateError("更新情報JSONのZIPサイズが不正です。")
+    if "release_notes" in manifest:
+        from .release_notes import validate_notes
+        try:
+            validate_notes(manifest["release_notes"], version)
+        except (ValueError, UnicodeError) as exc:
+            raise UpdateError("更新情報JSONの更新内容が不正です。") from exc
     return manifest
 
 
@@ -439,39 +451,96 @@ def validate_payload(archive, destination, tag):
         raise UpdateError("リリースタグとアプリのバージョンが一致しません。")
 
 
+def refresh_manifest(base, force=False, *, every_start=False):
+    """呼出側がdownload.lockを保持する。更新情報だけを取得し、失敗時は再試行を抑止する。"""
+    updates = base / ".updates"
+    state = read_json(updates / "check.json", {})
+    if not isinstance(state, dict):
+        state = {}
+    retry_at = state.get("retry_at")
+    if type(retry_at) in (int, float) and 0 < retry_at < 253402300799:
+        if not force and time.time() < retry_at:
+            return None
+        state.pop("retry_at", None)
+        state.pop("checked_at", None)
+    checked_at, interval = state.get("checked_at", 0), state.get("interval", 86400)
+    now = time.time()
+    valid_clock = (type(checked_at) in (int, float) and 0 <= checked_at <= now
+                   and type(interval) in (int, float) and 0 < interval <= 86400)
+    if not force and valid_clock and now - checked_at < interval and (not every_start or state.get("check_failed") is True):
+        return None
+    state["check_failed"] = True
+    write_json(updates / "check.json", {**state, "checked_at": now, "interval": 3600})
+    deadline = time.monotonic() + (5 if every_start else 25)
+    try:
+        manifest = fetch_manifest(state, deadline)
+    except HTTPError as exc:
+        record_rate_limit(updates, state, exc)
+        if exc.code == 404:
+            raise UpdateError("更新情報JSONが見つかりません。配布元の正式リリースに attendance-update.json が添付されているか確認してください。") from exc
+        raise
+    state.pop("check_failed", None)
+    return manifest, state, deadline
+
+
+def available_message(manifest):
+    from .version import VERSION
+    if version_tuple(manifest["version"]) <= version_tuple(VERSION):
+        return None
+    return (f"アップデートがあります: v{manifest['version']}（現在 {VERSION}）\n"
+            "  更新内容を確認: att update --notes\n"
+            "  アップデートする: att update")
+
+
+def cached_manifest(base):
+    state = read_json(base / ".updates/check.json", {})
+    try:
+        return validate_manifest(state.get("manifest"))
+    except (AttributeError, UpdateError, ValueError, TypeError):
+        return None
+
+
+def check_update(base):
+    """通常起動ではJSONだけを確認する。ZIP・依存環境・適用待ちデータには触れない。"""
+    updates = base / ".updates"
+    with file_lock(updates / "download.lock", exclusive=True, blocking=False):
+        result = refresh_manifest(base, every_start=True)
+        if result is None:
+            manifest = cached_manifest(base)
+            if manifest is None:
+                return None
+        else:
+            manifest, state, _ = result
+            write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
+        return available_message(manifest)
+
+
+def show_update_notes(base):
+    with file_lock(base / ".updates/download.lock", exclusive=True, blocking=False):
+        manifest, state, _ = refresh_manifest(base, force=True)
+        write_json(base / ".updates/check.json", {**state, "checked_at": time.time(), "interval": 86400})
+    message = available_message(manifest)
+    if message:
+        print(message)
+    notes = manifest.get("release_notes")
+    if notes:
+        print(notes)
+    else:
+        print(f"v{manifest['version']} の配布元は更新内容をJSONに添付していません。")
+        print(f"https://github.com/{REPOSITORY}/releases/tag/v{manifest['version']}")
+
+
 def prepare_update(base, force=False):
-    """通信と検証だけを行う。起動中のコードは変更しない。"""
+    """att updateで通信と検証を行う。起動中のコードは変更しない。"""
     updates = base / ".updates"
     with file_lock(updates / "download.lock", exclusive=True, blocking=False):
         had_pending = (updates / "pending").exists()
         if pending_metadata(base) is not None:
             return "更新の準備ができています。終了時に適用します。"
-        state = read_json(updates / "check.json", {})
-        if not isinstance(state, dict):
-            state = {}
-        if had_pending:
-            state.pop("checked_at", None)
-        retry_at = state.get("retry_at")
-        if type(retry_at) in (int, float) and 0 < retry_at < 253402300799:
-            if not force and time.time() < retry_at:
-                return None
-            state.pop("retry_at", None)
-            state.pop("checked_at", None)
-        checked_at, interval = state.get("checked_at", 0), state.get("interval", 86400)
-        now = time.time()
-        valid_clock = (type(checked_at) in (int, float) and 0 <= checked_at <= now
-                       and type(interval) in (int, float) and 0 < interval <= 86400)
-        if not force and valid_clock and now - checked_at < interval:
+        result = refresh_manifest(base, force=force or had_pending)
+        if result is None:
             return None
-        write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 3600})
-        deadline = time.monotonic() + 25
-        try:
-            manifest = fetch_manifest(state, deadline)
-        except HTTPError as exc:
-            record_rate_limit(updates, state, exc)
-            if exc.code == 404:
-                raise UpdateError("更新情報JSONが見つかりません。配布元の正式リリースに attendance-update.json が添付されているか確認してください。") from exc
-            raise
+        manifest, state, deadline = result
         from .version import VERSION
         version = manifest["version"]
         if not force and version == state.get("skip_version"):
@@ -617,8 +686,13 @@ def apply_pending(base):
 
 def update_command(base, argv):
     parser = argparse.ArgumentParser(prog="att update", description="最新版を取得し、終了時に適用します。")
-    parser.add_argument("--rollback", action="store_true", help="直前の更新前の版に戻します。")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--rollback", action="store_true", help="直前の更新前の版に戻します。")
+    group.add_argument("--notes", action="store_true", help="公開版の更新内容を表示します。取得・適用はしません。")
     args = parser.parse_args(argv)
+    if args.notes:
+        show_update_notes(base)
+        return 0
     if args.rollback:
         if not (base / ".updates/backup/journal.json").is_file():
             raise UpdateError("復元できる更新前の版がありません。")
@@ -656,7 +730,7 @@ def run_application(base, argv=None, *, use_runtime=False):
                  and "--demo" not in argv and "--help" not in argv and "-h" not in argv
                  and "--version" not in argv
                  and (not argv or argv[0] not in {"update", "user", "schedule"}))
-    manual_update = bool(argv and argv[0] == "update" and "--help" not in argv and "-h" not in argv)
+    manual_update = bool(argv and argv[0] == "update" and not any(flag in argv for flag in ("--help", "-h", "--notes")))
     try:
         with file_lock(updates / "runtime.lock") as runtime:
             if (updates / "transaction/journal.json").exists():
@@ -667,21 +741,17 @@ def run_application(base, argv=None, *, use_runtime=False):
             if use_runtime:
                 activate_runtime(base, argv, runtime)
             if automatic:
-                notice = read_json(updates / "notice.json", {})
-                if isinstance(notice, dict) and isinstance(notice.get("message"), str) and notice["message"]:
-                    print(f"更新のお知らせ: {notice['message']}", file=sys.stderr)
+                try:
+                    message = check_update(base)
+                    if message:
+                        print(message, file=sys.stderr)
+                except Exception as exc:
+                    # 確認の失敗は出席処理を妨げず、ログだけに残す。
                     try:
-                        (updates / "notice.json").unlink(missing_ok=True)
+                        with os.fdopen(os.open(updates / "updater.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600), "a") as log:
+                            print(update_failure_message(exc), file=log)
                     except OSError:
                         pass
-                # 別プロセスなので短いCLI操作が終了してもダウンロードを完了できる。
-                try:
-                    with (updates / "updater.log").open("a") as log:
-                        subprocess.Popen([sys.executable, "-m", "src.updater", "--background", str(base)],
-                                         cwd=base, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                         start_new_session=True)
-                except OSError:
-                    pass
             code = 1
             try:
                 if argv and argv[0] == "update":
@@ -689,14 +759,14 @@ def run_application(base, argv=None, *, use_runtime=False):
                 else:
                     code = importlib.import_module("main").main(argv)
             finally:
-                # 起動中・自動実行中の別プロセスがあれば適用を次回へ延期。
-                if automatic or manual_update:
+                # 明示的な更新が成功した時だけ、他の実行がなければ適用する。
+                if manual_update and code == 0:
                     fcntl.flock(runtime, fcntl.LOCK_UN)
                     try:
                         fcntl.flock(runtime, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         if (updates / "pending").exists() or (updates / "rollback.json").exists():
-                            print("更新待機: 別の処理が実行中のため更新は次回終了時に適用します。", file=sys.stderr)
+                            print("更新待機: 別の処理が実行中です。終了後に att update を再実行してください。", file=sys.stderr)
                             if manual_update:
                                 code = 1
                     else:
@@ -717,19 +787,13 @@ def run_application(base, argv=None, *, use_runtime=False):
 
 
 def background_update(base):
-    """本体終了後も取得を続け、他の処理がなければ適用する。"""
+    """以前の起動経路との互換用。更新情報の確認だけを行う。"""
     try:
         with file_lock(base / ".updates/runtime.lock") as runtime:
             if (base / ".updates/transaction/journal.json").exists():
                 return
-            prepare_update(base)
+            message = check_update(base)
             (base / ".updates/notice.json").unlink(missing_ok=True)
-            fcntl.flock(runtime, fcntl.LOCK_UN)
-            try:
-                fcntl.flock(runtime, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            message = finish_update(base)
             if message:
                 print(message, flush=True)
     except BlockingIOError:

@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--demo", action="store_true", help="接続せずに出席確認画面を試します。")
     parser.add_argument("--user", metavar="NAME", help="登録済みのユーザーネームを指定します。省略時は既定ユーザー。")
     parser.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
-    parser.epilog = "更新: att update ／ 更新前の版に戻す: att update --rollback"
+    parser.epilog = "更新内容: att update --notes ／ 更新: att update ／ 更新前の版に戻す: att update --rollback"
     args = parser.parse_args(argv)
     base = Path(__file__).resolve().parent
     if args.demo and not args.ui:
