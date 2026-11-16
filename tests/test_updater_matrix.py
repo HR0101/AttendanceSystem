@@ -34,27 +34,23 @@ class UpdaterMatrixTests(unittest.TestCase):
             fixture.doCleanups()
 
     def release(self, data):
-        return {"tag_name": "v" + fixtures.NEXT, "draft": False, "prerelease": False,
-                "assets": [{"name": u.ASSET_NAME,
-                            "browser_download_url": f"https://github.com/{u.REPOSITORY}/releases/download/v{fixtures.NEXT}/{u.ASSET_NAME}",
-                            "digest": "sha256:" + hashlib.sha256(data).hexdigest()}]}
+        return fixtures.manifest_for(data)
 
     def assert_unchanged(self, fixture):
         self.assertEqual(u.fingerprint(fixture.base), fixture.original)
         fixture.assert_private_preserved()
 
-    def test_network_http_statuses_at_api_and_archive_download(self):
-        for stage in ("api", "archive"):
+    def test_network_http_statuses_at_manifest_and_archive_download(self):
+        for stage in ("manifest", "archive"):
             for status in (400, 401, 403, 404, 407, 408, 410, 422, 429, 500, 502, 503, 504):
                 with self.subTest(stage=stage, status=status), self.installation() as fixture:
-                    error = HTTPError(u.API_URL, status, "private response", {}, None)
-                    replies = [error] if stage == "api" else [json.dumps(self.release(fixture.archive())).encode(), error]
+                    error = HTTPError(u.MANIFEST_URL, status, "private response", {}, None)
+                    replies = [error] if stage == "manifest" else [json.dumps(self.release(fixture.archive())).encode(), error]
                     with patch.object(u, "fetch", side_effect=replies), \
                             redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                         code = u.run_application(fixture.base, ["update"])
-                    no_release = stage == "api" and status == 404
-                    self.assertEqual(code, 0 if no_release else 1)
-                    self.assertIn("更新なし:" if no_release else "更新失敗:", output.getvalue() + errors.getvalue())
+                    self.assertEqual(code, 1)
+                    self.assertIn("更新失敗:", output.getvalue() + errors.getvalue())
                     self.assert_unchanged(fixture)
                     self.assertFalse((fixture.base / ".updates/pending").exists())
 
@@ -86,10 +82,10 @@ class UpdaterMatrixTests(unittest.TestCase):
                 response = io.BytesIO(b"a" * size)
                 with patch.object(u, "urlopen", return_value=response) as request:
                     if valid:
-                        self.assertEqual(u.fetch(u.API_URL, 5, time.monotonic() + 5), b"a" * size)
+                        self.assertEqual(u.fetch(u.MANIFEST_URL, 5, time.monotonic() + 5), b"a" * size)
                     else:
                         with self.assertRaisesRegex(u.UpdateError, "上限"):
-                            u.fetch(u.API_URL, 5, time.monotonic() + 5)
+                            u.fetch(u.MANIFEST_URL, 5, time.monotonic() + 5)
                 self.assertTrue(response.closed)
                 self.assertEqual(request.call_args.kwargs["timeout"], 5)
                 self.assertEqual(request.call_args.args[0].get_header("User-agent"), "AttendanceTool-Updater")
@@ -97,18 +93,18 @@ class UpdaterMatrixTests(unittest.TestCase):
     def test_network_fetch_deadline_and_midstream_failure_close_response(self):
         with patch.object(u, "urlopen", return_value=io.BytesIO(b"body")) as request:
             with self.assertRaisesRegex(u.UpdateError, "タイムアウト"):
-                u.fetch(u.API_URL, 100, time.monotonic() - 1)
+                u.fetch(u.MANIFEST_URL, 100, time.monotonic() - 1)
             self.assertTrue(request.return_value.closed)
         response = Mock()
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         response.read.side_effect = [b"part", ConnectionResetError()]
         with patch.object(u, "urlopen", return_value=response), self.assertRaises(ConnectionResetError):
-            u.fetch(u.API_URL, 100, time.monotonic() + 5)
+            u.fetch(u.MANIFEST_URL, 100, time.monotonic() + 5)
         response.__exit__.assert_called_once()
 
     def test_metadata_invalid_json_and_release_shapes(self):
-        cases = (b"not json", b"\xff", b"null", b"[]", b"1", b'"string"', b"{}", b'{"tag_name": 123}')
+        cases = (b"not json", b"\xff", b"null", b"[]", b"1", b'"string"', b"{}", b'{"version": 123}')
         for body in cases:
             with self.subTest(body=repr(body)), self.installation() as fixture, \
                     patch.object(u, "fetch", return_value=body), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
@@ -116,31 +112,31 @@ class UpdaterMatrixTests(unittest.TestCase):
                 self.assertIn("更新失敗:", errors.getvalue())
                 self.assert_unchanged(fixture)
 
-    def test_metadata_assets_and_checksums_are_validated(self):
-        for value in (None, {}, "bad", [None], [], [{"name": "other.zip"}], [{"name": u.ASSET_NAME}] * 2):
-            with self.subTest(assets=value), self.installation() as fixture:
+    def test_metadata_archive_and_checksums_are_validated(self):
+        for value in (None, {}, "bad", [None], [], {"name": "other.zip"}):
+            with self.subTest(archive=value), self.installation() as fixture:
                 with self.assertRaises(u.UpdateError):
-                    fixture.prepare(assets=value)
+                    fixture.prepare(archive=value)
                 self.assert_unchanged(fixture)
-        for digest in (None, "", "md5:" + "a" * 32, "sha256:" + "A" * 64, "sha256:" + "a" * 63, "sha256:" + "0" * 64):
+        for digest in (None, "", "md5:" + "a" * 32, "A" * 64, "a" * 63, "0" * 64):
             with self.subTest(digest=digest), self.installation() as fixture:
                 release = self.release(fixture.archive())
-                release["assets"][0]["digest"] = digest
+                release["archive"]["sha256"] = digest
                 with self.assertRaises(u.UpdateError):
                     fixture.prepare(**release)
                 self.assert_unchanged(fixture)
 
     def test_metadata_release_gating_and_numeric_versions(self):
-        for changes in ({"draft": True}, {"prerelease": True}, {"tag_name": "v0.0.0"}, {"tag_name": "v" + fixtures.VERSION}):
+        for changes in ({"version": "0.0.0"}, {"version": fixtures.VERSION}):
             with self.subTest(changes=changes), self.installation() as fixture:
                 message, fetch = fixture.prepare(**changes)
                 self.assertIn("更新なし:", message)
                 self.assertEqual(fetch.call_count, 1)
                 self.assert_unchanged(fixture)
-        for version in ("", "v1", "1.2", "1.2.3.4", "v1.2.3-beta", "01.2.3", "1.02.3", "../1.2.3"):
+        for version in ("", "v1", "1.2", "1.2.3.4", "1.2.3-beta", "01.2.3", "1.02.3", "../1.2.3", "v1.2.3"):
             with self.subTest(version=version), self.installation() as fixture:
                 with self.assertRaises(u.UpdateError):
-                    fixture.prepare(tag_name=version)
+                    fixture.prepare(version=version)
                 self.assert_unchanged(fixture)
 
     def test_archive_malformed_zip_and_python_syntax(self):
@@ -276,7 +272,7 @@ class UpdaterMatrixTests(unittest.TestCase):
                 path = fixture.base / ".updates/check.json"
                 path.parent.mkdir(exist_ok=True)
                 path.write_bytes(state)
-                with patch.object(u, "fetch", return_value=json.dumps({"tag_name": "v" + fixtures.VERSION}).encode()) as fetch:
+                with patch.object(u, "fetch", return_value=json.dumps(fixtures.manifest_for(fixture.archive(), fixtures.VERSION)).encode()) as fetch:
                     message = u.prepare_update(fixture.base)
                 self.assertIn("更新なし:", message)
                 fetch.assert_called_once()

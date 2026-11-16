@@ -23,6 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 NEXT = "99.0.0"
 
 
+def manifest_for(data, version=NEXT):
+    return {"schema_version": 1, "version": version,
+            "archive": {"name": u.ASSET_NAME, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}}
+
+
 class UpdaterTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -63,16 +68,11 @@ class UpdaterTests(unittest.TestCase):
                 archive.writestr(name, content)
         return stream.getvalue()
 
-    def prepare(self, data=None, smoke=True, **release_changes):
+    def prepare(self, data=None, smoke=True, **manifest_changes):
         data = self.archive() if data is None else data
-        release = {
-            "tag_name": "v" + NEXT, "draft": False, "prerelease": False,
-            "assets": [{"name": u.ASSET_NAME,
-                        "browser_download_url": f"https://github.com/{u.REPOSITORY}/releases/download/v{NEXT}/{u.ASSET_NAME}",
-                        "digest": "sha256:" + hashlib.sha256(data).hexdigest()}],
-        }
-        release.update(release_changes)
-        with patch.object(u, "fetch", side_effect=[json.dumps(release).encode(), data]) as fetch:
+        manifest = manifest_for(data)
+        manifest.update(manifest_changes)
+        with patch.object(u, "fetch", side_effect=[json.dumps(manifest).encode(), data]) as fetch:
             if smoke:
                 result = u.prepare_update(self.base, force=True)
             else:
@@ -130,15 +130,14 @@ class UpdaterTests(unittest.TestCase):
         self.assert_private_preserved()
 
     def test_bad_checksum_is_rejected(self):
-        with self.assertRaises(u.UpdateError):
-            self.prepare(assets=[{"name": u.ASSET_NAME,
-                                 "browser_download_url": f"https://github.com/{u.REPOSITORY}/releases/download/v{NEXT}/{u.ASSET_NAME}",
-                                 "digest": "sha256:" + "0" * 64}])
+        data = self.archive()
+        with self.assertRaisesRegex(u.UpdateError, "チェックサムが一致"):
+            self.prepare(data, archive={"name": u.ASSET_NAME, "size": len(data), "sha256": "0" * 64})
         self.assertEqual(u.fingerprint(self.base), self.original)
 
-    def test_untrusted_download_url_is_rejected(self):
+    def test_untrusted_archive_name_is_rejected(self):
         with self.assertRaises(u.UpdateError):
-            self.prepare(assets=[{"name": u.ASSET_NAME, "browser_download_url": "https://example.test/file"}])
+            self.prepare(archive={"name": "https://example.test/file", "size": 1, "sha256": "0" * 64})
 
     def test_archive_rejects_path_traversal_and_private_files(self):
         for name in ("../escape.py", "/tmp/escape.py", "config.json", "schedule.json", ".git/config", "src/../../escape.py"):
@@ -216,15 +215,17 @@ class UpdaterTests(unittest.TestCase):
         self.assertIn(VERSION, result.stdout)
         self.assertEqual(u.fingerprint(self.base), self.original)
 
-    def test_old_and_prerelease_versions_are_ignored(self):
-        for changes in ({"tag_name": "v0.0.1"}, {"prerelease": True}):
-            message, fetch = self.prepare(**changes)
-            self.assertTrue(message.startswith("更新なし:"))
-            self.assertEqual(fetch.call_count, 1)
+    def test_old_version_is_ignored_and_prerelease_is_rejected(self):
+        message, fetch = self.prepare(version="0.0.1")
+        self.assertTrue(message.startswith("更新なし:"))
+        self.assertEqual(fetch.call_count, 1)
+        with self.assertRaises(u.UpdateError):
+            self.prepare(version="99.0.0-rc1")
 
     def test_no_release_and_offline_do_not_break_background(self):
-        with patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, 404, "", {}, None)):
-            self.assertIn("更新なし: 公開済みの正式リリース", u.prepare_update(self.base, force=True))
+        with patch.object(u, "fetch", side_effect=HTTPError(u.MANIFEST_URL, 404, "", {}, None)):
+            with self.assertRaisesRegex(u.UpdateError, "更新情報JSONが見つかりません"):
+                u.prepare_update(self.base, force=True)
         with patch.object(u, "prepare_update", side_effect=OSError("offline")):
             u.background_update(self.base)
         self.assertEqual(u.fingerprint(self.base), self.original)
@@ -236,7 +237,7 @@ class UpdaterTests(unittest.TestCase):
             fetch.assert_not_called()
 
     def test_current_release_is_explicitly_reported_as_no_update(self):
-        message, _ = self.prepare(tag_name="v" + VERSION)
+        message, _ = self.prepare(version=VERSION)
         self.assertIn("更新なし: 最新版です", message)
         self.assertIn(VERSION, message)
 
@@ -244,9 +245,9 @@ class UpdaterTests(unittest.TestCase):
         cases = [
             (URLError("private-details"), "接続できません"),
             (URLError(TimeoutError()), "タイムアウト"),
-            (HTTPError(u.API_URL, 403, "", {}, None), "アクセスが拒否または制限"),
-            (HTTPError(u.API_URL, 429, "", {}, None), "アクセスが拒否または制限"),
-            (HTTPError(u.API_URL, 503, "", {}, None), "サーバーでエラー"),
+            (HTTPError(u.MANIFEST_URL, 403, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.MANIFEST_URL, 429, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.MANIFEST_URL, 503, "", {}, None), "サーバーでエラー"),
             (zipfile.BadZipFile("private-details"), "更新データに問題"),
             (PermissionError("private-details"), "保存する権限"),
         ]
@@ -261,17 +262,16 @@ class UpdaterTests(unittest.TestCase):
             self.assertNotIn("更新なし", message)
             self.assertNotIn("private-details", message)
 
-    def test_missing_release_is_success_but_missing_asset_is_failure(self):
-        with patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, 404, "", {}, None)), \
-                redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(u.run_application(self.base, ["update"]), 0)
-        self.assertIn("更新なし:", output.getvalue())
-        with patch.object(u, "fetch", side_effect=[json.dumps({"tag_name": "v" + NEXT, "assets": []}).encode()]), \
+    def test_missing_manifest_or_archive_is_failure(self):
+        with patch.object(u, "fetch", side_effect=HTTPError(u.MANIFEST_URL, 404, "", {}, None)), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(u.run_application(self.base, ["update"]), 1)
+        self.assertIn("更新情報JSONが見つかりません", errors.getvalue())
+        with patch.object(u, "fetch", side_effect=[json.dumps(manifest_for(self.archive())).encode(), HTTPError(u.MANIFEST_URL, 404, "", {}, None)]), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(u.run_application(self.base, ["update"]), 1)
         self.assertIn("更新失敗:", errors.getvalue())
-        self.assertIn("新版 v" + NEXT, errors.getvalue())
-        self.assertIn("更新用ZIPがありません", errors.getvalue())
+        self.assertIn("更新ファイルが見つかりません", errors.getvalue())
 
     def test_background_notice_includes_same_failure_reason(self):
         with patch.object(u, "prepare_update", side_effect=URLError("offline")), redirect_stdout(io.StringIO()):
@@ -290,8 +290,8 @@ class UpdaterTests(unittest.TestCase):
 
     def test_rolled_back_release_is_not_automatically_reinstalled(self):
         u.write_json(self.base / ".updates/check.json", {"skip_version": NEXT})
-        release = {"tag_name": "v" + NEXT}
-        with patch.object(u, "fetch", return_value=json.dumps(release).encode()) as fetch:
+        manifest = manifest_for(self.archive())
+        with patch.object(u, "fetch", return_value=json.dumps(manifest).encode()) as fetch:
             self.assertIsNone(u.prepare_update(self.base))
             self.assertEqual(fetch.call_count, 1)
         self.assertFalse((self.base / ".updates/pending").exists())
@@ -344,7 +344,7 @@ class UpdaterTests(unittest.TestCase):
     def test_background_http_rejection_preserves_files_and_retries_after_one_hour(self):
         for status in (403, 429):
             with self.subTest(status=status), \
-                    patch.object(u, "fetch", side_effect=HTTPError(u.API_URL, status, "", {}, None)) as fetch, \
+                    patch.object(u, "fetch", side_effect=HTTPError(u.MANIFEST_URL, status, "", {}, None)) as fetch, \
                     redirect_stdout(io.StringIO()):
                 u.write_json(self.base / ".updates/check.json", {})
                 u.background_update(self.base)
@@ -377,7 +377,7 @@ import urllib.request
 
 fixture = Path(os.environ["ATTENDANCE_TEST_TRANSPORT"])
 def fixture_open(request, timeout=None):
-    if request.full_url.endswith("/releases/latest"):
+    if request.full_url.endswith("/releases/latest/download/attendance-update.json"):
         return io.BytesIO((fixture / "release.json").read_bytes())
     if request.full_url.endswith("/attendance-update.zip"):
         time.sleep(0.3)
@@ -402,12 +402,7 @@ urllib.request.urlopen = fixture_open
                 u.write_json(self.base / ".updates/check.json", {})
                 data = self.archive()
                 (fixture / "release.zip").write_bytes(data)
-                (fixture / "release.json").write_text(json.dumps({
-                    "tag_name": "v" + NEXT, "draft": False, "prerelease": False,
-                    "assets": [{"name": u.ASSET_NAME,
-                                "browser_download_url": f"https://github.com/{u.REPOSITORY}/releases/download/v{NEXT}/{u.ASSET_NAME}",
-                                "digest": "sha256:" + hashlib.sha256(data).hexdigest()}],
-                }))
+                (fixture / "release.json").write_text(json.dumps(manifest_for(data)))
                 result = subprocess.run(command, cwd=self.base, env=environment,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)

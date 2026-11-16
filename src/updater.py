@@ -23,8 +23,10 @@ from urllib.request import Request, urlopen
 import zipfile
 
 REPOSITORY = "HR0101/AttendanceSystem"
-API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 ASSET_NAME = "attendance-update.zip"
+MANIFEST_NAME = "attendance-update.json"
+MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/{MANIFEST_NAME}"
+MAX_MANIFEST = 64 * 1024
 MAX_ARCHIVE = 8 * 1024 * 1024
 ROOT_FILES = frozenset({
     "main.py", "att", "attendance", "start.command", "install.command", "install.sh",
@@ -161,7 +163,8 @@ def file_lock(path, exclusive=False, blocking=True):
 
 
 def fetch(url, limit, deadline):
-    request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "AttendanceTool-Updater"})
+    request = Request(url, headers={"Accept": "application/json" if url == MANIFEST_URL else "application/octet-stream",
+                                    "User-Agent": "AttendanceTool-Updater"})
     chunks = []
     total = 0
     with urlopen(request, timeout=5) as response:
@@ -175,6 +178,24 @@ def fetch(url, limit, deadline):
             total += len(chunk)
             if total > limit:
                 raise UpdateError("更新ファイルが上限サイズを超えています。")
+
+
+def validate_manifest(manifest):
+    """公開JSONを検証する。ZIPの取得先は版番号から組み立てる。"""
+    if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
+        raise UpdateError("更新情報JSONの形式または形式バージョンが不正です。")
+    version = manifest.get("version")
+    if version != ".".join(map(str, version_tuple(version))):
+        raise UpdateError("更新情報JSONのバージョンが不正です。")
+    archive = manifest.get("archive")
+    if not isinstance(archive, dict) or archive.get("name") != ASSET_NAME:
+        raise UpdateError("更新情報JSONの更新用ZIPの指定が不正です。")
+    digest, size = archive.get("sha256"), archive.get("size")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise UpdateError("更新ファイルのチェックサムを確認できません。")
+    if type(size) is not int or not 0 < size <= MAX_ARCHIVE:
+        raise UpdateError("更新情報JSONのZIPサイズが不正です。")
+    return manifest
 
 
 def pending_metadata(base):
@@ -249,42 +270,27 @@ def prepare_update(base, force=False):
         write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 3600})
         deadline = time.monotonic() + 25
         try:
-            release = json.loads(fetch(API_URL, 1024 * 1024, deadline))
+            manifest = validate_manifest(json.loads(fetch(MANIFEST_URL, MAX_MANIFEST, deadline)))
         except HTTPError as exc:
             if exc.code == 404:
-                write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
-                return "更新なし: 公開済みの正式リリースが見つかりません。現在のバージョンを継続します。"
+                raise UpdateError("更新情報JSONが見つかりません。配布元の正式リリースに attendance-update.json が添付されているか確認してください。") from exc
             raise
-        if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
-            raise UpdateError("リリース情報の形式が不正です。")
         from .version import VERSION
-        if not force and release.get("tag_name", "").removeprefix("v") == state.get("skip_version"):
+        version = manifest["version"]
+        if not force and version == state.get("skip_version"):
             write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
             return None
-        if release.get("draft") or release.get("prerelease"):
+        tag = "v" + version
+        if version_tuple(version) <= version_tuple(VERSION):
             write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
-            return "更新なし: 自動更新の対象となる正式リリースがありません。"
-        if version_tuple(release["tag_name"]) <= version_tuple(VERSION):
-            write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
-            if version_tuple(release["tag_name"]) == version_tuple(VERSION):
-                return f"更新なし: 最新版です（現在 {VERSION}／公開版 {release['tag_name']}）。"
-            return f"更新なし: 使用中の {VERSION} は公開版 {release['tag_name']} より新しいバージョンです。"
-        tag = release["tag_name"]
-        raw_assets = release.get("assets", [])
-        if not isinstance(raw_assets, list) or not all(isinstance(a, dict) for a in raw_assets):
-            raise UpdateError("リリース情報の形式が不正です。")
-        assets = [a for a in raw_assets if a.get("name") == ASSET_NAME]
-        if len(assets) != 1:
-            raise UpdateError(f"新版 {tag} は公開されていますが、更新用ZIPがありません。配布元の準備完了後に再実行してください。")
-        asset = assets[0]
-        url = asset.get("browser_download_url", "")
-        if url != f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}":
-            raise UpdateError("更新ファイルの配布元が不正です。")
-        digest = asset.get("digest", "")
-        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-            raise UpdateError("更新ファイルのチェックサムを確認できません。")
+            if version_tuple(version) == version_tuple(VERSION):
+                return f"更新なし: 最新版です（現在 {VERSION}／公開版 {tag}）。"
+            return f"更新なし: 使用中の {VERSION} は公開版 {tag} より新しいバージョンです。"
+        url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}"
         data = fetch(url, MAX_ARCHIVE, deadline)
-        if "sha256:" + hashlib.sha256(data).hexdigest() != digest:
+        if len(data) != manifest["archive"]["size"]:
+            raise UpdateError("更新ファイルのサイズが更新情報JSONと一致しません。")
+        if hashlib.sha256(data).hexdigest() != manifest["archive"]["sha256"]:
             raise UpdateError("更新ファイルのチェックサムが一致しません。")
         with tempfile.TemporaryDirectory(dir=updates, prefix="download-") as temp:
             temporary = Path(temp)

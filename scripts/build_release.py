@@ -1,12 +1,14 @@
-"""個人設定を含めず更新用ZIPを作る。 python scripts/build_release.py v0.2.0"""
+"""個人設定を含めず更新用ZIPとJSONを作る。 python scripts/build_release.py v0.2.2"""
 
+import hashlib
+import json
 from pathlib import Path
 import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from src.updater import ASSET_NAME, REQUIRED, allowed, managed_files, version_tuple
+from src.updater import ASSET_NAME, MANIFEST_NAME, REQUIRED, allowed, atomic_write, managed_files, validate_manifest, version_tuple
 from src.version import VERSION
 
 
@@ -22,6 +24,13 @@ def build(tag, output):
             if (ROOT / name).is_symlink():
                 raise ValueError("シンボリックリンクは配布できません。")
             archive.write(ROOT / name, name)
+    data = output.read_bytes()
+    manifest = validate_manifest({
+        "schema_version": 1,
+        "version": VERSION,
+        "archive": {"name": ASSET_NAME, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+    })
+    atomic_write(output.parent / MANIFEST_NAME, (json.dumps(manifest, indent=2) + "\n").encode(), 0o644)
     return output
 
 
@@ -29,3 +38,4 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise SystemExit("使い方: python scripts/build_release.py vX.Y.Z")
     print(build(sys.argv[1], ROOT / "dist" / ASSET_NAME))
+    print(ROOT / "dist" / MANIFEST_NAME)
