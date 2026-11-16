@@ -96,7 +96,7 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 
 リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` と配布用の `src/dependency_lock.py` を再生成してください（[手順](COMMANDS.md#tests)）。ロック情報はPythonのデータファイルとしてZIPに同梱します。旧版の自動更新が未知の `.lock` ファイルを拒否するため、`requirements.lock` 自体はZIPに追加しません。ビルド時に両方の内容が一致するか検証します。v0.2.2以前から最初に移行するリリースでは `requirements.txt` を変更しないでください。v0.2.3への移行後は、依存変更も `att update` で取得・適用できます。
 
-ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.2.3` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
+ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.2.4` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
 
 <a id="configuration"></a>
 
@@ -105,6 +105,8 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 初回起動時に学生番号・ユーザーネーム・パスワードを入力します。学生番号とユーザーネームはローカルの `config.json`、パスワードは macOS Keychain の `UniversityAttendanceTool` に保存します。これらはGitの追跡対象外です。`config.json` を共有したり、ログを公開したりしないでください。
 
 ユーザーネームは表示・選択用で、大学へのログインには学生番号を使います。名前と学生番号の重複登録はできません。既存の `student_id` 設定も利用でき、初めは学生番号をユーザーネームとして扱います。
+
+画面の `U` でユーザー管理を開き、`I` で学籍番号変更、`X` で確認後の削除ができます。番号変更では保存パスワードを引き継ぎ、削除では保存パスワードも取り除きます。詳しくは[ユーザー管理の操作](COMMANDS.md#users)を参照してください。
 
 GUIでは `U` で一覧を開き、↑↓とSpaceで出席するユーザーを複数選択してEnterで適用できます。QR番号の授業をユーザーごとに確認し、「○人を出席登録」からまとめて登録します。処理は最大4人ずつ並行して行い、結果は `U` → `V` で個別に確認できます。選択は今回のGUIで有効です。
 

@@ -17,7 +17,7 @@ from .logging_utils import setup_logging
 from .room import RoomError, parse_room
 from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
-from .users import get_users, select_user, valid_username
+from .users import change_student_id_config, get_users, remove_user_config, select_user, valid_username
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
 
@@ -144,7 +144,7 @@ class AttendanceScreen:
                     from .attendance import run_attendance
                     from .browser import open_page
                     config = dict(self.config, dry_run=not register)
-                    if student_id == self.student_id:
+                    if student_id == self.student_id and self.password:
                         password = self.password
                     else:
                         if self.base is None:
@@ -228,13 +228,22 @@ class AttendanceScreen:
                 self.complete_attendance(data)
             elif kind == "account":
                 config, student_id, password, action, selection = data
+                if action in ("delete", "student_id"):
+                    removed = {u["student_id"] for u in get_users(self.config)} - {u["student_id"] for u in get_users(config)}
+                    self.demo_attended = {entry for entry in self.demo_attended if entry[0] not in removed}
+                    self.clear_target()
                 config["dry_run"] = self.config.get("dry_run", False)
                 self.config, self.student_id, self.password = config, student_id, password
                 if selection is not None:
                     self.selected_user_ids = selection
+                    self.pending_user_ids = set(selection)
                 self.busy = False
                 self.modal = None
-                self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": "既定ユーザーを変更しました。通常実行・自動実行に反映されます。"}[action]
+                self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": "既定ユーザーを変更しました。通常実行・自動実行に反映されます。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
+                self.user_index = min(self.user_index, max(0, len(get_users(config)) - 1))
+                if action == "delete" and not get_users(config):
+                    self.modal = "users"
+                    self.message += " Aで新しいユーザーを追加できます。"
                 if action == "switch" and self.room:
                     self.start()
             elif kind == "account_error":
@@ -266,7 +275,8 @@ class AttendanceScreen:
 
         def work():
             try:
-                from .user_commands import add_user, change_password, rename_user, use_user
+                from .user_commands import add_user, change_password, change_student_id, remove_user, rename_user, use_user
+                target = select_user(self.config, name) if action in ("delete", "student_id") else None
                 if self.demo:
                     config = dict(self.config, users=get_users(self.config))
                     if action == "add":
@@ -289,6 +299,10 @@ class AttendanceScreen:
                         select_user(config, name)
                         if not password:
                             raise CredentialError("新しいパスワードを入力してください。")
+                    elif action == "delete":
+                        config = remove_user_config(config, name)
+                    elif action == "student_id":
+                        config = change_student_id_config(config, name, student_id)
                 else:
                     if self.base is None:
                         raise CredentialError("設定ファイルの場所を確認できません。")
@@ -300,6 +314,10 @@ class AttendanceScreen:
                         config = use_user(self.base, name)
                     elif action == "password":
                         config = change_password(self.base, name, password)
+                    elif action == "delete":
+                        config = remove_user(self.base, name)
+                    elif action == "student_id":
+                        config = change_student_id(self.base, name, student_id)
                     else:
                         config = load_config(self.base / "config.json")
                 current_id, current_password = self.student_id, self.password
@@ -310,8 +328,26 @@ class AttendanceScreen:
                         current_id, current_password = get_credentials(config, self.base / "config.json", interactive=False, username=name)
                 elif action == "password" and not self.demo and select_user(config, name)["student_id"] == current_id:
                     current_password = password
-                config["_active_username"] = next((u["username"] for u in get_users(config) if u["student_id"] == current_id), current_id)
                 selected = {current_id} if action == "switch" else None
+                if action in ("delete", "student_id"):
+                    selected = set(self.selected_user_ids)
+                    if target["student_id"] in selected:
+                        selected.remove(target["student_id"])
+                        if action == "student_id":
+                            selected.add(student_id)
+                    if action == "student_id" and current_id == target["student_id"]:
+                        current_id = student_id
+                    users = get_users(config)
+                    selected.intersection_update(user["student_id"] for user in users)
+                    if not selected and users:
+                        selected.add(select_user(config)["student_id"])
+                    if current_id not in selected:
+                        current_id = next((user["student_id"] for user in users if user["student_id"] in selected), "")
+                        current_password = ""
+                elif action == "add" and not current_id:
+                    current_id, current_password = student_id, "" if self.demo else password
+                    selected = {student_id}
+                config["_active_username"] = next((u["username"] for u in get_users(config) if u["student_id"] == current_id), current_id)
                 self.events.put(("account", (config, current_id, current_password, action, selected)))
             except (ConfigurationError, CredentialError, OSError) as exc:
                 self.events.put(("account_error", str(exc)))
@@ -347,12 +383,13 @@ class AttendanceScreen:
 
     def open_form(self, action):
         users = get_users(self.config)
-        if action in ("rename", "password") and not users:
+        if action in ("rename", "password", "student_id") and not users:
             return
         self.modal = action
         self.form_index = 0
         self.form_error = ""
         self.form_values = (["", "", ""] if action == "add" else ["", ""] if action == "password"
+                            else [users[self.user_index]["student_id"]] if action == "student_id"
                             else [users[self.user_index]["username"]])
 
     def handle_modal(self, key):
@@ -361,7 +398,7 @@ class AttendanceScreen:
             return
         if key == "\x1b":
             self.form_values = []
-            self.modal = "users" if self.modal == "user_result" else None
+            self.modal = "users" if self.modal in ("user_result", "delete") else None
             return
         enter = key in ("\n", "\r", curses.KEY_ENTER)
         if self.modal == "help":
@@ -386,6 +423,11 @@ class AttendanceScreen:
                 self.open_form("rename")
             elif key in ("p", "P"):
                 self.open_form("password")
+            elif key in ("i", "I"):
+                self.open_form("student_id")
+            elif key in ("x", "X") and users:
+                self.modal = "delete"
+                self.confirm_selection = 0
             elif key in ("d", "D") and users:
                 self.modal = "default"
             return
@@ -394,7 +436,16 @@ class AttendanceScreen:
                 users = get_users(self.config)
                 self.account_action("default", users[self.user_index]["username"])
             return
-        if self.modal in ("add", "rename", "password"):
+        if self.modal == "delete":
+            if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+                self.confirm_selection = 1 - self.confirm_selection
+            elif enter:
+                if self.confirm_selection:
+                    self.account_action("delete", get_users(self.config)[self.user_index]["username"])
+                else:
+                    self.modal = "users"
+            return
+        if self.modal in ("add", "rename", "password", "student_id"):
             if enter and self.form_index == len(self.form_values) - 1:
                 if self.modal == "add":
                     name, student_id, password = self.form_values
@@ -415,6 +466,19 @@ class AttendanceScreen:
                         return
                     users = get_users(self.config)
                     self.account_action("password", users[self.user_index]["username"], password=password)
+                elif self.modal == "student_id":
+                    users = get_users(self.config)
+                    new_id = self.form_values[0].strip()
+                    if not new_id or not new_id.isascii() or not new_id.isalnum():
+                        self.form_error = "学籍番号は半角英数字で入力してください。"
+                        return
+                    if new_id == users[self.user_index]["student_id"]:
+                        self.form_error = "現在と異なる学籍番号を入力してください。"
+                        return
+                    if any(user["student_id"] == new_id for user in users):
+                        self.form_error = "その学籍番号は登録済みです。"
+                        return
+                    self.account_action("student_id", users[self.user_index]["username"], student_id=new_id)
                 else:
                     users = get_users(self.config)
                     new_name = self.form_values[0].strip()
@@ -551,13 +615,13 @@ class AttendanceScreen:
         left = (canvas.width - width) // 2
         height = min(canvas.height - 4, 20)
         top = (canvas.height - height) // 2
-        title = {"users": "ユーザー選択・管理", "user_result": "ユーザーごとの結果", "add": "ユーザー登録", "rename": "ユーザーネームの変更", "password": "保存パスワードの変更", "default": "既定ユーザーを変更", "help": "操作ヘルプ"}[self.modal]
+        title = {"users": "ユーザー選択・管理", "user_result": "ユーザーごとの結果", "add": "ユーザー登録", "rename": "ユーザーネームの変更", "password": "保存パスワードの変更", "student_id": "学籍番号の変更", "delete": "ユーザーの削除", "default": "既定ユーザーを変更", "help": "操作ヘルプ"}[self.modal]
         canvas.box(top, left, width, height, title, color(1))
         if self.modal == "users":
             users = get_users(self.config)
             default = select_user(self.config)
             canvas.put(top + 2, left + 3, f"Space 選択/解除  Enter 決定（{len(self.pending_user_ids)}人）", width=width - 6)
-            count = max(1, (height - 9) // 2)
+            count = max(1, (height - 10) // 2)
             self.user_index = min(self.user_index, max(0, len(users) - 1))
             first = max(0, self.user_index - count + 1)
             for index, user in enumerate(users[first:first + count], first):
@@ -569,8 +633,9 @@ class AttendanceScreen:
                 canvas.put(row, left + 3, f"{marker} {user['username']} / {user['student_id']}{tags}", attr, width - 6)
                 result = self.user_results.get(user["student_id"], {}).get("result", "未確認")
                 canvas.put(row + 1, left + 7, result, curses.A_DIM, width - 10)
-            canvas.put(top + height - 4, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
-            canvas.put(top + height - 5, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
+            canvas.put(top + height - 6, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
+            canvas.put(top + height - 5, left + 3, "I 学籍番号変更  X 削除", color(1), width - 6)
+            canvas.put(top + height - 4, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
             canvas.put(top + height - 3, left + 3, self.form_error or "既定ユーザーは通常実行・自動実行に使われます。", color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "user_result":
             user = get_users(self.config)[self.user_index]
@@ -581,13 +646,29 @@ class AttendanceScreen:
                 details += "\n\n" + "\n".join(f"{label}: {value}" for label, value in result["values"].items())
             for index, line in enumerate(wrap_text(details, width - 6)[:height - 7]):
                 canvas.put(top + 4 + index, left + 3, line, width=width - 6)
-        elif self.modal in ("add", "rename", "password"):
+        elif self.modal == "delete":
+            user = get_users(self.config)[self.user_index]
+            canvas.put(top + 2, left + 3, user["username"], curses.A_BOLD, width - 6)
+            canvas.put(top + 3, left + 3, f"学籍番号: {user['student_id']}", curses.A_BOLD, width - 6)
+            details = "このアプリの登録と保存パスワードを削除します。\n大学側のアカウントは削除しません。"
+            if len(get_users(self.config)) == 1:
+                details += "\n最後のユーザーです。削除後はAで追加できます。"
+            elif user == select_user(self.config):
+                details += "\n既定ユーザーは残った一覧の先頭に切り替わります。"
+            for index, line in enumerate(wrap_text(details, width - 6)):
+                canvas.put(top + 5 + index, left + 3, line, width=width - 6)
+            canvas.button(top + height - 5, left + 3, "[ キャンセル ]", self.confirm_selection == 0)
+            canvas.button(top + height - 5, left + 29, "[ 削除 ]", self.confirm_selection == 1)
+            canvas.put(top + height - 3, left + 3, "Tab/←→で選択し、Enterで決定します。", curses.A_DIM, width - 6)
+        elif self.modal in ("add", "rename", "password", "student_id"):
             fields = (("ユーザーネーム", "学生番号", "パスワード") if self.modal == "add" else
-                      ("新しいパスワード", "新しいパスワード（確認）") if self.modal == "password" else ("新しいユーザーネーム",))
-            if self.modal == "password":
+                      ("新しいパスワード", "新しいパスワード（確認）") if self.modal == "password" else
+                      ("新しい学籍番号",) if self.modal == "student_id" else ("新しいユーザーネーム",))
+            if self.modal in ("password", "student_id"):
                 user = get_users(self.config)[self.user_index]
                 canvas.put(top + 2, left + 3, f"{user['username']} / {user['student_id']}", width=width - 6)
-                canvas.put(top + 10, left + 3, "大学側で変更済みのパスワードを入力します。", curses.A_DIM, width - 6)
+                detail = "保存パスワードを新番号へ引き継ぎます。" if self.modal == "student_id" else "大学側で変更済みのパスワードを入力します。"
+                canvas.put(top + 10, left + 3, detail, curses.A_DIM, width - 6)
             for index, label in enumerate(fields):
                 row = top + 3 + index * 3
                 canvas.put(row, left + 3, label, curses.A_DIM)
@@ -617,7 +698,7 @@ class AttendanceScreen:
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
-        canvas.put(top + height - 2, left + 3, "Esc: 閉じる" + ("  Tab/↑↓: 項目選択" if self.modal in ("add", "rename", "password") else ""), curses.A_DIM, width - 6)
+        canvas.put(top + height - 2, left + 3, "Esc: 閉じる" + ("  Tab/↑↓: 項目選択" if self.modal in ("add", "rename", "password", "student_id") else ""), curses.A_DIM, width - 6)
 
     def run(self, screen):
         try:

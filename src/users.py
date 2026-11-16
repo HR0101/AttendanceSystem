@@ -51,3 +51,29 @@ def select_user(config, username=None):
                 return user
         raise ConfigurationError(f"ユーザー「{selected}」は未登録です。att user list で確認してください。")
     return users[0] if users else None
+
+
+def remove_user_config(config, name):
+    user = select_user(config, name)
+    default = select_user(config)
+    remaining = [entry for entry in get_users(config) if entry["student_id"] != user["student_id"]]
+    result = dict(config, users=remaining)
+    # 旧形式の番号を残すとget_usersが削除したユーザーを再作成する。
+    result.pop("student_id", None)
+    result["default_user"] = (remaining[0]["username"] if remaining else "") if default == user else default["username"]
+    return result
+
+
+def change_student_id_config(config, name, student_id):
+    user = select_user(config, name)
+    users = get_users(config)
+    if not isinstance(student_id, str) or not student_id or not student_id.isascii() or not student_id.isalnum():
+        raise ConfigurationError("学籍番号は半角英数字で入力してください。")
+    if any(entry["student_id"] == student_id and entry["username"] != name for entry in users):
+        raise ConfigurationError("その学籍番号は登録済みです。")
+    for entry in users:
+        if entry["username"] == user["username"]:
+            entry["student_id"] = student_id
+    result = dict(config, users=users)
+    result.pop("student_id", None)
+    return result
