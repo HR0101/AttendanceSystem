@@ -35,5 +35,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" dist/attendance-update.zip dist/attendance-update.json --verify-tag --generate-notes --draft
+          gh release create "$RELEASE_TAG" dist/attendance-update.zip dist/attendance-update.json --verify-tag --notes-file "updates/${RELEASE_TAG#v}.md" --draft
           gh release edit "$RELEASE_TAG" --draft=false --latest

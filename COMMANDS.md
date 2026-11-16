@@ -31,16 +31,17 @@ att --ui                 # GUIを開く
 
 ## 更新
 
-通常起動時に原則1日1回、正式リリースをバックグラウンドで確認し、終了後に適用します。ユーザー・認証情報・授業予定は保持します。他の処理の実行中、自動出席、デモでは更新を適用しません。
+通常起動では正式リリースの更新情報だけを確認し、新しい版がある時にコマンドを案内します。更新内容を確認してから `att update` で取得・適用してください。更新がない時は通知を表示しません。ユーザー・認証情報・授業予定は保持します。
 
 ```sh
 att update               # 手動で最新の正式リリースへ更新
+att update --notes       # 更新内容を表示（取得・適用なし）
 att --version            # バージョンを表示
 att update --rollback    # 直前の更新前の版へ戻す
-ATTENDANCE_NO_UPDATE=1 att --ui  # 自動更新せず起動
+ATTENDANCE_NO_UPDATE=1 att --ui  # 更新の確認・通知を止めて起動
 ```
 
-旧版からこの機能を導入する時だけ手動更新が必要です。依存ライブラリの変更を伴うリリースも手動セットアップになります。詳しくは[READMEの自動アップデート](README.md#自動アップデート)を参照してください。
+v0.2.3以降は、依存パッケージとChromiumも別環境へ自動で準備します。初回の移行やAPI制限で旧版が更新できない場合の手順は[READMEの自動アップデート](README.md#自動アップデート)を参照してください。
 
 <a id="attendance"></a>
 
@@ -183,6 +184,7 @@ cp schedule.example.json schedule.json # 初めて予定ファイルを作る場
 ## 開発用テスト
 
 ```sh
+python3 scripts/check_update_notes.py
 .venv/bin/python -m unittest discover -s tests
 ```
 
@@ -194,6 +196,7 @@ cp schedule.example.json schedule.json # 初めて予定ファイルを作る場
 
 ```sh
 uv pip compile requirements.txt --universal --generate-hashes --python-version 3.10 --exclude-newer "14 days" --no-header -o requirements.lock
+python3 scripts/generate_dependency_lock.py
 ```
 
 `--universal` はmacOSとCI（Linux）、Python 3.10以降の差をまとめて記録します。`--exclude-newer "14 days"` は、公開から14日未満の版を避けます（公開直後に乗っ取られた版の混入対策）。再生成したら、追加・変更されたパッケージ名が正規のものかを確認してください。

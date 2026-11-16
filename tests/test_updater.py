@@ -160,8 +160,8 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(u.UpdateError):
                 self.prepare(data)
 
-    def test_changed_dependencies_require_manual_setup(self):
-        with self.assertRaisesRegex(u.UpdateError, "依存ライブラリ"):
+    def test_changed_requirements_without_regenerated_lock_are_rejected(self):
+        with self.assertRaisesRegex(u.UpdateError, "ロック情報"):
             self.prepare(self.archive(requirements=b"new-dependency\n"))
         self.assertEqual(u.fingerprint(self.base), self.original)
 
@@ -226,7 +226,7 @@ class UpdaterTests(unittest.TestCase):
         with patch.object(u, "fetch", side_effect=HTTPError(u.MANIFEST_URL, 404, "", {}, None)):
             with self.assertRaisesRegex(u.UpdateError, "更新情報JSONが見つかりません"):
                 u.prepare_update(self.base, force=True)
-        with patch.object(u, "prepare_update", side_effect=OSError("offline")):
+        with patch.object(u, "check_update", side_effect=OSError("offline")):
             u.background_update(self.base)
         self.assertEqual(u.fingerprint(self.base), self.original)
 
@@ -245,8 +245,8 @@ class UpdaterTests(unittest.TestCase):
         cases = [
             (URLError("private-details"), "接続できません"),
             (URLError(TimeoutError()), "タイムアウト"),
-            (HTTPError(u.MANIFEST_URL, 403, "", {}, None), "アクセスが拒否または制限"),
-            (HTTPError(u.MANIFEST_URL, 429, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.MANIFEST_URL, 403, "", {}, None), "アクセスが拒否されました"),
+            (HTTPError(u.MANIFEST_URL, 429, "", {}, None), "利用制限中"),
             (HTTPError(u.MANIFEST_URL, 503, "", {}, None), "サーバーでエラー"),
             (zipfile.BadZipFile("private-details"), "更新データに問題"),
             (PermissionError("private-details"), "保存する権限"),
@@ -274,7 +274,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertIn("更新ファイルが見つかりません", errors.getvalue())
 
     def test_background_notice_includes_same_failure_reason(self):
-        with patch.object(u, "prepare_update", side_effect=URLError("offline")), redirect_stdout(io.StringIO()):
+        with patch.object(u, "check_update", side_effect=URLError("offline")), redirect_stdout(io.StringIO()):
             u.background_update(self.base)
         message = u.read_json(self.base / ".updates/notice.json")["message"]
         self.assertIn("更新失敗:", message)
@@ -311,9 +311,9 @@ class UpdaterTests(unittest.TestCase):
     def test_scheduled_demo_and_help_do_not_start_or_apply_updates(self):
         for argv in (["--scheduled"], ["--ui", "--demo"], ["--help"], ["--version"], ["user", "list"]):
             with self.subTest(argv=argv), patch.object(u.importlib, "import_module", return_value=Mock(main=Mock(return_value=0))), \
-                    patch.object(u.subprocess, "Popen") as launch, patch.object(u, "finish_update") as apply:
+                    patch.object(u, "check_update") as check, patch.object(u, "finish_update") as apply:
                 self.assertEqual(u.run_application(self.base, argv), 0)
-                launch.assert_not_called()
+                check.assert_not_called()
                 apply.assert_not_called()
 
     def test_other_running_process_defers_update(self):
@@ -321,22 +321,23 @@ class UpdaterTests(unittest.TestCase):
         with u.file_lock(self.base / ".updates/runtime.lock"):
             with patch.object(u.importlib, "import_module", return_value=Mock(main=Mock(return_value=0))), \
                     patch.object(u.subprocess, "Popen"), patch.object(u, "finish_update") as apply:
-                self.assertEqual(u.run_application(self.base, ["--ui"]), 0)
+                self.assertEqual(u.run_application(self.base, ["update"]), 1)
                 apply.assert_not_called()
         self.assertEqual(u.fingerprint(self.base), self.original)
         self.assertIn(NEXT, u.apply_pending(self.base))
 
-    def test_background_applies_after_short_lived_application_exits(self):
+    def test_background_never_applies_prepared_update(self):
         self.prepare()
-        with patch.object(u, "prepare_update"):
+        with patch.object(u, "check_update", return_value=None):
             u.background_update(self.base)
-        self.assertIn(NEXT, (self.base / "src/version.py").read_text())
+        self.assertEqual(u.fingerprint(self.base), self.original)
+        self.assertTrue((self.base / ".updates/pending").exists())
         self.assert_private_preserved()
 
     def test_background_keeps_pending_while_application_is_running(self):
         self.prepare()
         with u.file_lock(self.base / ".updates/runtime.lock"):
-            with patch.object(u, "prepare_update"):
+            with patch.object(u, "check_update", return_value=None):
                 u.background_update(self.base)
         self.assertEqual(u.fingerprint(self.base), self.original)
         self.assertTrue((self.base / ".updates/pending").exists())
@@ -363,10 +364,10 @@ class UpdaterTests(unittest.TestCase):
                     u.prepare_update(self.base, force=True)
                 self.assertEqual(fetch.call_count, 2)
 
-    def test_detached_background_download_apply_and_rollback_for_git_and_zip_installs(self):
+    def test_notification_then_manual_update_and_rollback_for_git_and_zip_installs(self):
         fixture = Path(self.temp.name) / "transport"
         fixture.mkdir()
-        # ネットワーク境界だけを模擬する。起動・ダウンロード処理・検証・
+        # ネットワーク境界だけを模擬する。起動・通知・ダウンロード処理・検証・
         # プロセス間のロック・適用・復元には実際の実装を使う。
         (fixture / "sitecustomize.py").write_text('''
 import io
@@ -376,23 +377,25 @@ import time
 import urllib.request
 
 fixture = Path(os.environ["ATTENDANCE_TEST_TRANSPORT"])
-def fixture_open(request, timeout=None):
+def fixture_open(self, request, *args, **kwargs):
+    with (fixture / "requests.log").open("a") as log:
+        log.write(request.full_url + "\\n")
     if request.full_url.endswith("/releases/latest/download/attendance-update.json"):
         return io.BytesIO((fixture / "release.json").read_bytes())
     if request.full_url.endswith("/attendance-update.zip"):
         time.sleep(0.3)
         return io.BytesIO((fixture / "release.zip").read_bytes())
     raise AssertionError("Unexpected network request")
-urllib.request.urlopen = fixture_open
+urllib.request.OpenerDirector.open = fixture_open
 ''')
         environment = dict(os.environ, PYTHONPATH=str(fixture), ATTENDANCE_TEST_TRANSPORT=str(fixture))
         environment.pop("ATTENDANCE_NO_UPDATE", None)
-        # 出席処理だけを省略し、通常起動と同じ更新ライフサイクルを動かす。
+        # 出席処理だけを省略し、実際のCLIと同じ更新ライフサイクルを動かす。
         command = [sys.executable, "-c", (
-            "from pathlib import Path; import main; "
+            "from pathlib import Path; import sys; import main; "
             "from src.updater import run_application; "
             "main.main = lambda argv: 0; "
-            "raise SystemExit(run_application(Path.cwd(), ['--check', '731']))"
+            "raise SystemExit(run_application(Path.cwd(), sys.argv[1:]))"
         )]
         for installation in ("git", "zip"):
             with self.subTest(installation=installation):
@@ -403,18 +406,22 @@ urllib.request.urlopen = fixture_open
                 data = self.archive()
                 (fixture / "release.zip").write_bytes(data)
                 (fixture / "release.json").write_text(json.dumps(manifest_for(data)))
-                result = subprocess.run(command, cwd=self.base, env=environment,
+                backup = self.base / ".updates/backup/journal.json"
+                before_backup = backup.read_bytes() if backup.exists() else None
+                result = subprocess.run(command + ["--check", "731"], cwd=self.base, env=environment,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    if (NEXT in (self.base / "src/version.py").read_text()
-                            and (self.base / ".updates/backup/journal.json").exists()
-                            and not (self.base / ".updates/pending").exists()):
-                        break
-                    time.sleep(0.02)
-                log = (self.base / ".updates/updater.log").read_text()
-                self.assertTrue((self.base / ".updates/backup/journal.json").exists(), log)
+                self.assertIn("アップデートがあります", result.stderr)
+                self.assertIn("att update --notes", result.stderr)
+                self.assertEqual(u.fingerprint(self.base), self.original)
+                self.assertFalse((self.base / ".updates/pending").exists())
+                self.assertEqual(backup.read_bytes() if backup.exists() else None, before_backup)
+                requests = (fixture / "requests.log").read_text().splitlines()
+                self.assertTrue(all(url == u.MANIFEST_URL for url in requests))
+                result = subprocess.run(command + ["update"], cwd=self.base, env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.base / ".updates/backup/journal.json").exists())
                 result = subprocess.run([sys.executable, str(self.base / "main.py"), "--version"],
                                         cwd=self.base, env=environment, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -425,6 +432,7 @@ urllib.request.urlopen = fixture_open
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(u.fingerprint(self.base), self.original)
                 self.assert_private_preserved()
+                (fixture / "requests.log").unlink()
 
     def test_version_order_is_numeric(self):
         self.assertGreater(u.version_tuple("v0.10.0"), u.version_tuple("0.9.9"))

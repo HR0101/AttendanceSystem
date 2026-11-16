@@ -1,6 +1,7 @@
 """標準ライブラリだけで動く出席確認画面。"""
 
 import curses
+import os
 import queue
 import sys
 import threading
@@ -18,6 +19,7 @@ from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
 from .users import get_users, select_user, valid_username
 from .schedule_ui import SchedulePanel
+from .updater import available_message, cached_manifest
 
 
 class AttendanceScreen:
@@ -31,6 +33,8 @@ class AttendanceScreen:
         self.events = queue.Queue()
         self.updated = "未確認"
         self.base = base
+        manifest = cached_manifest(base) if base and not demo and not os.environ.get("ATTENDANCE_NO_UPDATE") else None
+        self.update_version = manifest["version"] if manifest and available_message(manifest) else None
         self.history = deque(maxlen=8)
         self.checked = self.failed = False
         self.modal = None
@@ -440,6 +444,10 @@ class AttendanceScreen:
             canvas.put(1, 1, "画面を広げてください（幅62 × 高さ24以上）。", curses.A_BOLD)
             canvas.put(3, 1, self.status()[0])
             canvas.put(5, 1, "Q: 終了" if not self.busy else "処理中… 完了までお待ちください。")
+            if self.update_version:
+                canvas.put(7, 1, f"更新あり: v{self.update_version}", curses.A_BOLD)
+                canvas.put(8, 1, "内容: att update --notes")
+                canvas.put(9, 1, "適用: att update")
             screen.refresh()
             return
 
@@ -447,6 +455,9 @@ class AttendanceScreen:
         total = min(width - 4, 112 if wide else 78)
         left = (width - total) // 2
         main_width = total - 32 if wide else total
+        if self.update_version:
+            canvas.put(0, left, f"アップデートがあります: v{self.update_version}", color(4) | curses.A_BOLD, total)
+            canvas.put(4, left, "内容: att update --notes / 適用: att update", color(4), total)
         name = self.config.get("_active_username", self.student_id)
         default = select_user(self.config)
         is_default = default and default["student_id"] == self.student_id
