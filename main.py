@@ -4,7 +4,7 @@
 if __name__ == "__main__":
     from pathlib import Path
     from src.updater import run_application
-    raise SystemExit(run_application(Path(__file__).resolve().parent))
+    raise SystemExit(run_application(Path(__file__).resolve().parent, use_runtime=True))
 
 import argparse
 import sys

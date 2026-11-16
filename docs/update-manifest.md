@@ -5,11 +5,15 @@ v0.2.2から、利用者の更新確認はGitHub Releasesの添付JSONを直接�
 ## 取得経路
 
 1. `https://github.com/HR0101/AttendanceSystem/releases/latest/download/attendance-update.json` を取得する。
-2. JSONを検証し、現在版より新しい場合に、その版に固定した `releases/download/vX.Y.Z/attendance-update.zip` を取得する。
+2. JSONを検証し、現在版より新しい場合に、その版に固定した `releases/download/vX.Y.Z/attendance-update.zip` を取得する。v0.2.3以降はETagを保存し、304応答では検証済みJSONを再利用する。
 3. 実際のZIPサイズとSHA-256がJSONに一致することを確認する。
 4. 既存のファイル構成・Python構文・内部バージョン・依存関係・起動確認を通した後、終了時に適用する。
 
 `latest` がZIP取得前に別の版へ切り替わっても、取得するZIPはJSONの版番号に固定される。JSONが取得できない場合や形式が不正な場合は失敗として扱い、APIを呼び直さない。
+
+v0.2.3以降は取得開始時とすべてのリダイレクトで、HTTPSと正確なホスト名を検証する。許可するホストは `github.com`、`objects.githubusercontent.com`、`release-assets.githubusercontent.com`、`github-releases.githubusercontent.com`。HTTPへの変更、認証情報付きURL、別ポート、似た名前の第三者ホストは拒否する。
+
+403の利用制限ヘッダーや429を検出すると、`X-RateLimit-Reset` と `Retry-After` から再試行時刻を計算して表示する。バックグラウンド確認はその時刻まで待ち、時刻を過ぎたら通常の1時間待機を追加せず再確認する。通常の403拒否は利用制限と区別する。
 
 ## JSONの形式
 

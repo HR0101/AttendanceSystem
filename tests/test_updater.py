@@ -160,8 +160,8 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(u.UpdateError):
                 self.prepare(data)
 
-    def test_changed_dependencies_require_manual_setup(self):
-        with self.assertRaisesRegex(u.UpdateError, "依存ライブラリ"):
+    def test_changed_requirements_without_regenerated_lock_are_rejected(self):
+        with self.assertRaisesRegex(u.UpdateError, "ロック情報"):
             self.prepare(self.archive(requirements=b"new-dependency\n"))
         self.assertEqual(u.fingerprint(self.base), self.original)
 
@@ -245,8 +245,8 @@ class UpdaterTests(unittest.TestCase):
         cases = [
             (URLError("private-details"), "接続できません"),
             (URLError(TimeoutError()), "タイムアウト"),
-            (HTTPError(u.MANIFEST_URL, 403, "", {}, None), "アクセスが拒否または制限"),
-            (HTTPError(u.MANIFEST_URL, 429, "", {}, None), "アクセスが拒否または制限"),
+            (HTTPError(u.MANIFEST_URL, 403, "", {}, None), "アクセスが拒否されました"),
+            (HTTPError(u.MANIFEST_URL, 429, "", {}, None), "利用制限中"),
             (HTTPError(u.MANIFEST_URL, 503, "", {}, None), "サーバーでエラー"),
             (zipfile.BadZipFile("private-details"), "更新データに問題"),
             (PermissionError("private-details"), "保存する権限"),
@@ -376,14 +376,14 @@ import time
 import urllib.request
 
 fixture = Path(os.environ["ATTENDANCE_TEST_TRANSPORT"])
-def fixture_open(request, timeout=None):
+def fixture_open(self, request, *args, **kwargs):
     if request.full_url.endswith("/releases/latest/download/attendance-update.json"):
         return io.BytesIO((fixture / "release.json").read_bytes())
     if request.full_url.endswith("/attendance-update.zip"):
         time.sleep(0.3)
         return io.BytesIO((fixture / "release.zip").read_bytes())
     raise AssertionError("Unexpected network request")
-urllib.request.urlopen = fixture_open
+urllib.request.OpenerDirector.open = fixture_open
 ''')
         environment = dict(os.environ, PYTHONPATH=str(fixture), ATTENDANCE_TEST_TRANSPORT=str(fixture))
         environment.pop("ATTENDANCE_NO_UPDATE", None)

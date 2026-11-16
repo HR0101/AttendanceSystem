@@ -40,7 +40,7 @@ att update --rollback    # 直前の更新前の版へ戻す
 ATTENDANCE_NO_UPDATE=1 att --ui  # 自動更新せず起動
 ```
 
-旧版からこの機能を導入する時だけ手動更新が必要です。依存ライブラリの変更を伴うリリースも手動セットアップになります。詳しくは[READMEの自動アップデート](README.md#自動アップデート)を参照してください。
+v0.2.3以降は、依存パッケージとChromiumも別環境へ自動で準備します。初回の移行やAPI制限で旧版が更新できない場合の手順は[READMEの自動アップデート](README.md#自動アップデート)を参照してください。
 
 <a id="attendance"></a>
 
@@ -194,6 +194,7 @@ cp schedule.example.json schedule.json # 初めて予定ファイルを作る場
 
 ```sh
 uv pip compile requirements.txt --universal --generate-hashes --python-version 3.10 --exclude-newer "14 days" --no-header -o requirements.lock
+python3 scripts/generate_dependency_lock.py
 ```
 
 `--universal` はmacOSとCI（Linux）、Python 3.10以降の差をまとめて記録します。`--exclude-newer "14 days"` は、公開から14日未満の版を避けます（公開直後に乗っ取られた版の混入対策）。再生成したら、追加・変更されたパッケージ名が正規のものかを確認してください。

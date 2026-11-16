@@ -42,6 +42,7 @@ class ReleaseManifestTests(unittest.TestCase):
         script = self.fixture.base / "scripts/build_release.py"
         script.parent.mkdir()
         shutil.copy2(fixtures.ROOT / "scripts/build_release.py", script)
+        shutil.copy2(fixtures.ROOT / "requirements.lock", self.fixture.base / "requirements.lock")
         result = subprocess.run([sys.executable, str(script), "v" + fixtures.VERSION],
                                 cwd=self.fixture.base, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)

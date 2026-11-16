@@ -2,12 +2,15 @@
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 import http.client
 import importlib
 import json
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -19,7 +22,8 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import zipfile
 
 REPOSITORY = "HR0101/AttendanceSystem"
@@ -28,13 +32,15 @@ MANIFEST_NAME = "attendance-update.json"
 MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/{MANIFEST_NAME}"
 MAX_MANIFEST = 64 * 1024
 MAX_ARCHIVE = 8 * 1024 * 1024
+DOWNLOAD_HOSTS = frozenset({"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+                            "github-releases.githubusercontent.com"})
 ROOT_FILES = frozenset({
     "main.py", "att", "attendance", "start.command", "install.command", "install.sh",
     "requirements.txt", "config.example.json", "schedule.example.json", "README.md",
     "COMMANDS.md", "LICENSE",
 })
 REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
-    "__init__", "attendance", "browser", "config", "credentials", "logging_utils", "room",
+    "__init__", "attendance", "browser", "config", "credentials", "dependencies", "dependency_lock", "logging_utils", "room",
     "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "updater", "user_commands",
     "users", "verification", "version",
 )}
@@ -44,6 +50,34 @@ class UpdateError(Exception):
     pass
 
 
+def header_value(headers, name):
+    return next((str(value) for key, value in (headers.items() if headers else []) if key.lower() == name.lower()), "")
+
+
+def rate_limit_retry_at(exc):
+    """拒否と利用制限を区別し、サーバーが指定した再試行時刻を読む。"""
+    if not isinstance(exc, HTTPError) or exc.code not in (403, 429):
+        return None
+    remaining = header_value(exc.headers, "X-RateLimit-Remaining")
+    retry_after = header_value(exc.headers, "Retry-After")
+    if exc.code != 429 and remaining != "0" and not retry_after:
+        return None
+    now, candidates = time.time(), []
+    reset = header_value(exc.headers, "X-RateLimit-Reset")
+    if remaining == "0" and reset.isascii() and reset.isdecimal() and len(reset) <= 12:
+        candidates.append(int(reset))
+    if retry_after.isascii() and retry_after.isdecimal() and len(retry_after) <= 10:
+        candidates.append(now + int(retry_after))
+    elif retry_after:
+        try:
+            value = parsedate_to_datetime(retry_after)
+            candidates.append(value.replace(tzinfo=value.tzinfo or timezone.utc).timestamp())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    candidates = [value for value in candidates if now < value < 253402300799]
+    return max(candidates) if candidates else now + 60
+
+
 def update_failure_message(exc):
     """通信・配布・保存の失敗を、更新なしという結果と区別して表示する。"""
     if isinstance(exc, UpdateError):
@@ -51,8 +85,12 @@ def update_failure_message(exc):
             return str(exc)
         reason = str(exc)
     elif isinstance(exc, HTTPError):
-        if exc.code in (403, 429):
-            reason = f"GitHubへのアクセスが拒否または制限されました（HTTP {exc.code}）。時間をおいて再実行してください。"
+        retry_at = rate_limit_retry_at(exc)
+        if retry_at is not None:
+            when = datetime.fromtimestamp(retry_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            reason = f"GitHubの利用制限中です（HTTP {exc.code}）。{when} 以降に再実行してください。"
+        elif exc.code == 403:
+            reason = "GitHubへのアクセスが拒否されました（HTTP 403）。ネットワーク設定や配布先へのアクセスを確認してください。"
         elif exc.code >= 500:
             reason = f"配布サーバーでエラーが発生しました（HTTP {exc.code}）。時間をおいて再実行してください。"
         elif exc.code == 404:
@@ -142,6 +180,88 @@ def read_json(path, default=None):
         return default
 
 
+def runtime_directory(base, state):
+    """復元前にも読めるよう、環境の記録は標準ライブラリだけで検証する。"""
+    base = base.resolve()
+    if not isinstance(state, dict) or not isinstance(state.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", state["id"]):
+        raise UpdateError("依存パッケージの実行環境の記録が不正です。")
+    digest = state.get("lock_hash")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise UpdateError("依存パッケージの実行環境のハッシュが不正です。")
+    directory = base / ".updates/environments" / state["id"]
+    parent = directory
+    while parent != base:
+        if parent.is_symlink():
+            raise UpdateError("依存パッケージの実行環境がシンボリックリンクです。")
+        parent = parent.parent
+    ready = read_json(directory / "ready.json", {})
+    if (not isinstance(ready, dict) or ready.get("lock_hash") != digest
+            or ready.get("directory") != str(directory) or ready.get("python") != list(sys.version_info[:2])
+            or ready.get("platform") != sys.platform or ready.get("machine") != platform.machine()
+            or not (directory / "bin/python").is_file() or not (directory / "pyvenv.cfg").is_file()
+            or not (directory / "requirements.lock").is_file()
+            or hashlib.sha256((directory / "requirements.lock").read_bytes()).hexdigest() != digest):
+        raise UpdateError("依存パッケージの実行環境を確認できません。att update で再準備してください。")
+    return directory
+
+
+def read_runtime_state(base):
+    path = base / ".updates/runtime.json"
+    if not path.exists():
+        return None
+    state = read_json(path)
+    runtime_directory(base, state)
+    return state
+
+
+def set_runtime_state(base, state):
+    if state is None:
+        (base / ".updates/runtime.json").unlink(missing_ok=True)
+    else:
+        runtime_directory(base, state)
+        write_json(base / ".updates/runtime.json", state)
+
+
+def runtime_environment(base, state):
+    directory = runtime_directory(base, state)
+    return {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": str(directory / "browsers"),
+            "PYTHONNOUSERSITE": "1", "VIRTUAL_ENV": str(directory)}
+
+
+def activate_runtime(base, argv, runtime):
+    # ヘルプ・復元・デモはネットワークや依存パッケージの準備なしで利用できる。
+    if any(flag in argv for flag in ("--help", "-h", "--version", "--demo", "--rollback")):
+        return
+    try:
+        state = read_runtime_state(base)
+    except UpdateError:
+        if not (base / "src/dependencies.py").is_file():
+            raise
+        state = None
+    if (base / "src/dependencies.py").is_file():
+        from .dependencies import read_spec, prepare_environment
+        spec = read_spec(base)
+        if state is None or state["lock_hash"] != spec["lock_hash"]:
+            print("依存パッケージの準備のため、実行中の出席処理があれば終了を待ちます…", flush=True)
+            fcntl.flock(runtime, fcntl.LOCK_UN)
+            fcntl.flock(runtime, fcntl.LOCK_EX)
+            try:
+                spec = read_spec(base)
+                print("依存パッケージとChromiumを準備しています…", flush=True)
+                state = prepare_environment(base, spec)
+                set_runtime_state(base, state)
+            finally:
+                fcntl.flock(runtime, fcntl.LOCK_SH)
+    if state is not None:
+        directory = runtime_directory(base, state)
+        os.environ.update(runtime_environment(base, state))
+        if Path(sys.prefix) != directory:
+            os.execv(str(directory / "bin/python"), [str(directory / "bin/python"), str(base / "main.py"), *argv])
+    elif (base / ".venv/bin/python").is_file() and Path(sys.prefix).parent == base / ".updates/environments":
+        python = base / ".venv/bin/python"
+        os.execv(str(python), [str(python), str(base / "main.py"), *argv])
+
+
 def fingerprint(base):
     result = {}
     for name in managed_files(base):
@@ -162,12 +282,36 @@ def file_lock(path, exclusive=False, blocking=True):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def fetch(url, limit, deadline):
+def require_download_url(url):
+    try:
+        parsed = urlparse(url)
+        valid = (parsed.scheme == "https" and parsed.hostname in DOWNLOAD_HOSTS and parsed.port in (None, 443)
+                 and not parsed.username and not parsed.password)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise UpdateError("更新ファイルの配布元またはリダイレクト先が不正です。")
+
+
+class DownloadRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_download_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def urlopen(request, timeout):
+    return build_opener(DownloadRedirectHandler()).open(request, timeout=timeout)
+
+
+def fetch(url, limit, deadline, *, headers=None, on_headers=None):
+    require_download_url(url)
     request = Request(url, headers={"Accept": "application/json" if url == MANIFEST_URL else "application/octet-stream",
-                                    "User-Agent": "AttendanceTool-Updater"})
+                                    "User-Agent": "AttendanceTool-Updater", **(headers or {})})
     chunks = []
     total = 0
     with urlopen(request, timeout=5) as response:
+        if on_headers is not None:
+            on_headers(getattr(response, "headers", {}))
         while True:
             if time.monotonic() > deadline:
                 raise UpdateError("更新の通信がタイムアウトしました。")
@@ -198,6 +342,50 @@ def validate_manifest(manifest):
     return manifest
 
 
+def fetch_manifest(state, deadline):
+    """検証済みJSONとETagを保存し、304ではそのJSONを再利用する。"""
+    cached = state.get("manifest")
+    try:
+        validate_manifest(cached)
+    except (UpdateError, ValueError, TypeError):
+        cached = None
+    etag = state.get("etag")
+    if not valid_etag(etag):
+        etag = None
+    conditional = {"If-None-Match": etag} if cached is not None and etag else {}
+    for attempt in range(2):
+        received = {}
+        try:
+            data = fetch(MANIFEST_URL, MAX_MANIFEST, deadline, headers=conditional,
+                         on_headers=lambda headers: received.update(headers))
+        except HTTPError as exc:
+            if exc.code != 304:
+                raise
+            exc.close()
+            if conditional:
+                return cached
+            if attempt == 0:
+                continue
+            raise UpdateError("更新情報JSONが304を返しましたが、再利用できるキャッシュがありません。") from exc
+        manifest = validate_manifest(json.loads(data))
+        state["manifest"] = manifest
+        value = header_value(received, "ETag")
+        state.pop("etag", None)
+        if valid_etag(value):
+            state["etag"] = value
+        return manifest
+
+
+def valid_etag(value):
+    return isinstance(value, str) and 0 < len(value) <= 1024 and re.fullmatch(r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"', value) is not None
+
+
+def record_rate_limit(updates, state, exc):
+    retry_at = rate_limit_retry_at(exc)
+    if retry_at is not None:
+        write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 3600, "retry_at": retry_at})
+
+
 def pending_metadata(base):
     """中断・破損した準備データは破棄し、次のダウンロードを妨げない。"""
     pending = base / ".updates/pending"
@@ -220,6 +408,8 @@ def pending_metadata(base):
                 raise ValueError
         if not REQUIRED.issubset(metadata["files"]):
             raise ValueError
+        if metadata.get("runtime") is not None:
+            runtime_directory(base, metadata["runtime"])
     except (ValueError, UpdateError):
         shutil.rmtree(pending)
         return None
@@ -261,6 +451,12 @@ def prepare_update(base, force=False):
             state = {}
         if had_pending:
             state.pop("checked_at", None)
+        retry_at = state.get("retry_at")
+        if type(retry_at) in (int, float) and 0 < retry_at < 253402300799:
+            if not force and time.time() < retry_at:
+                return None
+            state.pop("retry_at", None)
+            state.pop("checked_at", None)
         checked_at, interval = state.get("checked_at", 0), state.get("interval", 86400)
         now = time.time()
         valid_clock = (type(checked_at) in (int, float) and 0 <= checked_at <= now
@@ -270,8 +466,9 @@ def prepare_update(base, force=False):
         write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 3600})
         deadline = time.monotonic() + 25
         try:
-            manifest = validate_manifest(json.loads(fetch(MANIFEST_URL, MAX_MANIFEST, deadline)))
+            manifest = fetch_manifest(state, deadline)
         except HTTPError as exc:
+            record_rate_limit(updates, state, exc)
             if exc.code == 404:
                 raise UpdateError("更新情報JSONが見つかりません。配布元の正式リリースに attendance-update.json が添付されているか確認してください。") from exc
             raise
@@ -287,7 +484,11 @@ def prepare_update(base, force=False):
                 return f"更新なし: 最新版です（現在 {VERSION}／公開版 {tag}）。"
             return f"更新なし: 使用中の {VERSION} は公開版 {tag} より新しいバージョンです。"
         url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}"
-        data = fetch(url, MAX_ARCHIVE, deadline)
+        try:
+            data = fetch(url, MAX_ARCHIVE, deadline)
+        except HTTPError as exc:
+            record_rate_limit(updates, state, exc)
+            raise
         if len(data) != manifest["archive"]["size"]:
             raise UpdateError("更新ファイルのサイズが更新情報JSONと一致しません。")
         if hashlib.sha256(data).hexdigest() != manifest["archive"]["sha256"]:
@@ -298,12 +499,18 @@ def prepare_update(base, force=False):
             archive.write_bytes(data)
             payload = temporary / "payload"
             validate_payload(archive, payload, tag)
-            # 環境を壊さないため、依存関係の変更を伴うリリースは手動セットアップが必要。
-            if (payload / "requirements.txt").read_bytes() != (base / "requirements.txt").read_bytes():
-                raise UpdateError("依存ライブラリが変更されています。最新版を手動で取得し bash install.sh を実行してください。")
-            result = subprocess.run([sys.executable, str(payload / "main.py"), "--help"],
+            from .dependencies import read_spec, prepare_environment
+            spec = read_spec(payload)
+            previous_spec = read_spec(base) if (base / "src/dependency_lock.py").is_file() else None
+            target_runtime = read_runtime_state(base)
+            if target_runtime is not None or previous_spec is None or previous_spec["lock_hash"] != spec["lock_hash"]:
+                print("更新版の依存パッケージとChromiumを準備しています…", flush=True)
+                target_runtime = prepare_environment(base, spec)
+            python = str(runtime_directory(base, target_runtime) / "bin/python") if target_runtime is not None else sys.executable
+            environment = runtime_environment(base, target_runtime) if target_runtime is not None else dict(os.environ)
+            result = subprocess.run([python, str(payload / "main.py"), "--help"],
                                     capture_output=True, timeout=20,
-                                    env={**os.environ, "ATTENDANCE_NO_UPDATE": "1"})
+                                    env={**environment, "ATTENDANCE_NO_UPDATE": "1"})
             if result.returncode:
                 raise UpdateError("更新版の起動確認に失敗しました。現在の版を継続します。")
             shutil.rmtree(payload / ".updates", ignore_errors=True)
@@ -311,9 +518,10 @@ def prepare_update(base, force=False):
             for cache in payload.rglob("__pycache__"):
                 shutil.rmtree(cache)
             write_json(payload / "metadata.json", {"version": tag, "before": fingerprint(base),
-                                                    "files": fingerprint(payload)})
+                                                    "files": fingerprint(payload), "runtime": target_runtime})
             os.replace(payload, updates / "pending")
-        write_json(updates / "check.json", {"checked_at": time.time(), "interval": 86400})
+        state.pop("skip_version", None)
+        write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
         return f"{tag} をダウンロードしました。終了時に適用します。"
 
 
@@ -334,8 +542,13 @@ def recover(base):
             target = safe_target(base, name)
             data = None if mode is None else safe_target(transaction / "files", name).read_bytes()
             restored.append((target, mode, data))
+        runtime_path = transaction / "runtime.json"
+        previous_runtime = read_json(runtime_path, "invalid") if runtime_path.exists() else None
+        if previous_runtime is not None:
+            runtime_directory(base, previous_runtime)
     except (ValueError, OSError, UpdateError) as exc:
         raise UpdateError("更新前の版の復元データが破損または不足しています。.updates/transaction を保持して確認してください。") from exc
+    set_runtime_state(base, previous_runtime)
     for target, mode, data in restored:
         if mode is None:
             target.unlink(missing_ok=True)
@@ -378,6 +591,7 @@ def apply_pending(base):
             atomic_write(transaction / "files" / name, target.read_bytes())
         else:
             journal[name] = None
+    write_json(transaction / "runtime.json", read_runtime_state(base))
     write_json(transaction / "journal.json", journal)
     try:
         for name in files:
@@ -389,6 +603,8 @@ def apply_pending(base):
                 target.unlink(missing_ok=True)
         # 同じ秒・サイズの更新でも古いバイトコードを使わせない。
         clear_caches(base)
+        if metadata.get("runtime") is not None:
+            set_runtime_state(base, metadata["runtime"])
     except Exception:
         recover(base)
         raise
@@ -433,7 +649,7 @@ def finish_update(base):
     return apply_pending(base)
 
 
-def run_application(base, argv=None):
+def run_application(base, argv=None, *, use_runtime=False):
     argv = sys.argv[1:] if argv is None else argv
     updates = base / ".updates"
     automatic = (not os.environ.get("ATTENDANCE_NO_UPDATE") and "--scheduled" not in argv
@@ -448,6 +664,8 @@ def run_application(base, argv=None):
                 fcntl.flock(runtime, fcntl.LOCK_EX)
                 recover(base)
                 fcntl.flock(runtime, fcntl.LOCK_SH)
+            if use_runtime:
+                activate_runtime(base, argv, runtime)
             if automatic:
                 notice = read_json(updates / "notice.json", {})
                 if isinstance(notice, dict) and isinstance(notice.get("message"), str) and notice["message"]:
@@ -527,4 +745,4 @@ def background_update(base):
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--background":
-        background_update(Path(sys.argv[2]).resolve())
+        importlib.import_module("src.updater").background_update(Path(sys.argv[2]).resolve())

@@ -1,4 +1,4 @@
-"""個人設定を含めず更新用ZIPとJSONを作る。 python scripts/build_release.py v0.2.2"""
+"""個人設定を含めず更新用ZIPとJSONを作る。 python scripts/build_release.py v0.2.3"""
 
 import hashlib
 import json
@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.updater import ASSET_NAME, MANIFEST_NAME, REQUIRED, allowed, atomic_write, managed_files, validate_manifest, version_tuple
 from src.version import VERSION
+from src.dependencies import read_spec
 
 
 def build(tag, output):
@@ -18,6 +19,9 @@ def build(tag, output):
     names = managed_files(ROOT)
     if not REQUIRED.issubset(names) or not all(allowed(name) for name in names):
         raise ValueError("更新ファイルの構成が不正です。")
+    spec = read_spec(ROOT)
+    if (ROOT / "requirements.lock").read_text(encoding="utf-8") != spec["text"]:
+        raise ValueError("配布用ロック情報が古いため scripts/generate_dependency_lock.py を実行してください。")
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in sorted(names):
