@@ -17,15 +17,17 @@ from .logging_utils import setup_logging
 from .room import RoomError, parse_room
 from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
-from .users import change_student_id_config, get_users, remove_user_config, select_user, valid_username
+from .users import change_student_id_config, get_users, remove_user_config, select_user, ui_selection, valid_username
+from .text_input import TextCursor
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
 
 
 class AttendanceScreen:
-    def __init__(self, config, student_id, password, logger, room="", demo=False, base=None):
+    def __init__(self, config, student_id, password, logger, room="", demo=False, base=None, *, restore_selection=True):
         self.config, self.student_id, self.password = config, student_id, password
         self.logger, self.room, self.demo = logger, room, demo
+        self.room_editor = TextCursor(room)
         self.values = {}
         self.attended = self.unenrolled = self.busy = self.confirm = False
         self.selected = 0
@@ -39,10 +41,16 @@ class AttendanceScreen:
         self.checked = self.failed = False
         self.modal = None
         self.user_index = 0
-        self.selected_user_ids = {student_id}
+        self.selected_user_ids = ui_selection(config, student_id) if restore_selection else {student_id}
+        if student_id not in self.selected_user_ids and self.selected_user_ids:
+            active = next(user for user in get_users(config) if user["student_id"] in self.selected_user_ids)
+            self.student_id, self.password = active["student_id"], ""
+            self.config["_active_username"] = active["username"]
         self.pending_user_ids = set()
         self.user_results = {}
         self.form_values = []
+        self.form_editors = []
+        self.password_visible = False
         self.form_index = 0
         self.form_error = ""
         self.confirm_selection = 0
@@ -271,6 +279,8 @@ class AttendanceScreen:
         self.message = "ユーザー情報を処理中…"
         # パスワード入力は送信後すぐにフォームから消す。
         self.form_values = []
+        self.form_editors = []
+        self.password_visible = False
         self.modal = "users"
 
         def work():
@@ -347,6 +357,8 @@ class AttendanceScreen:
                 elif action == "add" and not current_id:
                     current_id, current_password = student_id, "" if self.demo else password
                     selected = {student_id}
+                if action == "switch":
+                    self.persist_selection(config, selected)
                 config["_active_username"] = next((u["username"] for u in get_users(config) if u["student_id"] == current_id), current_id)
                 self.events.put(("account", (config, current_id, current_password, action, selected)))
             except (ConfigurationError, CredentialError, OSError) as exc:
@@ -367,12 +379,17 @@ class AttendanceScreen:
         if not self.pending_user_ids:
             self.form_error = "出席するユーザーを1人以上選択してください。"
             return
-        if self.pending_user_ids == self.selected_user_ids:
-            self.modal = None
-            return
         users = [user for user in get_users(self.config) if user["student_id"] in self.pending_user_ids]
         if len(users) == 1 and users[0]["student_id"] != self.student_id:
             self.account_action("switch", users[0]["username"])
+            return
+        try:
+            self.persist_selection(self.config, self.pending_user_ids)
+        except (ConfigurationError, CredentialError, OSError) as exc:
+            self.form_error = f"選択を保存できません: {exc}"
+            return
+        if self.pending_user_ids == self.selected_user_ids:
+            self.modal = None
             return
         self.selected_user_ids = set(self.pending_user_ids)
         self.clear_target()
@@ -380,6 +397,16 @@ class AttendanceScreen:
         self.message = f"{len(users)}人のユーザーを選択しました。QR番号を入力して確認してください。"
         if self.room:
             self.start()
+
+    def persist_selection(self, config, selected):
+        if self.demo:
+            values = [user["student_id"] for user in get_users(config) if user["student_id"] in selected]
+        else:
+            if self.base is None:
+                raise CredentialError("設定ファイルの場所を確認できません。")
+            from .user_commands import save_ui_selection
+            values = save_ui_selection(self.base, selected)["ui_selected_users"]
+        config["ui_selected_users"] = values
 
     def open_form(self, action):
         users = get_users(self.config)
@@ -391,6 +418,8 @@ class AttendanceScreen:
         self.form_values = (["", "", ""] if action == "add" else ["", ""] if action == "password"
                             else [users[self.user_index]["student_id"]] if action == "student_id"
                             else [users[self.user_index]["username"]])
+        self.form_editors = [TextCursor(value) for value in self.form_values]
+        self.password_visible = False
 
     def handle_modal(self, key):
         if self.modal == "schedule":
@@ -398,6 +427,8 @@ class AttendanceScreen:
             return
         if key == "\x1b":
             self.form_values = []
+            self.form_editors = []
+            self.password_visible = False
             self.modal = "users" if self.modal in ("user_result", "delete") else None
             return
         enter = key in ("\n", "\r", curses.KEY_ENTER)
@@ -446,7 +477,9 @@ class AttendanceScreen:
                     self.modal = "users"
             return
         if self.modal in ("add", "rename", "password", "student_id"):
-            if enter and self.form_index == len(self.form_values) - 1:
+            if key == curses.KEY_F2 and self.modal in ("add", "password"):
+                self.password_visible = not self.password_visible
+            elif enter and self.form_index == len(self.form_values) - 1:
                 if self.modal == "add":
                     name, student_id, password = self.form_values
                     if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
@@ -491,14 +524,11 @@ class AttendanceScreen:
                     self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0].strip())
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
                 self.form_index = (self.form_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.form_values)
-            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                self.form_values[self.form_index] = self.form_values[self.form_index][:-1]
-            elif key == "\x15":
-                self.form_values[self.form_index] = ""
-            elif isinstance(key, str) and key.isprintable():
+            else:
+                if len(self.form_editors) != len(self.form_values):
+                    self.form_editors = [TextCursor(value) for value in self.form_values]
                 limit = 256 if self.modal == "password" or (self.modal == "add" and self.form_index == 2) else 60
-                if len(self.form_values[self.form_index]) < limit:
-                    self.form_values[self.form_index] += key
+                self.form_values[self.form_index] = self.form_editors[self.form_index].edit(self.form_values[self.form_index], key, limit=limit)
 
     def draw(self, screen):
         screen.erase()
@@ -537,6 +567,10 @@ class AttendanceScreen:
             canvas.put(2, left, f"{name}  {'[既定]' if is_default else '[今回のユーザー]'}", curses.A_BOLD, main_width - 1)
             canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー選択  S: 予定", curses.A_DIM, main_width - 1)
         canvas.button(5, left, f"QR番号 [ {self.room or '___'} ]", self.selected == 0)
+        if self.selected == 0:
+            cursor = self.room_editor.sync(self.room)
+            canvas.put(5, left + 1 + text_width("QR番号 [ ") + cursor,
+                       self.room[cursor:cursor + 1] or "_", color(1) | curses.A_REVERSE | curses.A_UNDERLINE | curses.A_BOLD, 1)
         canvas.button(5, left + 28, "[ 更新 R ]", self.selected == 1, not self.busy)
         title, tone, detail = self.status()
         canvas.fill(7, left, main_width, 2, color(tone) | curses.A_REVERSE)
@@ -673,18 +707,14 @@ class AttendanceScreen:
                 row = top + 3 + index * 3
                 canvas.put(row, left + 3, label, curses.A_DIM)
                 value = self.form_values[index] if index < len(self.form_values) else ""
-                if self.modal == "password" or (self.modal == "add" and index == 2):
-                    value = "*" * len(value)
-                shortened = False
-                while text_width(value) > width - 10:
-                    value = value[1:]
-                    shortened = True
-                if shortened:
-                    value = "<" + value
-                attr = curses.A_REVERSE if index == self.form_index else 0
-                canvas.fill(row + 1, left + 3, width - 6, 1, attr)
-                canvas.put(row + 1, left + 4, value + ("_" if index == self.form_index else ""), attr, width - 8)
-            canvas.put(top + height - 4, left + 3, "最後の項目で Enter を押すと保存します。", color(1), width - 6)
+                if len(self.form_editors) != len(self.form_values):
+                    self.form_editors = [TextCursor(field) for field in self.form_values]
+                masked = (self.modal == "password" or (self.modal == "add" and index == 2)) and not self.password_visible
+                self.form_editors[index].draw(canvas, row + 1, left + 4, value, width - 8, active=index == self.form_index, masked=masked)
+            guide = "最後の項目でEnter: 保存"
+            if self.modal in ("add", "password"):
+                guide += "  F2: " + ("隠す" if self.password_visible else "パスワード表示")
+            canvas.put(top + height - 4, left + 3, guide, color(1), width - 6)
             canvas.put(top + height - 3, left + 3, self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。"), color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "default":
             users = get_users(self.config)
@@ -694,11 +724,11 @@ class AttendanceScreen:
                 canvas.put(top + 6 + index, left + 3, line)
             canvas.put(top + 11, left + 3, "Enter: 既定ユーザーに設定", color(4))
         else:
-            guide = ("QR番号: 数字入力 / Backspaceで削除", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで適用", "登録確認: Tab・←→で選択してEnter", "QR番号と授業の教室名は異なる場合があります。", "GUIの選択は今回だけ。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
+            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択してEnter", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
-        canvas.put(top + height - 2, left + 3, "Esc: 閉じる" + ("  Tab/↑↓: 項目選択" if self.modal in ("add", "rename", "password", "student_id") else ""), curses.A_DIM, width - 6)
+        canvas.put(top + height - 2, left + 3, "Esc: 閉じる" + ("  Tab/↑↓:項目 ←→:編集" if self.modal in ("add", "rename", "password", "student_id") else ""), curses.A_DIM, width - 6)
 
     def run(self, screen):
         try:
@@ -775,17 +805,11 @@ class AttendanceScreen:
                 else:
                     self.start()
             elif self.selected == 0:
-                if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                    self.room = self.room[:-1]
+                edited = self.room_editor.edit(self.room, key, limit=3, accepts=lambda value: all(char in "0123456789" for char in value))
+                if edited != self.room:
+                    self.room = edited
                     self.clear_target()
                     self.message = "QR番号を入力して Enter で確認してください。"
-                elif isinstance(key, str) and key in "0123456789" and len(self.room) < 3:
-                    self.room += key
-                    self.clear_target()
-                    self.message = "QR番号を入力して Enter で確認してください。"
-                elif key == "\x15":
-                    self.room = ""
-                    self.clear_target()
 
 
 def launch_ui(base: Path, room=None, demo=False, check=False, username=None) -> int:
@@ -801,14 +825,23 @@ def launch_ui(base: Path, room=None, demo=False, check=False, username=None) -> 
             student_id, password = "DEMO001", ""
         else:
             config = load_config(base / "config.json")
-            student_id, password = get_credentials(config, base / "config.json", username=username)
+            initial = username
+            if initial is None:
+                selected = ui_selection(config)
+                default = select_user(config)
+                primary = default if default and default["student_id"] in selected else next((user for user in get_users(config) if user["student_id"] in selected), None)
+                initial = primary["username"] if primary else None
+            student_id, password = get_credentials(config, base / "config.json", username=initial)
             if check:
                 config["dry_run"] = True
-        ui = AttendanceScreen(config, student_id, password, logger, room or "", demo, base)
+        ui = AttendanceScreen(config, student_id, password, logger, room or "", demo, base, restore_selection=username is None)
         try:
             return curses.wrapper(ui.run)
         finally:
             ui.password = ""
+            ui.form_values = []
+            ui.form_editors = []
+            ui.password_visible = False
             del password
     except (ConfigurationError, CredentialError, RoomError, curses.error) as exc:
         print(f"画面を起動できません: {exc}", file=sys.stderr)

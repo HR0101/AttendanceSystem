@@ -25,6 +25,10 @@ def validate_users(config):
     default = config.get("default_user", "")
     if not isinstance(default, str) or (default and default not in {u["username"] for u in get_users(config)}):
         raise ConfigurationError("default_user は登録済みのユーザーネームにしてください。")
+    selection = config.get("ui_selected_users", [])
+    if (not isinstance(selection, list) or not all(isinstance(value, str) and value and value.isascii() and value.isalnum() for value in selection)
+            or len(selection) != len(set(selection))):
+        raise ConfigurationError("ui_selected_users は重複のない学籍番号の配列にしてください。")
 
 
 def valid_username(value):
@@ -53,6 +57,17 @@ def select_user(config, username=None):
     return users[0] if users else None
 
 
+def ui_selection(config, fallback=""):
+    registered = {user["student_id"] for user in get_users(config)}
+    saved = set(config.get("ui_selected_users", [])) & registered
+    if saved:
+        return saved
+    if fallback:
+        return {fallback}
+    default = select_user(config)
+    return {default["student_id"]} if default else set()
+
+
 def remove_user_config(config, name):
     user = select_user(config, name)
     default = select_user(config)
@@ -61,6 +76,9 @@ def remove_user_config(config, name):
     # 旧形式の番号を残すとget_usersが削除したユーザーを再作成する。
     result.pop("student_id", None)
     result["default_user"] = (remaining[0]["username"] if remaining else "") if default == user else default["username"]
+    if "ui_selected_users" in result:
+        selected = ui_selection(result)
+        result["ui_selected_users"] = [entry["student_id"] for entry in remaining if entry["student_id"] in selected]
     return result
 
 
@@ -76,4 +94,7 @@ def change_student_id_config(config, name, student_id):
             entry["student_id"] = student_id
     result = dict(config, users=users)
     result.pop("student_id", None)
+    if "ui_selected_users" in result:
+        selected = {student_id if value == user["student_id"] else value for value in result["ui_selected_users"]}
+        result["ui_selected_users"] = [entry["student_id"] for entry in users if entry["student_id"] in selected]
     return result

@@ -159,6 +159,7 @@ class MultiUserUITests(unittest.TestCase):
 
         with patch("src.terminal_ui.get_credentials", side_effect=credentials), \
                 patch("src.browser.open_page", return_value=nullcontext(Mock())), \
+                patch("src.user_commands.save_ui_selection", return_value={"ui_selected_users": ["TEST002", "TEST003"]}), \
                 patch("src.attendance.run_attendance", side_effect=run) as attendance:
             ui.apply_user_selection()
             self.wait_for_operation(ui)

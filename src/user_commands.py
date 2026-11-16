@@ -46,6 +46,18 @@ def use_user(base, name):
     return config
 
 
+def save_ui_selection(base, student_ids):
+    path = base / "config.json"
+    config = load_config(path)
+    users = get_users(config)
+    requested = set(student_ids)
+    if not requested or not requested.issubset({user["student_id"] for user in users}):
+        raise CredentialError("ユーザー一覧が変更されています。画面を開き直して選択してください。")
+    config["ui_selected_users"] = [user["student_id"] for user in users if user["student_id"] in requested]
+    _save_private_json(path, config)
+    return config
+
+
 def rename_user(base, name, new_name):
     path = base / "config.json"
     config = load_config(path)

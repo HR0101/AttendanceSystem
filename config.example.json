@@ -4,6 +4,7 @@
   "student_id": "",
   "users": [],
   "default_user": "",
+  "ui_selected_users": [],
   "browser": {
     "headless": true,
     "timeout_ms": 15000
