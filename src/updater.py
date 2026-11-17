@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -467,7 +468,7 @@ def refresh_manifest(base, force=False, *, every_start=False):
     now = time.time()
     valid_clock = (type(checked_at) in (int, float) and 0 <= checked_at <= now
                    and type(interval) in (int, float) and 0 < interval <= 86400)
-    if not force and valid_clock and now - checked_at < interval and (not every_start or state.get("check_failed") is True):
+    if not force and valid_clock and now - checked_at < interval:
         return None
     state["check_failed"] = True
     write_json(updates / "check.json", {**state, "checked_at": now, "interval": 3600})
@@ -513,6 +514,41 @@ def check_update(base):
             manifest, state, _ = result
             write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
         return available_message(manifest)
+
+
+def log_check_failure(base, exc):
+    try:
+        with os.fdopen(os.open(base / ".updates/updater.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600), "a") as log:
+            print(update_failure_message(exc), file=log)
+    except OSError:
+        pass
+
+
+def start_update_check(base):
+    """通信を待たず起動する。ワーカーは通知用キャッシュだけを書き、端末には出力しない。"""
+    def work():
+        try:
+            # 別プロセスによるコード更新中には確認せず、起動中も共有ロックを保持する。
+            with file_lock(base / ".updates/runtime.lock", blocking=False):
+                if not (base / ".updates/transaction/journal.json").exists():
+                    check_update(base)
+        except BlockingIOError:
+            pass
+        except Exception as exc:
+            log_check_failure(base, exc)
+
+    worker = threading.Thread(target=work, name="attendance-update-check", daemon=True)
+    try:
+        worker.start()
+    except (RuntimeError, OSError) as exc:
+        log_check_failure(base, exc)
+        return None
+    return worker
+
+
+def cached_update_message(base):
+    manifest = cached_manifest(base)
+    return available_message(manifest) if manifest else None
 
 
 def show_update_notes(base):
@@ -740,18 +776,13 @@ def run_application(base, argv=None, *, use_runtime=False):
                 fcntl.flock(runtime, fcntl.LOCK_SH)
             if use_runtime:
                 activate_runtime(base, argv, runtime)
+            shown_message = None
             if automatic:
-                try:
-                    message = check_update(base)
-                    if message:
-                        print(message, file=sys.stderr)
-                except Exception as exc:
-                    # 確認の失敗は出席処理を妨げず、ログだけに残す。
-                    try:
-                        with os.fdopen(os.open(updates / "updater.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600), "a") as log:
-                            print(update_failure_message(exc), file=log)
-                    except OSError:
-                        pass
+                if "--ui" not in argv:
+                    shown_message = cached_update_message(base)
+                    if shown_message:
+                        print(shown_message, file=sys.stderr)
+                start_update_check(base)
             code = 1
             try:
                 if argv and argv[0] == "update":
@@ -759,6 +790,11 @@ def run_application(base, argv=None, *, use_runtime=False):
                 else:
                     code = importlib.import_module("main").main(argv)
             finally:
+                if automatic and "--ui" not in argv:
+                    # 入力中の端末へワーカーから割り込まず、完了済みの新情報だけを案内する。
+                    message = cached_update_message(base)
+                    if message and message != shown_message:
+                        print(message, file=sys.stderr)
                 # 明示的な更新が成功した時だけ、他の実行がなければ適用する。
                 if manual_update and code == 0:
                     fcntl.flock(runtime, fcntl.LOCK_UN)

@@ -5,7 +5,7 @@ v0.2.2から、利用者の更新確認はGitHub Releasesの添付JSONを直接�
 ## 取得経路
 
 1. `https://github.com/HR0101/AttendanceSystem/releases/latest/download/attendance-update.json` を取得する。
-2. JSONを検証する。v0.2.3以降の通常起動は、新しい版がある場合に `att update --notes` と `att update` の案内を表示して終わる。ETagを保存し、304応答では検証済みJSONを再利用する。
+2. JSONを検証する。v0.2.3以降の通常起動は、新しい版がある場合に `att update --notes` と `att update` の案内を表示して終わる。ETagを保存し、304応答では検証済みJSONを再利用する。v0.2.8以降は確認をデーモンスレッドで実行し、成功したキャッシュを原則24時間再利用する。起動・終了時に通信の完了を待たず、UIは起動後も1秒間隔でローカルキャッシュの変化を取り込む。ワーカーから端末へ出力せず、CLIの案内は起動時と処理終了時、UIの案内は画面内だけに表示する。
 3. 利用者が `att update` を実行した時だけ、その版に固定した `releases/download/vX.Y.Z/attendance-update.zip` を取得する。
 4. 実際のZIPサイズとSHA-256がJSONに一致することを確認する。
 5. 既存のファイル構成・Python構文・内部バージョン・依存関係・起動確認を通した後、終了時に適用する。
