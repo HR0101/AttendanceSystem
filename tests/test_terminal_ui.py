@@ -108,6 +108,9 @@ class TerminalUITests(unittest.TestCase):
         self.assertNotIn("private-password", drawn)
         self.assertIn("****************", drawn)
         ui.handle_modal("\x1b")
+        self.assertTrue(ui.save_prompt.active)
+        ui.handle_modal(curses.KEY_UP)
+        ui.handle_modal("\n")
         self.assertEqual(ui.form_values, [])
         self.assertIsNone(ui.modal)
 
@@ -168,8 +171,11 @@ class TerminalUITests(unittest.TestCase):
             self.assertIn("two / TWO001", drawn)
             self.assertIn("********************", drawn)
         ui.handle_modal("\x1b")
+        self.assertTrue(ui.save_prompt.active)
+        ui.handle_modal(curses.KEY_UP)
+        ui.handle_modal("\n")
         self.assertEqual(ui.form_values, [])
-        self.assertIsNone(ui.modal)
+        self.assertEqual(ui.modal, "users")
 
     def test_password_form_requires_matching_nonempty_confirmation(self):
         ui = self.demo_screen()

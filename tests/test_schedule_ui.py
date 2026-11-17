@@ -153,7 +153,7 @@ class SchedulePanelTests(unittest.TestCase):
             self.ui.draw(screen)
             drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
             self.assertIn("自動出席の予定", drawn)
-            self.assertIn("Esc:", drawn)
+            self.assertIn("Esc", drawn)
             self.panel.handle("\x1b")
         self.assertEqual(self.path.read_bytes(), original)
 
