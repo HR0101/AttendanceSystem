@@ -19,6 +19,7 @@ from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
 from .users import change_student_id_config, get_users, remove_user_config, select_user, ui_selection, valid_username
 from .text_input import TextCursor
+from .unsaved_changes import SavePrompt
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
 
@@ -49,6 +50,11 @@ class AttendanceScreen:
         self.pending_user_ids = set()
         self.user_results = {}
         self.form_values = []
+        self.form_initial_values = ()
+        self.form_parent_users = False
+        self.back_after_save = False
+        self.submitted_form = None
+        self.save_prompt = SavePrompt()
         self.form_editors = []
         self.password_visible = False
         self.form_index = 0
@@ -236,6 +242,8 @@ class AttendanceScreen:
                 self.complete_attendance(data)
             elif kind == "account":
                 config, student_id, password, action, selection = data
+                draft, old_config = self.submitted_form, self.config
+                self.submitted_form = None
                 if action == "default":
                     self.clear_target()
                 if action in ("delete", "student_id"):
@@ -249,6 +257,22 @@ class AttendanceScreen:
                     self.pending_user_ids = set(selection)
                 self.busy = False
                 self.modal = None
+                if draft is not None and draft[5]:
+                    pending = set(draft[6])
+                    users = get_users(config)
+                    valid = {user["student_id"] for user in users}
+                    for previous in get_users(old_config):
+                        if previous["student_id"] in pending and previous["student_id"] not in valid:
+                            pending.remove(previous["student_id"])
+                            replacement = next((user for user in users if user["username"] == previous["username"]), None)
+                            if replacement:
+                                pending.add(replacement["student_id"])
+                    pending.intersection_update(valid)
+                    if not get_users(old_config):
+                        pending = set(self.selected_user_ids)
+                    if self.back_after_save or pending != self.selected_user_ids:
+                        self.modal, self.pending_user_ids = "users", pending
+                self.back_after_save = False
                 self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": f"既定ユーザーとこの画面の出席対象を「{config['_active_username']}」に切り替えました。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
                 self.user_index = min(self.user_index, max(0, len(get_users(config)) - 1))
                 if action == "delete" and not get_users(config):
@@ -258,6 +282,12 @@ class AttendanceScreen:
                     self.start()
             elif kind == "account_error":
                 self.busy = False
+                if self.submitted_form is not None:
+                    draft = self.submitted_form
+                    (self.modal, self.form_values, self.form_editors, self.form_index, self.form_initial_values,
+                     self.form_parent_users, self.pending_user_ids) = draft
+                    self.submitted_form = None
+                    self.password_visible = False
                 self.form_error = data
                 self.message = data
             else:
@@ -279,9 +309,13 @@ class AttendanceScreen:
         self.busy = True
         self.form_error = ""
         self.message = "ユーザー情報を処理中…"
-        # パスワード入力は送信後すぐにフォームから消す。
+        self.submitted_form = ((self.modal, self.form_values, self.form_editors, self.form_index, self.form_initial_values,
+                                self.form_parent_users, set(self.pending_user_ids))
+                               if self.modal in ("add", "rename", "password", "student_id") and self.form_values else None)
+        # 処理中は入力を表示せず、失敗時だけ編集へ戻す。
         self.form_values = []
         self.form_editors = []
+        self.form_initial_values = ()
         self.password_visible = False
         self.modal = "users"
 
@@ -417,6 +451,8 @@ class AttendanceScreen:
         users = get_users(self.config)
         if action in ("rename", "password", "student_id") and not users:
             return
+        self.form_parent_users = self.modal == "users"
+        self.back_after_save = False
         self.modal = action
         self.form_index = 0
         self.form_error = ""
@@ -424,17 +460,96 @@ class AttendanceScreen:
                             else [users[self.user_index]["student_id"]] if action == "student_id"
                             else [users[self.user_index]["username"]])
         self.form_editors = [TextCursor(value) for value in self.form_values]
+        self.form_initial_values = tuple(self.form_values)
         self.password_visible = False
 
+    def discard_modal(self):
+        parent = self.modal in ("user_result", "delete", "default") or (
+            self.modal in ("add", "rename", "password", "student_id") and self.form_parent_users)
+        self.form_values = []
+        self.form_editors = []
+        self.form_initial_values = ()
+        self.password_visible = False
+        self.form_error = ""
+        self.back_after_save = False
+        if self.modal == "users":
+            self.pending_user_ids = set(self.selected_user_ids)
+        self.modal = "users" if parent else None
+
+    def save_form_and_back(self):
+        self.back_after_save = True
+        self.submit_account_form()
+
+    def request_modal_back(self):
+        self.password_visible = False
+        if self.modal == "users" and self.pending_user_ids != self.selected_user_ids:
+            self.save_prompt.open("ユーザーの選択", save=self.apply_user_selection, discard=self.discard_modal)
+        elif self.modal in ("add", "rename", "password", "student_id") and tuple(self.form_values) != self.form_initial_values:
+            self.save_prompt.open("ユーザー情報の編集", save=self.save_form_and_back, discard=self.discard_modal)
+        elif self.modal == "default":
+            user = get_users(self.config)[self.user_index]
+            if (self.config.get("default_user") != user["username"] or self.student_id != user["student_id"]
+                    or self.selected_user_ids != {user["student_id"]}):
+                self.save_prompt.open("既定ユーザーの変更",
+                                      save=lambda: self.account_action("default", user["username"]), discard=self.discard_modal)
+            else:
+                self.discard_modal()
+        else:
+            self.discard_modal()
+
+    def submit_account_form(self):
+        if self.modal == "add":
+            name, student_id, password = self.form_values
+            if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
+                self.form_error = "名前・半角英数字の学生番号・パスワードを入力してください。"
+                return
+            if any(u["username"] == name.strip() or u["student_id"] == student_id.strip() for u in get_users(self.config)):
+                self.form_error = "その名前または学生番号は登録済みです。"
+                return
+            self.account_action("add", self.form_values[0].strip(), student_id=self.form_values[1].strip(), password=self.form_values[2])
+        elif self.modal == "password":
+            password, confirmation = self.form_values
+            if not password:
+                self.form_error = "新しいパスワードを入力してください。"
+                return
+            if password != confirmation:
+                self.form_error = "確認用のパスワードが一致しません。"
+                return
+            users = get_users(self.config)
+            self.account_action("password", users[self.user_index]["username"], password=password)
+        elif self.modal == "student_id":
+            users = get_users(self.config)
+            new_id = self.form_values[0].strip()
+            if not new_id or not new_id.isascii() or not new_id.isalnum():
+                self.form_error = "学籍番号は半角英数字で入力してください。"
+                return
+            if new_id == users[self.user_index]["student_id"]:
+                self.form_error = "現在と異なる学籍番号を入力してください。"
+                return
+            if any(user["student_id"] == new_id for user in users):
+                self.form_error = "その学籍番号は登録済みです。"
+                return
+            self.account_action("student_id", users[self.user_index]["username"], student_id=new_id)
+        else:
+            users = get_users(self.config)
+            new_name = self.form_values[0].strip()
+            if not valid_username(new_name):
+                self.form_error = "新しいユーザーネームを1～60文字で入力してください。"
+                return
+            if any(u["username"] == new_name and u["student_id"] != users[self.user_index]["student_id"] for u in users):
+                self.form_error = "そのユーザーネームは登録済みです。"
+                return
+            self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0].strip())
+
     def handle_modal(self, key):
+        if self.save_prompt.active:
+            self.save_prompt.handle(key)
+            return
         if self.modal == "schedule":
             self.schedule_panel.handle(key)
             return
-        if key == "\x1b":
-            self.form_values = []
-            self.form_editors = []
-            self.password_visible = False
-            self.modal = "users" if self.modal in ("user_result", "delete") else None
+        if key == "\x1b" or (key in ("q", "Q") and self.modal not in ("add", "rename", "password", "student_id")):
+            self.request_modal_back()
             return
         enter = key in ("\n", "\r", curses.KEY_ENTER)
         if self.modal == "help":
@@ -485,48 +600,7 @@ class AttendanceScreen:
             if key == curses.KEY_F2 and self.modal in ("add", "password"):
                 self.password_visible = not self.password_visible
             elif enter and self.form_index == len(self.form_values) - 1:
-                if self.modal == "add":
-                    name, student_id, password = self.form_values
-                    if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
-                        self.form_error = "名前・半角英数字の学生番号・パスワードを入力してください。"
-                        return
-                    if any(u["username"] == name.strip() or u["student_id"] == student_id.strip() for u in get_users(self.config)):
-                        self.form_error = "その名前または学生番号は登録済みです。"
-                        return
-                    self.account_action("add", self.form_values[0].strip(), student_id=self.form_values[1].strip(), password=self.form_values[2])
-                elif self.modal == "password":
-                    password, confirmation = self.form_values
-                    if not password:
-                        self.form_error = "新しいパスワードを入力してください。"
-                        return
-                    if password != confirmation:
-                        self.form_error = "確認用のパスワードが一致しません。"
-                        return
-                    users = get_users(self.config)
-                    self.account_action("password", users[self.user_index]["username"], password=password)
-                elif self.modal == "student_id":
-                    users = get_users(self.config)
-                    new_id = self.form_values[0].strip()
-                    if not new_id or not new_id.isascii() or not new_id.isalnum():
-                        self.form_error = "学籍番号は半角英数字で入力してください。"
-                        return
-                    if new_id == users[self.user_index]["student_id"]:
-                        self.form_error = "現在と異なる学籍番号を入力してください。"
-                        return
-                    if any(user["student_id"] == new_id for user in users):
-                        self.form_error = "その学籍番号は登録済みです。"
-                        return
-                    self.account_action("student_id", users[self.user_index]["username"], student_id=new_id)
-                else:
-                    users = get_users(self.config)
-                    new_name = self.form_values[0].strip()
-                    if not valid_username(new_name):
-                        self.form_error = "新しいユーザーネームを1～60文字で入力してください。"
-                        return
-                    if any(u["username"] == new_name and u["student_id"] != users[self.user_index]["student_id"] for u in users):
-                        self.form_error = "そのユーザーネームは登録済みです。"
-                        return
-                    self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0].strip())
+                self.submit_account_form()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
                 self.form_index = (self.form_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.form_values)
             else:
@@ -547,6 +621,8 @@ class AttendanceScreen:
                 canvas.put(7, 1, f"更新あり: v{self.update_version}", curses.A_BOLD)
                 canvas.put(8, 1, "内容: att update --notes")
                 canvas.put(9, 1, "適用: att update")
+            if self.save_prompt.active:
+                canvas.put(7, 1, "未保存の変更があります。画面を広げてください。")
             screen.refresh()
             return
 
@@ -617,7 +693,14 @@ class AttendanceScreen:
             canvas.box(23, left, main_width, height - 26, "今回の操作履歴", color(1))
             for index, (stamp, qr, message) in enumerate(list(self.history)[:height - 28]):
                 canvas.put(24 + index, left + 2, f"{stamp}  QR {qr}  {message}", width=main_width - 4)
-        canvas.put(height - 2, left, "Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 H ヘルプ Q 終了", curses.A_DIM, total)
+        footer = "Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 H ヘルプ Q 終了"
+        if self.save_prompt.active:
+            footer = "↑↓/Tab: 選択 Enter: 決定 Esc/Q: 編集に戻る"
+        elif self.modal:
+            editing = self.modal in ("add", "rename", "password", "student_id") or (
+                self.modal == "schedule" and self.schedule_panel.mode in ("add", "edit", "period"))
+            footer = "Esc: 戻る・保存確認  " + ("q/Q: 文字入力" if editing else "Q: 戻る")
+        canvas.put(height - 2, left, footer, curses.A_DIM, total)
         if self.demo and height >= 26:
             canvas.put(height - 3, left, "デモ: 1 未出席 / 2 出席済 / 3 受付なし / 4 履修なし / 5 エラー", curses.A_DIM, total)
 
@@ -625,6 +708,8 @@ class AttendanceScreen:
             self.draw_confirmation(canvas)
         elif self.modal:
             self.draw_modal(canvas)
+        if self.save_prompt.active:
+            self.save_prompt.draw(canvas)
         screen.refresh()
 
     def draw_confirmation(self, canvas):
@@ -675,7 +760,7 @@ class AttendanceScreen:
             canvas.put(top + height - 6, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
             canvas.put(top + height - 5, left + 3, "I 学籍番号変更  X 削除", color(1), width - 6)
             canvas.put(top + height - 4, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
-            canvas.put(top + height - 3, left + 3, self.form_error or "Dで既定とこの画面の出席対象を切り替えます。", color(3) if self.form_error else curses.A_DIM, width - 6)
+            canvas.put(top + height - 3, left + 3, self.form_error or "Esc/Qで戻る（変更があれば保存確認）。", color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "user_result":
             user = get_users(self.config)[self.user_index]
             canvas.put(top + 2, left + 3, f"{user['username']} / {user['student_id']}", curses.A_BOLD, width - 6)
@@ -733,7 +818,8 @@ class AttendanceScreen:
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
-        canvas.put(top + height - 2, left + 3, "Esc: 閉じる" + ("  Tab/↑↓:項目 ←→:編集" if self.modal in ("add", "rename", "password", "student_id") else ""), curses.A_DIM, width - 6)
+        guide = "Esc: 戻る・保存確認  Tab/↑↓:項目" if self.modal in ("add", "rename", "password", "student_id") else "Esc/Q: 戻る"
+        canvas.put(top + height - 2, left + 3, guide, curses.A_DIM, width - 6)
 
     def run(self, screen):
         try:
@@ -766,8 +852,20 @@ class AttendanceScreen:
                 continue
             height, width = screen.getmaxyx()
             if height < 24 or width < 62:
+                if self.save_prompt.active:
+                    if key in ("\x1b", "q", "Q"):
+                        self.save_prompt.handle(key)
+                    continue
                 if key in ("q", "Q", "\x03"):
-                    return 0
+                    if self.modal:
+                        self.handle_modal("\x1b")
+                    else:
+                        return 0
+                elif key == "\x1b" and self.modal:
+                    self.handle_modal(key)
+                continue
+            if self.save_prompt.active:
+                self.save_prompt.handle(key)
                 continue
             if self.confirm:
                 if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
@@ -846,6 +944,9 @@ def launch_ui(base: Path, room=None, demo=False, check=False, username=None) -> 
             ui.password = ""
             ui.form_values = []
             ui.form_editors = []
+            ui.form_initial_values = ()
+            ui.submitted_form = None
+            ui.save_prompt.reset()
             ui.password_visible = False
             del password
     except (ConfigurationError, CredentialError, RoomError, curses.error) as exc:

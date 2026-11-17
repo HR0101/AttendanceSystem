@@ -27,6 +27,7 @@ class SchedulePanel:
         self.index = 0
         self.mode = "list"
         self.fields = []
+        self.initial_fields = ()
         self.editors = []
         self.field_index = 0
         self.message = ""
@@ -59,6 +60,7 @@ class SchedulePanel:
             self.data, self.active, self.message = result
             self.mode = "list"
             self.fields = []
+            self.initial_fields = ()
             self.editors = []
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
 
@@ -66,6 +68,7 @@ class SchedulePanel:
         self.owner.modal = "schedule"
         self.mode = "list"
         self.fields = []
+        self.initial_fields = ()
         self.editors = []
         self.data = None
 
@@ -143,6 +146,19 @@ class SchedulePanel:
         else:
             self.fields = [self.owner.values.get("授業名", ""), list(WEEKDAYS)[date.today().weekday()], self.owner.values.get("開始時刻", ""), self.owner.room, "", ""]
         self.editors = [TextCursor(value) for value in self.fields]
+        self.initial_fields = tuple(self.fields)
+
+    def discard_form(self):
+        self.mode, self.fields, self.editors, self.message = "list", [], [], ""
+        self.initial_fields = ()
+
+    def request_back(self):
+        if self.mode == "list":
+            self.owner.modal = None
+        elif self.mode in ("add", "edit", "period") and tuple(self.fields) != self.initial_fields:
+            self.owner.save_prompt.open("自動出席予定の編集", save=self.submit, discard=self.discard_form)
+        else:
+            self.discard_form()
 
     def submit(self):
         candidate = copy.deepcopy(self.data)
@@ -161,13 +177,12 @@ class SchedulePanel:
         self.persist(candidate)
 
     def handle(self, key):
+        if self.owner.save_prompt.active:
+            self.owner.save_prompt.handle(key)
+            return
         enter = key in ("\n", "\r", curses.KEY_ENTER)
-        if key == "\x1b":
-            if self.mode == "list":
-                self.owner.modal = None
-            else:
-                self.mode, self.fields, self.message = "list", [], ""
-                self.editors = []
+        if key == "\x1b" or (key in ("q", "Q") and self.mode not in ("add", "edit", "period")):
+            self.request_back()
             return
         if self.data is None:
             if key in ("r", "R"):
@@ -252,4 +267,4 @@ class SchedulePanel:
         from .terminal_layout import wrap_text
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
             put(height - 4 + offset, line, color(4))
-        put(height - 2, "Esc: 戻る  R: 再読込" if self.mode == "list" else "Esc: キャンセル  Ctrl+U: 入力を消す", curses.A_DIM)
+        put(height - 2, "Esc/Q: 戻る  R: 再読込" if self.mode == "list" else "Esc: 戻る・保存確認  Ctrl+U: 全消去", curses.A_DIM)

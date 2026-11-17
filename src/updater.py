@@ -41,7 +41,7 @@ ROOT_FILES = frozenset({
 })
 REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
     "__init__", "attendance", "browser", "config", "credentials", "dependencies", "dependency_lock", "logging_utils", "room",
-    "release_notes", "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "text_input", "updater", "user_commands",
+    "release_notes", "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "text_input", "unsaved_changes", "updater", "user_commands",
     "users", "verification", "version",
 )}
 
