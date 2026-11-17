@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: セキュリティ脆弱性の報告（非公開）
+    url: https://github.com/HR0101/AttendanceSystem/security/advisories/new
+    about: 認証情報やセキュリティに関わる問題は公開 Issue に書かず、こちらから非公開でご報告ください。
