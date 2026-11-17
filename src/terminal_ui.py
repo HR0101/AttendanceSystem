@@ -236,6 +236,8 @@ class AttendanceScreen:
                 self.complete_attendance(data)
             elif kind == "account":
                 config, student_id, password, action, selection = data
+                if action == "default":
+                    self.clear_target()
                 if action in ("delete", "student_id"):
                     removed = {u["student_id"] for u in get_users(self.config)} - {u["student_id"] for u in get_users(config)}
                     self.demo_attended = {entry for entry in self.demo_attended if entry[0] not in removed}
@@ -247,12 +249,12 @@ class AttendanceScreen:
                     self.pending_user_ids = set(selection)
                 self.busy = False
                 self.modal = None
-                self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": "既定ユーザーを変更しました。通常実行・自動実行に反映されます。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
+                self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": f"既定ユーザーとこの画面の出席対象を「{config['_active_username']}」に切り替えました。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
                 self.user_index = min(self.user_index, max(0, len(get_users(config)) - 1))
                 if action == "delete" and not get_users(config):
                     self.modal = "users"
                     self.message += " Aで新しいユーザーを追加できます。"
-                if action == "switch" and self.room:
+                if action in ("switch", "default") and self.room:
                     self.start()
             elif kind == "account_error":
                 self.busy = False
@@ -285,7 +287,8 @@ class AttendanceScreen:
 
         def work():
             try:
-                from .user_commands import add_user, change_password, change_student_id, remove_user, rename_user, use_user
+                from .user_commands import activate_default_user, add_user, change_password, change_student_id, remove_user, rename_user
+                activated = None
                 target = select_user(self.config, name) if action in ("delete", "student_id") else None
                 if self.demo:
                     config = dict(self.config, users=get_users(self.config))
@@ -305,6 +308,7 @@ class AttendanceScreen:
                             config["default_user"] = new_name
                     elif action == "default":
                         config["default_user"] = select_user(config, name)["username"]
+                        config["ui_selected_users"] = [select_user(config, name)["student_id"]]
                     elif action == "password":
                         select_user(config, name)
                         if not password:
@@ -321,7 +325,8 @@ class AttendanceScreen:
                     elif action == "rename":
                         config = rename_user(self.base, name, new_name)
                     elif action == "default":
-                        config = use_user(self.base, name)
+                        config, active_id, active_password = activate_default_user(self.base, name)
+                        activated = active_id, active_password
                     elif action == "password":
                         config = change_password(self.base, name, password)
                     elif action == "delete":
@@ -330,15 +335,15 @@ class AttendanceScreen:
                         config = change_student_id(self.base, name, student_id)
                     else:
                         config = load_config(self.base / "config.json")
-                current_id, current_password = self.student_id, self.password
-                if action == "switch":
+                current_id, current_password = activated if activated is not None else (self.student_id, self.password)
+                if action in ("switch", "default"):
                     if self.demo:
                         current_id, current_password = select_user(config, name)["student_id"], ""
-                    else:
+                    elif activated is None:
                         current_id, current_password = get_credentials(config, self.base / "config.json", interactive=False, username=name)
                 elif action == "password" and not self.demo and select_user(config, name)["student_id"] == current_id:
                     current_password = password
-                selected = {current_id} if action == "switch" else None
+                selected = {current_id} if action in ("switch", "default") else None
                 if action in ("delete", "student_id"):
                     selected = set(self.selected_user_ids)
                     if target["student_id"] in selected:
@@ -670,7 +675,7 @@ class AttendanceScreen:
             canvas.put(top + height - 6, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
             canvas.put(top + height - 5, left + 3, "I 学籍番号変更  X 削除", color(1), width - 6)
             canvas.put(top + height - 4, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
-            canvas.put(top + height - 3, left + 3, self.form_error or "既定ユーザーは通常実行・自動実行に使われます。", color(3) if self.form_error else curses.A_DIM, width - 6)
+            canvas.put(top + height - 3, left + 3, self.form_error or "Dで既定とこの画面の出席対象を切り替えます。", color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "user_result":
             user = get_users(self.config)[self.user_index]
             canvas.put(top + 2, left + 3, f"{user['username']} / {user['student_id']}", curses.A_BOLD, width - 6)
@@ -720,9 +725,9 @@ class AttendanceScreen:
             users = get_users(self.config)
             name = users[self.user_index]["username"]
             canvas.put(top + 3, left + 3, name, curses.A_BOLD, width - 6)
-            for index, line in enumerate(wrap_text("このユーザーを通常実行・時刻による自動実行の既定ユーザーにします。", width - 6)):
+            for index, line in enumerate(wrap_text("このユーザーを通常実行・自動実行の既定に設定し、この画面の出席対象もこの1人に切り替えます。複数選択はUから再設定できます。", width - 6)):
                 canvas.put(top + 6 + index, left + 3, line)
-            canvas.put(top + 11, left + 3, "Enter: 既定ユーザーに設定", color(4))
+            canvas.put(top + 11, left + 3, "Enter: 既定と出席対象を切替", color(4))
         else:
             guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択してEnter", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
             for index, line in enumerate(guide):

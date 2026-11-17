@@ -46,6 +46,22 @@ def use_user(base, name):
     return config
 
 
+def activate_default_user(base, name):
+    """GUIの既定と出席対象を一緒に変更する。認証失敗なら設定を保存しない。"""
+    path = base / "config.json"
+    config = load_config(path)
+    user = select_user(config, name)
+    student_id = user["student_id"]
+    password = _saved_password(keychain_backend(), student_id)
+    if not password:
+        raise CredentialError("保存パスワードがありません。ユーザー管理のPで設定してから、もう一度Dで切り替えてください。")
+    config["users"] = get_users(config)
+    config["default_user"] = user["username"]
+    config["ui_selected_users"] = [student_id]
+    _save_private_json(path, config)
+    return config, student_id, password
+
+
 def save_ui_selection(base, student_ids):
     path = base / "config.json"
     config = load_config(path)
