@@ -315,7 +315,7 @@ class UpdaterMatrixTests(unittest.TestCase):
                 notice.parent.mkdir(parents=True)
                 notice.write_bytes(state)
                 app = Mock(main=Mock(return_value=0))
-                with patch.object(u.importlib, "import_module", return_value=app), patch.object(u, "check_update", return_value=None), redirect_stderr(io.StringIO()):
+                with patch.object(u.importlib, "import_module", return_value=app), patch.object(u, "start_update_check"), redirect_stderr(io.StringIO()):
                     self.assertEqual(u.run_application(fixture.base, ["--ui"]), 0)
                 app.main.assert_called_once()
 
@@ -348,7 +348,7 @@ class UpdaterMatrixTests(unittest.TestCase):
             with self.subTest(mode=mode), self.installation() as fixture:
                 app = Mock(main=Mock(return_value=7))
                 with patch.object(u.importlib, "import_module", return_value=app), \
-                        patch.object(u, "check_update", side_effect=URLError("offline")) as check, \
+                        patch.object(u, "start_update_check") as check, \
                         patch.dict(u.os.environ, {"ATTENDANCE_NO_UPDATE": "1"} if mode == "disabled" else {}, clear=True):
                     self.assertEqual(u.run_application(fixture.base, ["--check", "731"]), 7)
                 self.assertEqual(check.call_count, 0 if mode == "disabled" else 1)
@@ -523,7 +523,7 @@ class UpdaterMatrixTests(unittest.TestCase):
 
                 app = Mock(main=Mock(return_value=0))
                 with patch.object(u.importlib, "import_module", return_value=app), \
-                        patch.object(u, "check_update", return_value=None), patch.object(Path, "unlink", fail_notice), \
+                        patch.object(u, "start_update_check"), patch.object(Path, "unlink", fail_notice), \
                         redirect_stderr(io.StringIO()) as errors:
                     self.assertEqual(u.run_application(fixture.base, ["--ui"]), 0)
                 self.assertEqual(errors.getvalue(), "")

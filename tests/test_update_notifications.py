@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
+import threading
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
@@ -24,16 +25,67 @@ class UpdateNotificationTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.base = self.fixture.base
         self.manifest = {**fixtures.manifest_for(self.fixture.archive()), "release_notes": notes(fixtures.NEXT)}
+        self.workers = []
+        original_start = u.start_update_check
 
-    def start(self):
+        def tracked_start(base):
+            worker = original_start(base)
+            if worker:
+                self.workers.append(worker)
+            return worker
+
+        context = patch.object(u, "start_update_check", side_effect=tracked_start)
+        context.start()
+        self.addCleanup(context.stop)
+        self.addCleanup(self.wait_workers)
+
+    def wait_workers(self):
+        for worker in self.workers:
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), "更新確認ワーカーが終了していない")
+
+    def test_slow_network_does_not_block_application_start_or_exit(self):
+        network_started, release_network, application_started = (threading.Event() for _ in range(3))
+        result = []
+
+        def slow_fetch(*args, **kwargs):
+            network_started.set()
+            release_network.wait(3)
+            return json.dumps(self.manifest).encode()
+
+        def main(argv):
+            application_started.set()
+            return 7
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(u, "fetch", side_effect=slow_fetch), \
+                patch.object(u.importlib, "import_module", return_value=Mock(main=main)), redirect_stderr(io.StringIO()):
+            caller = threading.Thread(target=lambda: result.append(u.run_application(self.base, ["--ui"])), daemon=True)
+            caller.start()
+            try:
+                self.assertTrue(network_started.wait(1))
+                self.assertTrue(application_started.wait(.5), "更新通信の完了待ちでアプリが起動しない")
+                caller.join(.5)
+                self.assertFalse(caller.is_alive(), "アプリ終了時も更新通信を待っている")
+                self.assertEqual(result, [7])
+            finally:
+                release_network.set()
+                caller.join(3)
+                self.wait_workers()
+
+    def start(self, argv=None):
         output = io.StringIO()
-        with patch.dict(os.environ, {}), patch.object(u.importlib, "import_module", return_value=Mock(main=Mock(return_value=0))), \
+
+        def main(argv):
+            self.wait_workers()
+            return 0
+
+        with patch.dict(os.environ, {}), patch.object(u.importlib, "import_module", return_value=Mock(main=main)), \
                 redirect_stderr(output):
             os.environ.pop("ATTENDANCE_NO_UPDATE", None)
-            self.assertEqual(u.run_application(self.base, ["--ui"], use_runtime=True), 0)
+            self.assertEqual(u.run_application(self.base, argv or ["--check", "731"], use_runtime=True), 0)
         return output.getvalue()
 
-    def test_each_start_notifies_with_commands_and_fetches_json_only(self):
+    def test_each_start_notifies_from_cache_and_daily_check_fetches_json_only(self):
         with patch.object(u, "fetch", return_value=json.dumps(self.manifest).encode()) as fetch, \
                 patch.object(d, "prepare_environment") as prepare, patch.object(u, "finish_update") as apply:
             for _ in range(2):
@@ -41,12 +93,42 @@ class UpdateNotificationTests(unittest.TestCase):
                 self.assertIn("アップデートがあります", output)
                 self.assertIn("att update --notes", output)
                 self.assertIn("アップデートする: att update", output)
-            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(fetch.call_count, 1)
             self.assertTrue(all(call.args[0] == u.MANIFEST_URL for call in fetch.call_args_list))
             prepare.assert_not_called()
             apply.assert_not_called()
         self.assertFalse((self.base / ".updates/pending").exists())
         self.assertEqual(u.fingerprint(self.base), self.fixture.original)
+
+    def test_ui_start_is_silent_and_completed_check_is_cached(self):
+        with patch.object(u, "fetch", return_value=json.dumps(self.manifest).encode()):
+            self.assertEqual(self.start(["--ui"]), "")
+            self.assertEqual(self.start(["--ui"]), "")
+        self.assertEqual(u.cached_manifest(self.base), self.manifest)
+
+    def test_expired_cache_is_refreshed_but_fresh_cache_is_reused(self):
+        u.write_json(self.base / ".updates/check.json", {"checked_at": u.time.time() - 86401,
+                                                       "interval": 86400, "manifest": self.manifest})
+        with patch.object(u, "fetch", return_value=json.dumps(self.manifest).encode()) as fetch:
+            self.start()
+            self.start()
+        fetch.assert_called_once()
+
+    def test_cached_cli_notice_is_not_duplicated_or_printed_during_input(self):
+        u.write_json(self.base / ".updates/check.json", {"manifest": self.manifest})
+        with patch.object(u, "fetch", return_value=json.dumps(self.manifest).encode()):
+            self.assertEqual(self.start().count("アップデートがあります"), 1)
+
+    def test_busy_check_lock_does_not_log_failure_or_block_app(self):
+        with u.file_lock(self.base / ".updates/download.lock", exclusive=True), patch.object(u, "fetch") as fetch:
+            self.assertEqual(self.start(["--ui"]), "")
+        fetch.assert_not_called()
+        self.assertFalse((self.base / ".updates/updater.log").exists())
+
+    def test_worker_creation_failure_does_not_stop_application(self):
+        with patch.object(u.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+            self.assertEqual(self.start(["--ui"]), "")
+        self.assertTrue((self.base / ".updates/updater.log").is_file())
 
     def test_current_and_older_releases_are_silent(self):
         for version in (fixtures.VERSION, "0.0.1"):
@@ -129,6 +211,25 @@ class UpdateNotificationTests(unittest.TestCase):
             with self.subTest(demo=demo), patch.dict(os.environ, environment, clear=True):
                 ui = AttendanceScreen({}, "TEST001", "", Mock(), base=self.base, demo=demo)
                 self.assertIsNone(ui.update_version)
+
+    def test_screen_picks_up_finished_check_after_start_without_network_or_stderr(self):
+        from src.terminal_ui import AttendanceScreen
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test"}
+        with patch.dict(os.environ, {}, clear=True):
+            ui = AttendanceScreen(config, "TEST001", "", Mock(), base=self.base)
+            self.assertIsNone(ui.update_version)
+            with patch.object(u, "fetch", return_value=json.dumps(self.manifest).encode()):
+                self.assertEqual(self.start(["--ui"]), "")
+            ui.update_check_after = 0
+            with patch.object(u, "fetch", side_effect=AssertionError("UI must not fetch")), redirect_stderr(io.StringIO()) as output:
+                ui.poll()
+                self.assertEqual(ui.update_version, fixtures.NEXT)
+                screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+                ui.draw(screen)
+                shown = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+                self.assertIn("att update --notes", shown)
+                self.assertIn("適用: att update", shown)
+                self.assertEqual(output.getvalue(), "")
 
 
 if __name__ == "__main__":

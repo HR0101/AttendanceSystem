@@ -402,8 +402,10 @@ urllib.request.OpenerDirector.open = fixture_open
                 if installation == "zip":
                     shutil.rmtree(self.base / ".git")
                     self.private.pop(".git/config")
-                u.write_json(self.base / ".updates/check.json", {})
                 data = self.archive()
+                # 即終了するCLIは通信を待たない。保存済みの通知と手動更新の連携を検証する。
+                u.write_json(self.base / ".updates/check.json", {"manifest": manifest_for(data),
+                                                               "checked_at": time.time(), "interval": 86400})
                 (fixture / "release.zip").write_bytes(data)
                 (fixture / "release.json").write_text(json.dumps(manifest_for(data)))
                 backup = self.base / ".updates/backup/journal.json"
@@ -416,11 +418,11 @@ urllib.request.OpenerDirector.open = fixture_open
                 self.assertEqual(u.fingerprint(self.base), self.original)
                 self.assertFalse((self.base / ".updates/pending").exists())
                 self.assertEqual(backup.read_bytes() if backup.exists() else None, before_backup)
-                requests = (fixture / "requests.log").read_text().splitlines()
-                self.assertTrue(all(url == u.MANIFEST_URL for url in requests))
+                self.assertFalse((fixture / "requests.log").exists())
                 result = subprocess.run(command + ["update"], cwd=self.base, env=environment,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("/attendance-update.zip", (fixture / "requests.log").read_text())
                 self.assertTrue((self.base / ".updates/backup/journal.json").exists())
                 result = subprocess.run([sys.executable, str(self.base / "main.py"), "--version"],
                                         cwd=self.base, env=environment, capture_output=True, text=True, timeout=10)

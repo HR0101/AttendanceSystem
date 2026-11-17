@@ -38,6 +38,7 @@ class AttendanceScreen:
         self.base = base
         manifest = cached_manifest(base) if base and not demo and not os.environ.get("ATTENDANCE_NO_UPDATE") else None
         self.update_version = manifest["version"] if manifest and available_message(manifest) else None
+        self.update_check_after = time.monotonic() + 1
         self.history = deque(maxlen=8)
         self.checked = self.failed = False
         self.modal = None
@@ -213,6 +214,11 @@ class AttendanceScreen:
         self.history.appendleft((self.updated, self.room, self.message))
 
     def poll(self):
+        if (self.base and not self.demo and not os.environ.get("ATTENDANCE_NO_UPDATE")
+                and time.monotonic() >= self.update_check_after):
+            self.update_check_after = time.monotonic() + 1
+            manifest = cached_manifest(self.base)
+            self.update_version = manifest["version"] if manifest and available_message(manifest) else None
         self.schedule_panel.poll()
         while True:
             try:
