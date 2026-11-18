@@ -53,10 +53,113 @@ class SchedulePanelTests(unittest.TestCase):
             self.ui.poll()
             self.assertFalse(load_schedule(self.path)["courses"][1]["enabled"])
             self.panel.handle("d")
+            self.assertEqual(self.panel.mode, "delete")
+            self.assertEqual(self.panel.confirm_selection, 0)
             self.assertEqual(len(load_schedule(self.path)["courses"]), 2)
+            self.panel.handle("\t")
+            self.assertEqual(self.panel.confirm_selection, 1)
             self.panel.handle("\n")
             self.ui.poll()
             self.assertEqual(len(load_schedule(self.path)["courses"]), 1)
+
+    def test_delete_confirmation_defaults_to_cancel_and_shows_course_details(self):
+        self.panel.data["courses"][0]["register_time"] = "14:05"
+        self.panel.data["courses"][0]["register_until"] = "14:12"
+        self.panel.handle("d")
+        self.assertEqual(self.panel.mode, "delete")
+        self.assertEqual(self.panel.confirm_selection, 0)
+        for key, expected in (("\t", 1), (curses.KEY_LEFT, 0), (curses.KEY_RIGHT, 1), (curses.KEY_BTAB, 0)):
+            self.panel.handle(key)
+            self.assertEqual(self.panel.confirm_selection, expected)
+        for width in (62, 120):
+            screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+            self.ui.draw(screen)
+            drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+            for text in ("授業", "月", "14:00", "14:05～14:12", "731", "キャンセル", "削除する"):
+                self.assertIn(text, drawn)
+
+    def test_delete_default_cancel_repeated_enter_esc_and_q_never_delete(self):
+        original = self.path.read_bytes()
+        self.panel.active = True
+        with patch("src.schedule_ui.save_schedule") as save, patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.remove_agent") as remove:
+            for sequence in (("\n", "\n"), ("\x1b",), ("q",), ("Q",)):
+                with self.subTest(sequence=sequence):
+                    self.panel.mode = "list"
+                    self.panel.handle("d")
+                    self.assertEqual(self.panel.confirm_selection, 0)
+                    for key in sequence:
+                        self.panel.handle(key)
+                    self.assertEqual(len(self.panel.data["courses"]), 1)
+                    self.assertEqual(self.path.read_bytes(), original)
+                    save.assert_not_called()
+                    install.assert_not_called()
+                    remove.assert_not_called()
+
+    def test_explicit_delete_updates_active_agent_and_reports_save_failure(self):
+        self.panel.active = True
+        self.panel.data["courses"].append({"weekday": "tue", "start_time": "10:00", "room": "642", "course_name": "火曜授業", "enabled": True})
+        save_schedule(self.path, self.panel.data)
+        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.agent_installed", return_value=True):
+            self.panel.handle("d")
+            self.panel.handle(curses.KEY_RIGHT)
+            self.panel.handle("\n")
+            self.ui.poll()
+        install.assert_called_once()
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 1)
+        with patch("src.schedule_ui.remove_agent") as remove, patch("src.schedule_ui.agent_installed", return_value=False):
+            self.panel.handle("d")
+            self.panel.handle("\t")
+            self.panel.handle("\n")
+            self.ui.poll()
+        remove.assert_called_once_with(self.base)
+        self.assertEqual(load_schedule(self.path)["courses"], [])
+        self.panel.data = copy.deepcopy(DATA)
+        save_schedule(self.path, self.panel.data)
+        before = self.path.read_bytes()
+        for err in (PermissionError("書き込み不可"), PermissionError()):
+            with self.subTest(err=repr(err)), patch("src.schedule_ui.save_schedule", side_effect=err), \
+                    patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.remove_agent") as remove:
+                self.panel.handle("d")
+                self.panel.handle("\t")
+                self.panel.handle("\n")
+                self.ui.poll()
+                self.assertEqual(self.panel.mode, "delete")
+                self.assertTrue(self.panel.message)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(len(self.panel.data["courses"]), 1)
+                install.assert_not_called()
+                remove.assert_not_called()
+                self.panel.handle("\x1b")
+
+    def test_ctrl_s_saves_schedule_forms_from_any_field(self):
+        with patch("src.schedule_ui.agent_installed", return_value=False):
+            self.panel.handle("a")
+            self.panel.fields = ["途中保存授業", "wed", "13:00", "642", "", ""]
+            self.panel.field_index = 0
+            self.panel.handle("\x13")
+            self.ui.poll()
+            self.assertEqual(self.panel.mode, "list")
+            self.assertEqual(load_schedule(self.path)["courses"][1]["course_name"], "途中保存授業")
+            self.panel.handle(curses.KEY_DOWN)
+            self.panel.handle("\n")
+            self.panel.fields[3] = "611"
+            self.panel.field_index = 1
+            self.panel.handle("\x13")
+            self.ui.poll()
+            self.assertEqual(load_schedule(self.path)["courses"][1]["room"], "611")
+            self.panel.handle("p")
+            self.panel.fields[1] = "2026-12-25"
+            self.panel.field_index = 0
+            self.panel.handle("\x13")
+            self.ui.poll()
+            self.assertEqual(load_schedule(self.path)["active_until"].isoformat(), "2026-12-25")
+            self.panel.handle("a")
+            self.panel.fields[2] = "99:99"
+            self.panel.field_index = 2
+            self.panel.handle("\x13")
+            self.assertEqual(self.panel.mode, "add")
+            self.assertEqual(self.panel.field_index, 2)
+            self.assertIn("HH:MM", self.panel.message)
 
     def test_invalid_form_preserves_file_and_input(self):
         original = self.path.read_bytes()
