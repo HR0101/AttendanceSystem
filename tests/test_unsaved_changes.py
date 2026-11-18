@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from src.config import load_config
 from src.credentials import CredentialError
 from src.scheduler import load_schedule, save_schedule
+from src.terminal_layout import Canvas
 from src.terminal_ui import AttendanceScreen
 from src.unsaved_changes import SavePrompt
 from test_schedule_ui import DATA
@@ -160,6 +161,12 @@ class UnsavedChangesTests(unittest.TestCase):
         ui.handle_modal(curses.KEY_DOWN)
         ui.handle_modal("d")
         ui.handle_modal("q")
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        ui.draw(screen)
+        flat = "".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("one (OLD001) → two (NEW002)", flat)
+        self.assertIn("現在の出席対象（1人選択中）", flat)
+        self.assertIn("自動実行（停止中）も今後は two (NEW002)", flat)
         self.assertEqual(self.path.read_bytes(), self.before)
         self.choose(ui, "save")
         self.assertEqual((ui.student_id, ui.password), ("NEW002", "second-secret"))
@@ -377,6 +384,36 @@ class UnsavedChangesTests(unittest.TestCase):
             self.assertFalse(prompt.active)
             save.assert_not_called()
             discard.assert_not_called()
+
+    def test_prompt_renders_details_within_bounds_and_resets_them_on_reopen(self):
+        prompt = SavePrompt()
+        prompt.open("既定ユーザーの変更", save=Mock(), discard=Mock(),
+                    details=("1行目の補足", "2行目の補足"))
+        for width in (62, 80, 120):
+            screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+            prompt.draw(Canvas(screen))
+            drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+            self.assertIn("1行目の補足", drawn)
+            self.assertIn("2行目の補足", drawn)
+            self.assertIn("[ 保存して戻る ]", drawn)
+            self.assertIn("[ 編集を続ける ]", drawn)
+            self.assertTrue(all(0 <= call.args[0] < 23 for call in screen.addstr.call_args_list))
+
+        prompt.open("長い補足", save=Mock(), discard=Mock(), details=tuple(f"項目{i}" for i in range(12)))
+        screen = Mock(getmaxyx=Mock(return_value=(24, 62)))
+        prompt.draw(Canvas(screen))
+        drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("…", drawn)
+        self.assertIn("[ 編集を続ける ]", drawn)
+        self.assertTrue(all(0 <= call.args[0] < 23 for call in screen.addstr.call_args_list))
+
+        prompt.handle("\x1b")
+        self.assertEqual(prompt.details, ())
+        prompt.open("通常の確認", save=Mock(), discard=Mock())
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        prompt.draw(Canvas(screen))
+        drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertNotIn("項目0", drawn)
 
     def test_small_terminal_cannot_bypass_unsaved_prompt(self):
         ui = self.screen()

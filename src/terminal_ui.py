@@ -17,6 +17,7 @@ from .config import ConfigurationError, load_config
 from .credentials import CredentialError, get_credentials
 from .logging_utils import setup_logging
 from .room import RoomError, parse_room
+from .scheduler import agent_installed
 from .verification import AttendanceError
 from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
 from .users import change_student_id_config, get_users, remove_user_config, select_user, ui_selection, valid_username
@@ -24,6 +25,8 @@ from .text_input import TextCursor
 from .unsaved_changes import SavePrompt
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
+
+_UNSET = object()
 
 
 class _WorkerLogger:
@@ -104,6 +107,7 @@ class AttendanceScreen:
         self.form_index = 0
         self.form_error = ""
         self.confirm_selection = 0
+        self._default_agent_active = _UNSET
         self.demo_state = "unattended"
         self.demo_attended = set()
         self.schedule_panel = SchedulePanel(self)
@@ -537,6 +541,7 @@ class AttendanceScreen:
         self.expire_password()
         self.modal = "users"
         self.form_error = ""
+        self._default_agent_active = _UNSET
         self.pending_user_ids = set(self.selected_user_ids)
         users = get_users(self.config)
         self.user_index = next((i for i, u in enumerate(users) if u["student_id"] in self.selected_user_ids), 0)
@@ -592,6 +597,57 @@ class AttendanceScreen:
         self.form_initial_values = tuple(self.form_values)
         self.password_visible = False
 
+    def _automation_active(self):
+        """LaunchAgentの自動実行状態を安全に確認する。デモや参照不可時はFalse/Noneを返す。"""
+        if self.demo or not isinstance(self.base, Path):
+            return False
+        try:
+            return bool(agent_installed(self.base))
+        except Exception:
+            return None
+
+    def default_switch_impact(self, target_user, *, agent_active=_UNSET):
+        """既定ユーザー変更時の現在値・出席対象・自動実行への具体的な影響文を返す。"""
+        if agent_active is _UNSET:
+            agent_active = self._automation_active()
+        target_label = f"{target_user['username']} ({target_user['student_id']})"
+        try:
+            current_default = select_user(self.config) if self.config.get("default_user") else None
+        except ConfigurationError:
+            current_default = None
+        same_default = (
+            current_default is not None
+            and current_default["username"] == target_user["username"]
+            and current_default["student_id"] == target_user["student_id"]
+        )
+        if current_default is None:
+            default_line = f"既定ユーザー: 未設定 → {target_label}"
+        elif same_default:
+            default_line = f"既定ユーザー: {target_label}（変更なし）"
+        else:
+            current_label = f"{current_default['username']} ({current_default['student_id']})"
+            default_line = f"既定ユーザー: {current_label} → {target_label}"
+
+        selected_count = len(self.selected_users()) if self.selected_user_ids else 0
+        if (same_default and self.selected_user_ids == {target_user["student_id"]}
+                and self.student_id == target_user["student_id"]):
+            target_line = f"現在の出席対象（1人選択中）と保存済みの選択は {target_label} のままです。"
+        elif selected_count == 0:
+            target_line = f"現在の出席対象（未選択）と保存済みの選択も {target_label} の1人のみに切り替わります。"
+        else:
+            target_line = f"現在の出席対象（{selected_count}人選択中）と保存済みの選択も {target_label} の1人のみに切り替わります。"
+
+        automation_state = "有効中" if agent_active is True else "停止中" if agent_active is False else "状態未確認"
+        if same_default:
+            automation_line = f"自動実行（{automation_state}）は引き続き {target_label} で実行されます。"
+        else:
+            automation_line = f"自動実行（{automation_state}）も今後は {target_label} で実行されます。"
+        return (default_line, target_line, automation_line)
+
+    def _confirm_default_user(self, username):
+        self._default_agent_active = _UNSET
+        self.account_action("default", username)
+
     def discard_modal(self):
         parent = self.modal in ("user_result", "delete", "default") or (
             self.modal in ("add", "rename", "password", "student_id") and self.form_parent_users)
@@ -602,6 +658,7 @@ class AttendanceScreen:
         self.password_visible = False
         self.form_error = ""
         self.back_after_save = False
+        self._default_agent_active = _UNSET
         if self.modal == "users":
             self.pending_user_ids = set(self.selected_user_ids)
         self.modal = "users" if parent else None
@@ -617,11 +674,21 @@ class AttendanceScreen:
         elif self.modal in ("add", "rename", "password", "student_id") and tuple(self.form_values) != self.form_initial_values:
             self.save_prompt.open("ユーザー情報の編集", save=self.save_form_and_back, discard=self.discard_modal)
         elif self.modal == "default":
-            user = get_users(self.config)[self.user_index]
+            users = get_users(self.config)
+            if not users:
+                self.discard_modal()
+                return
+            user = users[min(self.user_index, len(users) - 1)]
             if (self.config.get("default_user") != user["username"] or self.student_id != user["student_id"]
                     or self.selected_user_ids != {user["student_id"]}):
-                self.save_prompt.open("既定ユーザーの変更",
-                                      save=lambda: self.account_action("default", user["username"]), discard=self.discard_modal)
+                if self._default_agent_active is _UNSET:
+                    self._default_agent_active = self._automation_active()
+                self.save_prompt.open(
+                    "既定ユーザーの変更",
+                    save=lambda: self._confirm_default_user(user["username"]),
+                    discard=self.discard_modal,
+                    details=self.default_switch_impact(user, agent_active=self._default_agent_active),
+                )
             else:
                 self.discard_modal()
         else:
@@ -717,11 +784,21 @@ class AttendanceScreen:
                 self.confirm_selection = 0
             elif key in ("d", "D") and users:
                 self.modal = "default"
+                self.confirm_selection = 0
+                self._default_agent_active = self._automation_active()
             return
         if self.modal == "default":
-            if enter:
-                users = get_users(self.config)
-                self.account_action("default", users[self.user_index]["username"])
+            if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+                self.confirm_selection = 1 - self.confirm_selection
+            elif enter:
+                if self.confirm_selection:
+                    users = get_users(self.config)
+                    self._default_agent_active = _UNSET
+                    if users:
+                        self.account_action("default", users[min(self.user_index, len(users) - 1)]["username"])
+                else:
+                    self._default_agent_active = _UNSET
+                    self.modal = "users"
             return
         if self.modal == "delete":
             if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
@@ -945,11 +1022,24 @@ class AttendanceScreen:
             canvas.put(top + height - 3, left + 3, self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。"), color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "default":
             users = get_users(self.config)
-            name = users[self.user_index]["username"]
-            canvas.put(top + 3, left + 3, name, curses.A_BOLD, width - 6)
-            for index, line in enumerate(wrap_text("このユーザーを通常実行・自動実行の既定に設定し、この画面の出席対象もこの1人に切り替えます。複数選択はUから再設定できます。", width - 6)):
-                canvas.put(top + 6 + index, left + 3, line)
-            canvas.put(top + 11, left + 3, "Enter: 既定と出席対象を切替", color(4))
+            if users:
+                user = users[min(self.user_index, len(users) - 1)]
+                if self._default_agent_active is _UNSET:
+                    self._default_agent_active = self._automation_active()
+                canvas.put(top + 2, left + 3, f"変更先: {user['username']} ({user['student_id']})", curses.A_BOLD, width - 6)
+                paragraphs = [wrap_text(entry, width - 6) for entry in self.default_switch_impact(user, agent_active=self._default_agent_active)]
+                row, limit = top + 4, top + height - 6
+                spaced = sum(len(lines) for lines in paragraphs) + max(0, len(paragraphs) - 1) <= limit - row
+                for lines in paragraphs:
+                    for line in lines:
+                        if row < limit:
+                            canvas.put(row, left + 3, line, width=width - 6)
+                            row += 1
+                    if spaced and row < limit:
+                        row += 1
+            canvas.button(top + height - 5, left + 3, "[ キャンセル ]", self.confirm_selection == 0)
+            canvas.button(top + height - 5, left + 25, "[ 切り替える ]", self.confirm_selection == 1)
+            canvas.put(top + height - 3, left + 3, "Tab/←→で選択し、Enterで決定します。", curses.A_DIM, width - 6)
         else:
             guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択してEnter", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
             for index, line in enumerate(guide):
