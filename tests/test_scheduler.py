@@ -6,12 +6,12 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from src.config import private_file_lock
 from src.scheduler import (
-    ScheduleError, calendar_intervals, due_course, load_schedule,
+    ScheduleError, calendar_intervals, due_course, load_schedule, next_scheduled_run,
     registration_time, save_schedule, schedule_data, update_schedule, validate_schedule,
 )
 
@@ -486,6 +486,69 @@ class SchedulerTests(unittest.TestCase):
                 save_schedule(path, enabled_conflict)
             self.assertEqual(path.read_bytes(), original)
             self.assertFalse(load_schedule(path)["courses"][1]["enabled"])
+
+    def test_next_scheduled_run_picks_earliest_enabled_course(self):
+        disabled = dict(COURSE, weekday="mon", start_time="09:00", course_name="無効", enabled=False)
+        wednesday = dict(COURSE, weekday="wed", start_time="10:00", course_name="水曜授業", enabled=True)
+        schedule = dict(SCHEDULE, courses=[disabled, COURSE, wednesday])
+        self.assertEqual(
+            next_scheduled_run(schedule, datetime(2026, 10, 5, 14, 4)),
+            (datetime(2026, 10, 5, 14, 5), COURSE),
+        )
+        self.assertEqual(
+            next_scheduled_run(schedule, datetime(2026, 10, 5, 14, 5)),
+            (datetime(2026, 10, 5, 14, 5), COURSE),
+        )
+        self.assertEqual(
+            next_scheduled_run(schedule, datetime(2026, 10, 5, 14, 6)),
+            (datetime(2026, 10, 7, 10, 5), wednesday),
+        )
+
+    def test_next_scheduled_run_respects_period_and_blackout_dates(self):
+        self.assertEqual(
+            next_scheduled_run(SCHEDULE, datetime(2026, 9, 1, 9, 0)),
+            (datetime(2026, 9, 21, 14, 5), COURSE),
+        )
+        # 2026-11-23 は休講日のため翌週の 2026-11-30 を返す。
+        self.assertEqual(
+            next_scheduled_run(SCHEDULE, datetime(2026, 11, 20, 9, 0)),
+            (datetime(2026, 11, 30, 14, 5), COURSE),
+        )
+        self.assertIsNone(next_scheduled_run(SCHEDULE, datetime(2026, 12, 21, 14, 6)))
+        self.assertIsNone(next_scheduled_run(SCHEDULE, datetime(2026, 12, 22, 9, 0)))
+        disabled_only = dict(SCHEDULE, courses=[dict(COURSE, enabled=False)])
+        self.assertIsNone(next_scheduled_run(disabled_only, datetime(2026, 10, 5, 10, 0)))
+        all_blackouts = dict(
+            SCHEDULE,
+            active_from=date(2026, 10, 5),
+            active_until=date(2026, 10, 12),
+            blackout_dates=frozenset({date(2026, 10, 5), date(2026, 10, 12)}),
+        )
+        self.assertIsNone(next_scheduled_run(all_blackouts, datetime(2026, 10, 1, 9, 0)))
+
+    def test_next_scheduled_run_handles_range_rollover_and_timezone(self):
+        ranged = dict(COURSE, register_time="14:05", register_until="14:15")
+        first_time = registration_time(ranged, date(2026, 10, 5))
+        second_time = registration_time(ranged, date(2026, 10, 12))
+        first_hour, first_min = map(int, first_time.split(":"))
+        second_hour, second_min = map(int, second_time.split(":"))
+        ranged_schedule = dict(SCHEDULE, courses=[ranged])
+        self.assertEqual(
+            next_scheduled_run(ranged_schedule, datetime(2026, 10, 5, first_hour, first_min)),
+            (datetime(2026, 10, 5, first_hour, first_min), ranged),
+        )
+        self.assertEqual(
+            next_scheduled_run(ranged_schedule, datetime(2026, 10, 5, first_hour, first_min, 1)),
+            (datetime(2026, 10, 12, second_hour, second_min), ranged),
+        )
+        rollover_course = dict(COURSE, weekday="sun", start_time="23:58")
+        rollover_schedule = dict(SCHEDULE, active_from=date(2026, 10, 4), active_until=date(2026, 10, 4), courses=[rollover_course])
+        self.assertEqual(
+            next_scheduled_run(rollover_schedule, datetime(2026, 10, 5, 0, 1)),
+            (datetime(2026, 10, 5, 0, 3), rollover_course),
+        )
+        aware = next_scheduled_run(SCHEDULE, datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc))
+        self.assertEqual(aware, (datetime(2026, 10, 5, 14, 5, tzinfo=timezone.utc), COURSE))
 
 
 if __name__ == "__main__":
