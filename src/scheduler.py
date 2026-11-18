@@ -1,3 +1,6 @@
+import contextlib
+import errno
+import threading
 """授業予定の検証と macOS LaunchAgent の管理。"""
 
 import fcntl
@@ -1056,3 +1059,136 @@ def format_schedule_diagnostics(diag: dict) -> list[str]:
             else "  有効な授業数: NG（0件: 有効な授業を設定してください）"
         )
     return lines
+
+
+_LOCK_STATE = threading.local()
+
+
+def _held_locks() -> dict[str, list[int]]:
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    return held
+
+
+@contextlib.contextmanager
+def _delegate_private_lock(shared_lock, path: Path, *, exclusive: bool, blocking: bool):
+    """PR #49 の config.private_file_lock がある場合は単一実装へ委譲し、OSエラーを変換する。"""
+    try:
+        cm = shared_lock(path, exclusive=exclusive, blocking=blocking)
+        entered = cm.__enter__()
+    except BlockingIOError:
+        raise
+    except OSError as exc:
+        raise ScheduleError(str(exc)) from exc
+    try:
+        yield entered
+    except BaseException as exc:
+        try:
+            suppress = cm.__exit__(type(exc), exc, exc.__traceback__)
+        except BlockingIOError:
+            raise
+        except OSError as exit_exc:
+            raise ScheduleError(str(exit_exc)) from exit_exc
+        if not suppress:
+            raise
+    else:
+        try:
+            cm.__exit__(None, None, None)
+        except BlockingIOError:
+            raise
+        except OSError as exit_exc:
+            raise ScheduleError(str(exit_exc)) from exit_exc
+
+
+def _open_lock_fd(lock_path: Path) -> int:
+    """シンボリックリンク・非通常ファイルを拒否し、0o600 の通常ファイルとしてロックを開く。"""
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ScheduleError("予定のロックファイルがシンボリックリンクです。") from exc
+        if exc.errno == errno.EISDIR:
+            raise ScheduleError("予定のロックファイルは通常のファイルにしてください。") from exc
+        raise ScheduleError(f"予定のロックファイルを開けません: {exc}") from exc
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise ScheduleError("予定のロックファイルは通常のファイルにしてください。")
+        if stat.S_IMODE(mode) != 0o600:
+            os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def schedule_lock(path: Path, *, exclusive: bool = True, blocking: bool = True):
+    """schedule.json の読み書き競合を防ぐ専用ロックファイルで排他制御する。"""
+    from . import config as _config_mod
+    shared_lock = getattr(_config_mod, "private_file_lock", None)
+    if shared_lock is not None:
+        with _delegate_private_lock(shared_lock, path, exclusive=exclusive, blocking=blocking) as entered:
+            yield entered
+        return
+    if not isinstance(path, (str, os.PathLike)):
+        yield path
+        return
+    target = Path(path)
+    lock_path = target.with_name(f"{target.name}.lock")
+    if lock_path.is_symlink():
+        raise ScheduleError("予定のロックファイルがシンボリックリンクです。")
+    try:
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ScheduleError(f"予定のロックファイルの保存先を作成できません: {exc}") from exc
+    key = os.path.realpath(lock_path)
+    held = _held_locks()
+    counts = held.get(key)
+    idx = 0 if exclusive else 1
+    # 同一スレッド内のネストしたロック取得による flock 自己デッドロックを防ぐ。
+    # blocking=False は常に新しい flock(LOCK_NB) を試して競合検出を維持する。
+    if blocking and counts is not None:
+        if counts[0] > 0 or (not exclusive and counts[1] > 0):
+            counts[idx] += 1
+            try:
+                yield lock_path
+            finally:
+                counts[idx] -= 1
+                if counts[0] == 0 and counts[1] == 0:
+                    held.pop(key, None)
+            return
+        if exclusive and counts[1] > 0:
+            raise ScheduleError("共有ロック中に排他ロックを取得できません。")
+    fd = _open_lock_fd(lock_path)
+    try:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(fd, mode | (0 if blocking else fcntl.LOCK_NB))
+        if key not in held:
+            held[key] = [0, 0]
+        held[key][idx] += 1
+        try:
+            yield lock_path
+        finally:
+            counts_now = held.get(key)
+            if counts_now is not None:
+                counts_now[idx] -= 1
+                if counts_now[0] == 0 and counts_now[1] == 0:
+                    held.pop(key, None)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def schedule_digest(path: Path) -> str | None:
+    """schedule.json のSHA-256ハッシュを返す。ファイルがない場合は None。"""
+    if path.is_symlink():
+        raise ScheduleError("schedule.json がシンボリックリンクのため処理できません。")
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
