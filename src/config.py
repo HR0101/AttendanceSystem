@@ -18,7 +18,17 @@ class ConfigurationError(Exception):
 _LOCK_STATE = threading.local()
 
 
-def _held_locks() -> dict[str, int]:
+class _HeldLock:
+    __slots__ = ("fd", "count", "exclusive", "extra_shared")
+
+    def __init__(self, fd: int, exclusive: bool) -> None:
+        self.fd = fd
+        self.count = 1
+        self.exclusive = exclusive
+        self.extra_shared = 0
+
+
+def _held_locks() -> dict[str, _HeldLock]:
     held = getattr(_LOCK_STATE, "held", None)
     if held is None:
         held = {}
@@ -64,8 +74,8 @@ def read_private_text(path: Path, error_cls: type[Exception], label: str) -> str
 
 
 @contextlib.contextmanager
-def private_file_lock(path: Path):
-    """設定・予定ファイルの read-modify-write 全体を保護する排他ロック。"""
+def private_file_lock(path: Path, *, exclusive: bool = True, blocking: bool = True):
+    """設定・予定ファイル用のアドバイザリロック（既定は排他・ブロッキング）。"""
     if not isinstance(path, (str, os.PathLike)):
         yield
         return
@@ -76,27 +86,39 @@ def private_file_lock(path: Path):
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     key = os.path.realpath(lock_path)
     held = _held_locks()
-    # 同一スレッド内のネストしたロック取得による flock 自己デッドロックを防ぐ。
-    if held.get(key, 0) > 0:
-        held[key] += 1
+    entry = held.get(key)
+    # 同一スレッド内の blocking=True なネスト取得は、同一 fd を再利用し自己デッドロックを防ぐ。
+    # blocking=False の場合は別 fd で flock(..., LOCK_NB) を試み、競合時は BlockingIOError を送出する。
+    if entry is not None and blocking:
+        if exclusive and not entry.exclusive:
+            if entry.extra_shared:
+                raise OSError("非ブロッキング共有ロック保持中は排他ロックへ昇格できません。")
+            fcntl.flock(entry.fd, fcntl.LOCK_EX)
+            entry.exclusive = True
+        entry.count += 1
         try:
             yield lock_path
         finally:
-            held[key] -= 1
-            if held[key] == 0:
-                del held[key]
+            entry.count -= 1
         return
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{lock_path.name} は通常のファイルにしてください。")
         tighten_fd_mode(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        held[key] = 1
+        flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(fd, flags)
+        if entry is None:
+            held[key] = _HeldLock(fd, exclusive)
+        else:
+            entry.extra_shared += 1
         try:
             yield lock_path
         finally:
-            held.pop(key, None)
+            if entry is None:
+                held.pop(key, None)
+            else:
+                entry.extra_shared -= 1
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)

@@ -1,4 +1,6 @@
+import fcntl
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
+from src.config import private_file_lock
 from src.scheduler import (
     ScheduleError, calendar_intervals, due_course, load_schedule,
     registration_time, save_schedule, schedule_data, update_schedule, validate_schedule,
@@ -200,6 +203,92 @@ class SchedulerTests(unittest.TestCase):
                     {c["weekday"] for c in load_schedule(path)["courses"]},
                     {"mon", *days, "sat", "sun"},
                 )
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+
+    def test_schedule_lock_file_conflicts_with_flock_and_allows_reentrant_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            lock_path = base / "schedule.json.lock"
+            save_schedule(path, schedule_data(SCHEDULE))
+
+            # 独立した flock 呼び出しが schedule.json.lock 上で非ブロッキング取得と競合することを確認する。
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                with private_file_lock(path, exclusive=False, blocking=False):
+                    pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+            # 同一スレッド内の再入（update_schedule -> save_schedule）は成功し、blocking=False は拒否される。
+            def add_course(day: str):
+                def mutator(current):
+                    current["courses"].append({
+                        "weekday": day, "start_time": "10:00", "room": "642",
+                        "course_name": f"授業-{day}", "enabled": True,
+                    })
+                    return current
+                return mutator
+
+            with private_file_lock(path):
+                update_schedule(path, add_course("tue"))
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+
+            # 共有ロックから update_schedule（排他ロック昇格）へのネストもデッドロックせず完了する。
+            with private_file_lock(path, exclusive=False):
+                self.assertEqual(len(load_schedule(path)["courses"]), 2)
+                update_schedule(path, add_course("wed"))
+            self.assertEqual({c["weekday"] for c in load_schedule(path)["courses"]}, {"mon", "tue", "wed"})
+
+            # 別プロセスが schedule.json.lock を保持している間、blocking=False は BlockingIOError を送出する。
+            script = "\n".join([
+                "import sys",
+                "from pathlib import Path",
+                "from src.config import private_file_lock",
+                "with private_file_lock(Path(sys.argv[1]), exclusive=True):",
+                "    print('LOCKED', flush=True)",
+                "    sys.stdin.read()",
+            ])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script, str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                if line != "LOCKED":
+                    self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
             finally:
                 for stream in (proc.stdin, proc.stdout, proc.stderr):
                     if stream and not stream.closed:

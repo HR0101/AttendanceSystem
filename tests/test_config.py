@@ -1,6 +1,8 @@
 """設定 URL、パーミッション検証、ファイルロック、ログ設定の保護を確認する。"""
 
+import fcntl
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -145,6 +147,145 @@ class ConfigTests(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                 proc.wait(timeout=5)
+
+    def test_private_file_lock_nonblocking_and_reentrant_upgrade_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.json"
+
+            def probe_on_worker(*, exclusive: bool) -> bool:
+                result = []
+
+                def run():
+                    try:
+                        with private_file_lock(target, exclusive=exclusive, blocking=False):
+                            result.append(True)
+                    except BlockingIOError:
+                        result.append(False)
+
+                t = threading.Thread(target=run)
+                t.start()
+                t.join(timeout=5)
+                self.assertEqual(len(result), 1)
+                return result[0]
+
+            with private_file_lock(target, exclusive=True):
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=False, blocking=False):
+                        pass
+                self.assertFalse(probe_on_worker(exclusive=True))
+                self.assertFalse(probe_on_worker(exclusive=False))
+                # 同一スレッドの blocking=True な共有ロック要求は再入し、排他ロックを維持する。
+                with private_file_lock(target, exclusive=False):
+                    self.assertFalse(probe_on_worker(exclusive=False))
+                self.assertFalse(probe_on_worker(exclusive=False))
+            self.assertTrue(probe_on_worker(exclusive=True))
+
+            with private_file_lock(target, exclusive=False):
+                self.assertTrue(probe_on_worker(exclusive=False))
+                self.assertFalse(probe_on_worker(exclusive=True))
+                with private_file_lock(target, exclusive=False):
+                    self.assertTrue(probe_on_worker(exclusive=False))
+                with private_file_lock(target, exclusive=False, blocking=False):
+                    self.assertTrue(probe_on_worker(exclusive=False))
+                    with self.assertRaises(OSError):
+                        with private_file_lock(target, exclusive=True):
+                            pass
+                self.assertFalse(probe_on_worker(exclusive=True))
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=True, blocking=False):
+                        pass
+                # 同一スレッドで共有ロックから排他ロックへ昇格できる。
+                with private_file_lock(target, exclusive=True):
+                    self.assertFalse(probe_on_worker(exclusive=False))
+                    self.assertFalse(probe_on_worker(exclusive=True))
+                self.assertFalse(probe_on_worker(exclusive=False))
+            self.assertTrue(probe_on_worker(exclusive=True))
+
+    def test_private_file_lock_shared_and_exclusive_with_flock_and_subprocesses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            target = base / "config.json"
+            lock_path = target.with_name("config.json.lock")
+
+            # 複数スレッドで同時に共有ロックを保持できることを確認する。
+            barrier = threading.Barrier(2, timeout=5)
+            errors = []
+
+            def shared_reader():
+                try:
+                    with private_file_lock(target, exclusive=False, blocking=False):
+                        barrier.wait()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            readers = [threading.Thread(target=shared_reader) for _ in range(2)]
+            for r in readers:
+                r.start()
+            for r in readers:
+                r.join(timeout=5)
+            self.assertEqual(errors, [])
+
+            # 独立した flock(LOCK_EX / LOCK_SH) 呼び出しとの競合・共存を確認する。
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=False, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                with private_file_lock(target, exclusive=False, blocking=False):
+                    pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(target, exclusive=True, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+            # 別プロセスが排他または共有ロックを保持する間の blocking=False 挙動を確認する。
+            for child_exclusive in (True, False):
+                script = "\n".join([
+                    "import sys",
+                    "from pathlib import Path",
+                    "from src.config import private_file_lock",
+                    f"with private_file_lock(Path(sys.argv[1]), exclusive={child_exclusive!r}):",
+                    "    print('LOCKED', flush=True)",
+                    "    sys.stdin.read()",
+                ])
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", script, str(target)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                )
+                try:
+                    line = proc.stdout.readline().strip()
+                    if line != "LOCKED":
+                        self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+                    with self.assertRaises(BlockingIOError):
+                        with private_file_lock(target, exclusive=True, blocking=False):
+                            pass
+                    if child_exclusive:
+                        with self.assertRaises(BlockingIOError):
+                            with private_file_lock(target, exclusive=False, blocking=False):
+                                pass
+                    else:
+                        with private_file_lock(target, exclusive=False, blocking=False):
+                            pass
+                    proc.stdin.close()
+                    self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+                finally:
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream and not stream.closed:
+                            stream.close()
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=5)
 
     def test_setup_logging_tightens_permissions_and_rejects_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
