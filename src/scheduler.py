@@ -14,6 +14,7 @@ from .room import RoomError, parse_room
 
 LABEL = "local.attendance.tool"
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+WEEKDAY_LABELS = "月火水木金土日"
 WEEK_MINUTES = 7 * 24 * 60
 START_DELAY_MINUTES = 5
 LAST_ALLOWED_MINUTE = 30
@@ -84,6 +85,7 @@ def validate_schedule(raw: dict) -> dict:
         if enabled:
             occupied.add(key)
         courses.append({"weekday": weekday, "start_time": start_time, "course_name": course_name.strip(), "room": room, "route": route, "enabled": enabled, "register_time": register_time, "register_until": register_until})
+    _check_registration_conflicts(courses)
     return {"active_from": active_from, "active_until": active_until, "blackout_dates": blackout_dates, "courses": courses}
 
 
@@ -139,10 +141,69 @@ def registration_time(course: dict, course_date: date | None = None) -> str:
     return f"{minute_of_day // 60:02}:{minute_of_day % 60:02}"
 
 
+def _uses_exact_timing(courses: list[dict]) -> bool:
+    """範囲指定を含む有効な授業があるときは遅延許容を行わない。"""
+    return any(c.get("enabled", True) and c.get("register_until") for c in courses)
+
+
+def _registration_window(course: dict, exact: bool) -> tuple[int, int]:
+    """有効な授業が自動登録の対象になる週内分範囲 [start, end] を返す。"""
+    run_minute = _registration_week_minute(course)
+    if not exact:
+        return run_minute, run_minute + (LAST_ALLOWED_MINUTE - START_DELAY_MINUTES)
+    if course.get("register_until"):
+        hour, minute = map(int, course["register_until"].split(":"))
+        return run_minute, WEEKDAYS[course["weekday"]] * 1440 + hour * 60 + minute
+    return run_minute, run_minute
+
+
+def _split_week_window(start: int, end: int) -> list[tuple[int, int]]:
+    """週またぎを含む登録ウィンドウを [0, WEEK_MINUTES - 1] の区間列へ分割する。"""
+    start_mod = start % WEEK_MINUTES
+    end_mod = end % WEEK_MINUTES
+    if start_mod <= end_mod:
+        return [(start_mod, end_mod)]
+    return [(start_mod, WEEK_MINUTES - 1), (0, end_mod)]
+
+
+def _format_week_minute(week_minute: int) -> tuple[int, str]:
+    day, minute_of_day = divmod(week_minute % WEEK_MINUTES, 1440)
+    return day, f"{minute_of_day // 60:02}:{minute_of_day % 60:02}"
+
+
+def _window_description(course: dict, start: int, end: int) -> str:
+    start_day, start_hhmm = _format_week_minute(start)
+    end_day, end_hhmm = _format_week_minute(end)
+    if start % WEEK_MINUTES == end % WEEK_MINUTES:
+        span = f"{WEEKDAY_LABELS[start_day]} {start_hhmm}"
+    elif start_day == end_day:
+        span = f"{WEEKDAY_LABELS[start_day]} {start_hhmm}～{end_hhmm}"
+    else:
+        span = f"{WEEKDAY_LABELS[start_day]} {start_hhmm}～{WEEKDAY_LABELS[end_day]} {end_hhmm}"
+    return f"{course['course_name']} ({span})"
+
+
+def _check_registration_conflicts(courses: list[dict]) -> None:
+    """有効な授業間で due_course() の受付ウィンドウが重ならないかを検証する。"""
+    exact = _uses_exact_timing(courses)
+    segments = []
+    for index, course in enumerate(courses):
+        if not course.get("enabled", True):
+            continue
+        start, end = _registration_window(course, exact)
+        label = _window_description(course, start, end)
+        for seg_start, seg_end in _split_week_window(start, end):
+            segments.append((seg_start, seg_end, index, label))
+    segments.sort()
+    for prev, curr in zip(segments, segments[1:]):
+        if curr[0] <= prev[1]:
+            raise ScheduleError(f"受付時間が重なります: {prev[3]} と {curr[3]}")
+
+
 def due_course(schedule: dict, now: datetime) -> dict | None:
     now_minute = now.weekday() * 1440 + now.hour * 60 + now.minute
     # 範囲内の各分に起動する場合、同じ授業を繰り返し処理しない。
-    exact = any(c.get("enabled", True) and c.get("register_until") for c in schedule["courses"])
+    exact = _uses_exact_timing(schedule["courses"])
     matches = []
     for course in schedule["courses"]:
         run_minute = _registration_week_minute(course, now.date())
@@ -165,13 +226,9 @@ def calendar_intervals(courses: list[dict]) -> list[dict]:
     for course in courses:
         if not course.get("enabled", True):
             continue
-        run_minute = _registration_week_minute(course) % WEEK_MINUTES
-        end_minute = run_minute
-        if course.get("register_until"):
-            hour, minute = map(int, course["register_until"].split(":"))
-            end_minute = WEEKDAYS[course["weekday"]] * 1440 + hour * 60 + minute
+        run_minute, end_minute = _registration_window(course, exact=True)
         for candidate in range(run_minute, end_minute + 1):
-            weekday, minute_of_day = divmod(candidate, 1440)
+            weekday, minute_of_day = divmod(candidate % WEEK_MINUTES, 1440)
             hour, minute = divmod(minute_of_day, 60)
             key = ((weekday + 1) % 7, hour, minute)
             if key not in seen:

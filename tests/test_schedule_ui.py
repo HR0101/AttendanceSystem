@@ -157,6 +157,82 @@ class SchedulePanelTests(unittest.TestCase):
             self.panel.handle("\x1b")
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_conflicting_add_and_edit_keep_form_and_file_intact(self):
+        original = self.path.read_bytes()
+        # DATA の既存授業は 月 14:00 (既定 14:05～14:30)
+        self.panel.form("add")
+        self.panel.fields = ["競合授業", "月曜日", "14:15", "642", "14:20", ""]
+        self.panel.submit()
+        self.assertEqual(self.panel.mode, "add")
+        self.assertEqual(self.panel.fields[0], "競合授業")
+        self.assertIn("授業", self.panel.message)
+        self.assertIn("競合授業", self.panel.message)
+        self.assertIn("14:05", self.panel.message)
+        self.assertIn("14:20", self.panel.message)
+        self.assertFalse(self.ui.busy)
+        self.assertEqual(self.path.read_bytes(), original)
+
+        screen = Mock(getmaxyx=Mock(return_value=(24, 62)))
+        self.ui.draw(screen)
+        drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("受付時間が重なります", drawn)
+
+        # 2件目を追加してから 1件目と衝突する時刻へ編集すると拒否される。
+        two_courses = {
+            **DATA,
+            "courses": [
+                DATA["courses"][0],
+                {"weekday": "mon", "start_time": "16:00", "room": "642", "course_name": "午後授業", "enabled": True},
+            ],
+        }
+        save_schedule(self.path, two_courses)
+        self.panel.data = copy.deepcopy(two_courses)
+        self.panel.mode = "list"
+        self.panel.index = 1
+        before_edit = self.path.read_bytes()
+        self.panel.form("edit")
+        self.panel.fields[4] = "14:30"
+        self.panel.submit()
+        self.assertEqual(self.panel.mode, "edit")
+        self.assertEqual(self.panel.fields[4], "14:30")
+        self.assertIn("午後授業", self.panel.message)
+        self.assertEqual(self.path.read_bytes(), before_edit)
+
+    def test_toggling_disabled_conflicting_course_or_disabling_range_is_rejected(self):
+        disabled_conflict = {
+            **DATA,
+            "courses": [
+                DATA["courses"][0],
+                {"weekday": "mon", "start_time": "14:15", "room": "642", "course_name": "無効競合", "enabled": False, "register_time": "14:20", "register_until": ""},
+            ],
+        }
+        save_schedule(self.path, disabled_conflict)
+        self.panel.data = copy.deepcopy(disabled_conflict)
+        self.panel.index = 1
+        before = self.path.read_bytes()
+        self.panel.handle("t")
+        self.assertFalse(self.panel.data["courses"][1]["enabled"])
+        self.assertIn("無効競合", self.panel.message)
+        self.assertEqual(self.path.read_bytes(), before)
+
+        # exact モードを支える範囲授業を無効化すると固定授業同士が衝突するため拒否される。
+        exact_schedule = {
+            **DATA,
+            "courses": [
+                DATA["courses"][0],
+                {"weekday": "mon", "start_time": "14:15", "room": "642", "course_name": "近接固定", "enabled": True, "register_time": "14:20", "register_until": ""},
+                {"weekday": "tue", "start_time": "10:00", "room": "642", "course_name": "火曜範囲", "enabled": True, "register_time": "10:05", "register_until": "10:15"},
+            ],
+        }
+        save_schedule(self.path, exact_schedule)
+        self.panel.data = copy.deepcopy(exact_schedule)
+        self.panel.index = 2
+        before_exact = self.path.read_bytes()
+        self.panel.handle("t")
+        self.assertTrue(self.panel.data["courses"][2]["enabled"])
+        self.assertIn("近接固定", self.panel.message)
+        self.assertEqual(self.path.read_bytes(), before_exact)
+
 
 if __name__ == "__main__":
     unittest.main()
