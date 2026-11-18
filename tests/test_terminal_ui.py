@@ -3,6 +3,8 @@
 import curses
 import io
 import logging
+
+import tempfile
 import unittest
 from pathlib import Path
 from contextlib import nullcontext, redirect_stderr
@@ -519,6 +521,177 @@ class TerminalUITests(unittest.TestCase):
         for editor in submit_pw_editors:
             self.assertEqual(editor.text, "")
             self.assertEqual(editor.position, 0)
+
+    def _drawn_text(self, ui, height=24, width=80):
+        screen = Mock(getmaxyx=Mock(return_value=(height, width)))
+        ui.draw(screen)
+        return "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+
+    def test_log_viewer_opens_via_L_switches_tabs_scrolls_and_closes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "logs").mkdir()
+            (base / ".updates").mkdir()
+            (base / "logs" / "attendance-2026-11-18.log").write_text("older-day-line\n", encoding="utf-8")
+            lines = [f"2026-11-19 10:00:{i:02d} INFO line-{i:02d}" for i in range(1, 36)]
+            lines[-1] = "2026-11-19 10:00:35 ERROR 失敗 line-35"
+            (base / "logs" / "attendance-2026-11-19.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            (base / "logs" / "launchagent.log").write_text("launchd-entry-ok\n", encoding="utf-8")
+            (base / ".updates" / "updater.log").write_text("updater-warning-entry\n", encoding="utf-8")
+
+            ui = self.demo_screen()
+            ui.demo = False
+            ui.base = base
+            screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+            screen.get_wch.side_effect = ["l", "\x1b", "L", "q", "Q"]
+            with patch("src.terminal_ui.curses.has_colors", return_value=False):
+                self.assertEqual(ui.run(screen), 0)
+            # "l" opens logs, "\x1b" closes logs, "L" opens logs, "q" closes logs, "Q" exits UI
+            self.assertIsNone(ui.modal)
+
+            ui.open_logs()
+            shown = self._drawn_text(ui)
+            self.assertIn("attendance-2026-11-19.log", shown)
+            self.assertNotIn("older-day-line", shown)
+            self.assertIn("line-35", shown)
+            self.assertNotIn("line-01", shown)
+
+            # Scroll up by page and line to reach line-01, then back down to tail
+            ui.handle_modal(curses.KEY_PPAGE)
+            ui.handle_modal(curses.KEY_PPAGE)
+            ui.handle_modal(curses.KEY_UP)
+            scrolled = self._drawn_text(ui)
+            self.assertIn("line-01", scrolled)
+            self.assertNotIn("line-35", scrolled)
+
+            ui.handle_modal(curses.KEY_NPAGE)
+            ui.handle_modal(curses.KEY_DOWN)
+            ui.handle_modal(curses.KEY_HOME)
+            self.assertIn("line-01", self._drawn_text(ui))
+            ui.handle_modal(curses.KEY_END)
+            self.assertIn("line-35", self._drawn_text(ui))
+
+            # Switch tabs via Tab/Right/Left/BTab/1/2/3
+            ui.handle_modal("\t")
+            self.assertIn("launchd-entry-ok", self._drawn_text(ui))
+            ui.handle_modal(curses.KEY_RIGHT)
+            self.assertIn("updater-warning-entry", self._drawn_text(ui))
+            ui.handle_modal(curses.KEY_BTAB)
+            self.assertIn("launchd-entry-ok", self._drawn_text(ui))
+            ui.handle_modal(curses.KEY_LEFT)
+            self.assertIn("line-35", self._drawn_text(ui))
+
+            # Reload picks up appended lines
+            with (base / "logs" / "attendance-2026-11-19.log").open("a", encoding="utf-8") as stream:
+                stream.write("2026-11-19 10:00:36 INFO line-36\n")
+            ui.handle_modal("r")
+            self.assertIn("line-36", self._drawn_text(ui))
+
+            # Esc and Q both close log viewer
+            ui.handle_modal("\x1b")
+            self.assertIsNone(ui.modal)
+            ui.open_logs()
+            ui.handle_modal("Q")
+            self.assertIsNone(ui.modal)
+
+    def test_log_viewer_handles_missing_empty_symlink_and_large_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ui = self.demo_screen()
+            ui.demo = False
+            ui.base = base
+
+            # Missing logs/ and .updates/
+            ui.open_logs()
+            self.assertIn("まだありません", self._drawn_text(ui))
+            ui.handle_modal("2")
+            self.assertIn("まだありません", self._drawn_text(ui))
+            ui.handle_modal("3")
+            self.assertIn("まだありません", self._drawn_text(ui))
+
+            # Empty and invalid-UTF8 / large tail
+            (base / "logs").mkdir()
+            (base / ".updates").mkdir()
+            (base / "logs" / "attendance-2026-11-19.log").write_text("\n", encoding="utf-8")
+            ui.handle_modal("1")
+            self.assertIn("記録はまだありません", self._drawn_text(ui))
+
+            # Symlinked updater.log is ignored safely
+            secret = base / "secret.txt"
+            secret.write_text("DO_NOT_READ_SYMLINK\n", encoding="utf-8")
+            (base / ".updates" / "updater.log").symlink_to(secret)
+            ui.handle_modal("3")
+            shown = self._drawn_text(ui)
+            self.assertNotIn("DO_NOT_READ_SYMLINK", shown)
+            self.assertIn("まだありません", shown)
+
+            # Large log file reads tail cleanly (drops truncated first line)
+            big = base / "logs" / "attendance-2026-11-20.log"
+            early_block = ("EARLY_HEAD_LINE_" + "X" * 90 + "\n") * 50
+            middle_block = ("MIDDLE_LINE_" + "X" * 90 + "\n") * 700
+            recent_block = ("RECENT_LINE\n") * 20
+            big.write_bytes(early_block.encode("utf-8") + middle_block.encode("utf-8") + recent_block.encode("utf-8") + b"\xff\xfeTAIL_OK\n")
+            ui.handle_modal("1")
+            shown = self._drawn_text(ui)
+            self.assertIn("TAIL_OK", shown)
+            self.assertIn("RECENT_LINE", shown)
+            self.assertNotIn("EARLY_HEAD_LINE_", "\n".join(ui.log_lines))
+
+            # Unreadable log file shows friendly error message
+            with patch("src.terminal_ui._read_log_tail", side_effect=PermissionError("denied")):
+                ui.handle_modal("r")
+                self.assertIn("読み込めませんでした", self._drawn_text(ui))
+
+    def test_log_viewer_and_shortcuts_draw_cleanly_at_supported_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "logs").mkdir()
+            (base / "logs" / "attendance-2026-11-19.log").write_text("2026-11-19 10:05:00 INFO 出席確認テスト\n", encoding="utf-8")
+            ui = self.demo_screen()
+            ui.demo = False
+            ui.base = base
+
+            for width in (62, 80, 120):
+                ui.modal = None
+                main_drawn = self._drawn_text(ui, width=width)
+                self.assertIn("L: ログ", main_drawn)
+                self.assertIn("L", main_drawn)
+
+                ui.modal = "help"
+                help_drawn = self._drawn_text(ui, width=width)
+                self.assertIn("L: ログ", help_drawn)
+
+                ui.open_logs()
+                log_drawn = self._drawn_text(ui, width=width)
+                self.assertIn("ログ確認", log_drawn)
+                self.assertIn("1:実行ログ", log_drawn)
+                self.assertIn("Esc/Q:戻る", log_drawn)
+                self.assertIn("出席確認テスト", log_drawn)
+
+    def test_demo_log_viewer_never_reads_disk_logs_and_none_base_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "logs").mkdir()
+            (base / ".updates").mkdir()
+            (base / "logs" / "attendance-2026-11-19.log").write_text("SECRET-DISK-LOG\n", encoding="utf-8")
+            (base / "logs" / "launchagent.log").write_text("SECRET-AGENT-LOG\n", encoding="utf-8")
+            (base / ".updates" / "updater.log").write_text("SECRET-UPDATER-LOG\n", encoding="utf-8")
+
+            ui = self.demo_screen()
+            ui.base = base
+            ui.open_logs()
+            for tab in ("1", "2", "3"):
+                ui.handle_modal(tab)
+                shown = self._drawn_text(ui)
+                self.assertIn("デモ", shown)
+                self.assertNotIn("SECRET-DISK-LOG", shown)
+                self.assertNotIn("SECRET-AGENT-LOG", shown)
+                self.assertNotIn("SECRET-UPDATER-LOG", shown)
+
+            ui.demo = False
+            ui.base = None
+            ui.open_logs()
+            self.assertIn("設定フォルダを確認できないため", self._drawn_text(ui))
 
 
 if __name__ == "__main__":
