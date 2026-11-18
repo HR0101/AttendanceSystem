@@ -1,9 +1,13 @@
 """標準ライブラリだけで動く出席確認画面。"""
 
+import contextlib
 import curses
+import inspect
+import io
 import os
 import queue
 import sys
+import termios
 import threading
 import time
 import unicodedata
@@ -159,6 +163,34 @@ def _load_log_tab(base: Path | None, demo: bool, tab_index: int) -> tuple[str, l
     return source, lines, ""
 
 
+@contextlib.contextmanager
+def _disable_xon_flow_control():
+    """端末のソフトウェアフロー制御 (IXON) を一時解除し、Ctrl+S を画面へ渡す。"""
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+    except (AttributeError, io.UnsupportedOperation, ValueError, OSError, termios.error):
+        yield
+        return
+    if not (old_attrs[0] & termios.IXON):
+        yield
+        return
+    new_attrs = list(old_attrs)
+    new_attrs[0] &= ~termios.IXON
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+    except (OSError, termios.error):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+        except (OSError, termios.error):
+            pass
+
+
 class AttendanceScreen:
     def __init__(self, config, student_id, password, logger, room="", demo=False, base=None, *, restore_selection=True, password_ttl=PASSWORD_TTL_SECONDS):
         self.password_ttl = password_ttl
@@ -178,7 +210,8 @@ class AttendanceScreen:
         self.update_version = manifest["version"] if manifest and available_message(manifest) else None
         self.update_check_after = time.monotonic() + 1
         self.history = deque(maxlen=8)
-        self.checked = self.failed = False
+        self.checked = self.failed = self.cancelled = False
+        self.cancel_event = None
         self.modal = None
         self.user_index = 0
         self.selected_user_ids = ui_selection(config, student_id) if restore_selection else {student_id}
@@ -263,9 +296,30 @@ class AttendanceScreen:
     def clear_target(self):
         self.values = {}
         self.user_results = {}
-        self.attended = self.unenrolled = self.checked = self.failed = self.confirm = False
+        self.attended = self.unenrolled = self.checked = self.failed = self.cancelled = self.confirm = False
         self.confirm_scroll = 0
         self.updated = "未確認"
+
+    def request_cancel(self):
+        """出席確認・登録などのネットワーク処理を安全な境界で中断する。"""
+        if not self.busy or self.cancel_event is None or self.cancel_event.is_set():
+            return False
+        self.cancel_event.set()
+        self.message = "中断しています…"
+        return True
+
+    @staticmethod
+    def _run_attendance(fn, *args, cancel_event=None, **kwargs):
+        # 古いテスト用モック（side_effect 関数を含む）が cancel_event を受け取らない場合だけ省略する。
+        side = getattr(fn, "side_effect", None)
+        target = side if callable(side) and not (isinstance(side, type) and issubclass(side, BaseException)) else fn
+        try:
+            parameters = inspect.signature(target).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        if any(p.name == "cancel_event" or p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters):
+            kwargs["cancel_event"] = cancel_event
+        return fn(*args, **kwargs)
 
     def selected_users(self):
         users = get_users(self.config)
@@ -282,19 +336,29 @@ class AttendanceScreen:
 
     def status(self):
         if self.busy:
-            return "|/-\\"[int(time.monotonic() * 8) % 4] + " 処理中", 1, "完了までお待ちください"
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                return "中断しています…", 3, "安全に停止できる位置で終了します"
+            detail = "Esc/Qで中断できます" if self.cancel_event is not None else "完了までお待ちください"
+            return "|/-\\"[int(time.monotonic() * 8) % 4] + " 処理中", 1, detail
         if len(self.selected_user_ids) > 1 and self.checked:
             total = len(self.selected_user_ids)
             attended = sum(result.get("attended", False) for result in self.user_results.values())
+            cancelled = sum(result.get("cancelled", False) for result in self.user_results.values())
             errors = sum(result.get("failed", False) for result in self.user_results.values())
             ready = len(self.registration_targets())
             if attended == total:
                 return f"全員出席済み（{total}人）", 2, "Uでユーザーごとの結果を確認できます"
+            if self.cancelled and cancelled:
+                title = f"処理を中断しました（登録可能 {ready}人 / 選択 {total}人）" if ready else "処理を中断しました"
+                detail = f"出席済み {attended}人 / 中断 {cancelled}人 / エラー {errors}人"
+                return title, 3, detail
             title = f"登録可能 {ready}人 / 選択 {total}人" if ready else "ユーザーごとの結果を確認してください"
             detail = f"出席済み {attended}人 / 対象外 {total - attended - ready - errors}人 / エラー {errors}人"
             if self.config.get("dry_run"):
                 detail = "確認のみモードです。Uで個別の結果を確認できます"
             return title, 3 if errors else 4, detail
+        if self.cancelled:
+            return "処理を中断しました", 3, "R で再確認できます"
         if self.failed:
             return "確認できませんでした", 3, "R で再試行できます"
         if self.unenrolled:
@@ -327,28 +391,39 @@ class AttendanceScreen:
                     if len(self.selected_user_ids) > 1 else self.values) for user in targets} if register else {}
         if not register:
             self.clear_target()
+        cancel_event = threading.Event()
+        self.cancel_event = cancel_event
         self.busy, self.confirm, self.confirm_scroll = True, False, 0
-        self.failed = False
+        self.failed = self.cancelled = False
         self.message = f"{len(targets)}人の出席登録中…" if register else f"{len(targets)}人の授業情報を取得中…"
         # 古い授業情報は、新しい取得に成功するまで登録に利用しない。
         self.values = {}
         self.selected = 1
         for user in targets:
             self.user_results[user["student_id"]] = {"values": {}, "attended": False, "unenrolled": False,
-                                                    "failed": False, "result": "処理中…"}
+                                                    "failed": False, "cancelled": False, "result": "処理中…"}
 
         def work_user(index, user):
+            from .attendance import AttendanceCancelled
             student_id = user["student_id"]
             values_expected = expected.get(student_id, {})
             # 複数人並列処理時は PII を含まない番号でスレッドごとのログを追跡可能にする。
             worker_logger = _WorkerLogger(self.logger, f"対象={index}/{len(targets)}") if len(targets) > 1 else self.logger
 
             password = ""
+            if cancel_event.is_set():
+                worker_logger.info("画面操作中断")
+                self.events.put(("user_cancelled", (student_id, "中断しました")))
+                return
             try:
                 if self.demo:
+                    if cancel_event.is_set():
+                        raise AttendanceCancelled("ユーザー操作により中断しました。")
                     if self.demo_state == "error":
                         raise AttendanceError("デモの通信エラーです。Rで再確認できます。")
                     if register:
+                        if cancel_event.is_set():
+                            raise AttendanceCancelled("ユーザー操作により中断しました。")
                         self.demo_attended.add((student_id, room))
                     attended = self.demo_state == "attended" or (student_id, room) in self.demo_attended
                     unenrolled = self.demo_state == "unenrolled"
@@ -364,16 +439,25 @@ class AttendanceScreen:
                         if self.base is None:
                             raise CredentialError("設定ファイルの場所を確認できません。")
                         _, password = get_credentials(config, self.base / "config.json", interactive=False, username=user["username"])
+                    if cancel_event.is_set():
+                        raise AttendanceCancelled("ユーザー操作により中断しました。")
                     with open_page(config) as page:
-                        result = run_attendance(
+                        if cancel_event.is_set():
+                            raise AttendanceCancelled("ユーザー操作により中断しました。")
+                        result = self._run_attendance(
+                            run_attendance,
                             page, config, student_id, password, room, route, worker_logger,
                             values_expected.get("授業名"), values_expected.get("開始時刻"),
                             on_snapshot=lambda values, attended, unenrolled: self.events.put(
                                 ("user_snapshot", (student_id, values, attended, unenrolled))),
                             expected_values=values_expected if register else None,
+                            cancel_event=cancel_event,
                         )
                 worker_logger.info("画面操作 結果=%s", result)
                 self.events.put(("user_result", (student_id, result)))
+            except AttendanceCancelled:
+                self.logger.info("画面操作中断")
+                self.events.put(("user_cancelled", (student_id, "中断しました")))
             except (ConfigurationError, CredentialError, AttendanceError, RoomError) as exc:
                 worker_logger.error("画面操作停止 種別=%s 理由=%s", type(exc).__name__, exc)
                 self.events.put(("user_error", (student_id, str(exc))))
@@ -407,13 +491,19 @@ class AttendanceScreen:
             if result["values"] and result["values"] != self.values:
                 result.update(values={}, failed=True, attended=False, unenrolled=False,
                               result="授業情報が他のユーザーと異なります。Rで再確認してください。")
-        self.attended = all(result["attended"] for result in results)
-        self.unenrolled = all(result["unenrolled"] for result in results)
+        cancelled_any = any(result.get("cancelled", False) for result in results)
+        self.cancel_event = None
+        self.attended = bool(results) and all(result["attended"] for result in results)
+        self.unenrolled = bool(results) and all(result["unenrolled"] for result in results)
         self.failed = any(result["failed"] for result in results)
+        self.cancelled = cancelled_any
         self.checked, self.busy = True, False
         self.updated = datetime.now().strftime("%H:%M:%S")
         if len(users) == 1:
             self.message = results[0]["result"]
+        elif cancelled_any:
+            attended = sum(result["attended"] for result in results)
+            self.message = f"処理を中断しました（出席済み {attended}/{len(users)}人）。Uで個別結果を確認できます。"
         else:
             attended = sum(result["attended"] for result in results)
             self.message = f"{'一括登録' if register else '確認'}完了: 出席済み {attended}/{len(users)}人。Uで個別結果を確認できます。"
@@ -438,18 +528,20 @@ class AttendanceScreen:
             elif kind == "user_snapshot":
                 student_id, values, attended, unenrolled = data
                 self.user_results[student_id].update(values=dict(values), attended=attended, unenrolled=unenrolled)
-            elif kind in ("user_result", "user_error"):
+            elif kind in ("user_result", "user_error", "user_cancelled"):
                 student_id, result = data
                 state = self.user_results[student_id]
                 state["result"] = result
                 if kind == "user_error":
-                    state.update(values={}, failed=True, attended=False, unenrolled=False)
+                    state.update(values={}, failed=True, attended=False, unenrolled=False, cancelled=False)
+                elif kind == "user_cancelled":
+                    state.update(values={}, failed=False, attended=False, unenrolled=False, cancelled=True)
                 elif result in ("出席登録成功", "出席済み", "デモ: 出席済み"):
                     state["attended"] = True
                 elif result.startswith("履修登録なし"):
                     state["unenrolled"] = True
                 if len(self.selected_user_ids) > 1:
-                    name = next(user["username"] for user in self.selected_users() if user["student_id"] == student_id)
+                    name = next((user["username"] for user in self.selected_users() if user["student_id"] == student_id), student_id)
                     self.history.appendleft((datetime.now().strftime("%H:%M:%S"), self.room, f"{name}: {result}"))
             elif kind == "complete":
                 self.complete_attendance(data)
@@ -491,6 +583,7 @@ class AttendanceScreen:
                     self._wipe_form_data(draft[1], draft[2])
                     del draft
                 self.back_after_save = False
+                self.form_parent_users = False
                 self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": f"既定ユーザーとこの画面の出席対象を「{config['_active_username']}」に切り替えました。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
                 self.user_index = min(self.user_index, max(0, len(get_users(config)) - 1))
                 if action == "delete" and not get_users(config):
@@ -500,6 +593,7 @@ class AttendanceScreen:
                     self.start()
             elif kind == "account_error":
                 self.busy = False
+                self.back_after_save = False
                 if self.submitted_form is not None:
                     draft = self.submitted_form
                     (self.modal, self.form_values, self.form_editors, self.form_index, self.form_initial_values,
@@ -529,8 +623,8 @@ class AttendanceScreen:
         self.busy = True
         self.form_error = ""
         self.message = "ユーザー情報を処理中…"
-        self.submitted_form = ((self.modal, self.form_values, self.form_editors, self.form_index, self.form_initial_values,
-                                self.form_parent_users, set(self.pending_user_ids))
+        self.submitted_form = ((self.modal, list(self.form_values), list(self.form_editors), self.form_index,
+                                self.form_initial_values, self.form_parent_users, set(self.pending_user_ids))
                                if self.modal in ("add", "rename", "password", "student_id") and self.form_values else None)
         # 処理中は入力を表示せず、失敗時だけ編集へ戻す。
         self.form_values = []
@@ -628,7 +722,7 @@ class AttendanceScreen:
                 config["_active_username"] = next((u["username"] for u in get_users(config) if u["student_id"] == current_id), current_id)
                 self.events.put(("account", (config, current_id, current_password, action, selected)))
             except (ConfigurationError, CredentialError, OSError) as exc:
-                self.events.put(("account_error", str(exc)))
+                self.events.put(("account_error", str(exc) or "ユーザー情報を処理できません。"))
             except Exception:
                 self.events.put(("account_error", "ユーザー情報を処理できません。Keychain の状態を確認してください。"))
             finally:
@@ -773,6 +867,7 @@ class AttendanceScreen:
         self.form_values = []
         self.form_editors = []
         self.form_initial_values = ()
+        self.form_parent_users = False
         self.password_visible = False
         self.form_error = ""
         self.back_after_save = False
@@ -812,55 +907,57 @@ class AttendanceScreen:
         else:
             self.discard_modal()
 
-    def submit_account_form(self):
+    def _validated_account_submission(self):
         if self.modal == "add":
             name, student_id, password = self.form_values
-            try:
-                if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
-                    self.form_error = "名前・半角英数字の学生番号・パスワードを入力してください。"
-                    return
-                if any(u["username"] == name.strip() or u["student_id"] == student_id.strip() for u in get_users(self.config)):
-                    self.form_error = "その名前または学生番号は登録済みです。"
-                    return
-                self.account_action("add", name.strip(), student_id=student_id.strip(), password=password)
-            finally:
-                del password
-        elif self.modal == "password":
+            if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
+                self.form_error = "名前・半角英数字の学生番号・パスワードを入力してください。"
+                return None
+            if any(u["username"] == name.strip() or u["student_id"] == student_id.strip() for u in get_users(self.config)):
+                self.form_error = "その名前または学生番号は登録済みです。"
+                return None
+            return ("add", name.strip(), {"student_id": student_id.strip(), "password": password})
+        if self.modal == "password":
             password, confirmation = self.form_values
-            try:
-                if not password:
-                    self.form_error = "新しいパスワードを入力してください。"
-                    return
-                if password != confirmation:
-                    self.form_error = "確認用のパスワードが一致しません。"
-                    return
-                users = get_users(self.config)
-                self.account_action("password", users[self.user_index]["username"], password=password)
-            finally:
-                del password, confirmation
-        elif self.modal == "student_id":
+            if not password:
+                self.form_error = "新しいパスワードを入力してください。"
+                return None
+            if password != confirmation:
+                self.form_error = "確認用のパスワードが一致しません。"
+                return None
+            users = get_users(self.config)
+            return ("password", users[self.user_index]["username"], {"password": password})
+        if self.modal == "student_id":
             users = get_users(self.config)
             new_id = self.form_values[0].strip()
             if not new_id or not new_id.isascii() or not new_id.isalnum():
                 self.form_error = "学籍番号は半角英数字で入力してください。"
-                return
+                return None
             if new_id == users[self.user_index]["student_id"]:
                 self.form_error = "現在と異なる学籍番号を入力してください。"
-                return
+                return None
             if any(user["student_id"] == new_id for user in users):
                 self.form_error = "その学籍番号は登録済みです。"
-                return
-            self.account_action("student_id", users[self.user_index]["username"], student_id=new_id)
-        else:
-            users = get_users(self.config)
-            new_name = self.form_values[0].strip()
-            if not valid_username(new_name):
-                self.form_error = "新しいユーザーネームを1～60文字で入力してください。"
-                return
-            if any(u["username"] == new_name and u["student_id"] != users[self.user_index]["student_id"] for u in users):
-                self.form_error = "そのユーザーネームは登録済みです。"
-                return
-            self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0].strip())
+                return None
+            return ("student_id", users[self.user_index]["username"], {"student_id": new_id})
+        users = get_users(self.config)
+        new_name = self.form_values[0].strip()
+        if not valid_username(new_name):
+            self.form_error = "新しいユーザーネームを1～60文字で入力してください。"
+            return None
+        if any(u["username"] == new_name and u["student_id"] != users[self.user_index]["student_id"] for u in users):
+            self.form_error = "そのユーザーネームは登録済みです。"
+            return None
+        return ("rename", users[self.user_index]["username"], {"new_name": new_name})
+
+    def submit_account_form(self):
+        plan = self._validated_account_submission()
+        if plan is None:
+            # 入力検証に失敗したときは「保存して戻る」指定を次の直接Enterへ持ち越さない。
+            self.back_after_save = False
+            return
+        action, name, kwargs = plan
+        self.account_action(action, name, **kwargs)
 
     def handle_modal(self, key):
         if self.save_prompt.active:
@@ -952,12 +1049,12 @@ class AttendanceScreen:
                 if self.confirm_selection:
                     self.account_action("delete", get_users(self.config)[self.user_index]["username"])
                 else:
-                    self.modal = "users"
+                    self.discard_modal()
             return
         if self.modal in ("add", "rename", "password", "student_id"):
-            if key == curses.KEY_F2 and self.modal in ("add", "password"):
+            if key in (curses.KEY_F2, "\x14") and self.modal in ("add", "password"):
                 self.password_visible = not self.password_visible
-            elif enter and self.form_index == len(self.form_values) - 1:
+            elif key == "\x13" or (enter and self.form_index == len(self.form_values) - 1):
                 self.submit_account_form()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
                 self.form_index = (self.form_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.form_values)
@@ -974,7 +1071,10 @@ class AttendanceScreen:
         if height < 24 or width < 62:
             canvas.put(1, 1, "画面を広げてください（幅62 × 高さ24以上）。", curses.A_BOLD)
             canvas.put(3, 1, self.status()[0])
-            canvas.put(5, 1, "Q: 終了" if not self.busy else "処理中… 完了までお待ちください。")
+            busy_hint = ("中断しています…" if self.cancel_event is not None and self.cancel_event.is_set()
+                         else "処理中… Esc/Q: 中断" if self.cancel_event is not None
+                         else "処理中… 完了までお待ちください。")
+            canvas.put(5, 1, busy_hint if self.busy else "Q: 終了")
             if self.update_version:
                 canvas.put(7, 1, f"更新あり: v{self.update_version}", curses.A_BOLD)
                 canvas.put(8, 1, "内容: att update --notes")
@@ -1034,7 +1134,7 @@ class AttendanceScreen:
         canvas.button(19, left, "[ スケジュール登録 S ]", self.selected == 3, not self.busy)
         canvas.put(19, left + 30, "曜日・時刻・教室を設定", curses.A_DIM, main_width - 30)
         for index, line in enumerate(wrap_text(self.message, main_width - 2)[:2]):
-            canvas.put(20 + index, left + 1, line, color(3 if self.failed else 1), main_width - 2)
+            canvas.put(20 + index, left + 1, line, color(3 if self.failed or self.cancelled else 1), main_width - 2)
 
         if wide:
             side = left + main_width + 2
@@ -1054,12 +1154,15 @@ class AttendanceScreen:
                 canvas.put(24 + index, left + 2, f"{stamp}  QR {qr}  {message}", width=main_width - 4)
         footer = ("Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 L ログ H ヘルプ Q 終了" if total >= 68
                   else "Tab選択 Enter実行 R更新 U管理 S予定 Lログ Hヘルプ Q終了")
-        if self.save_prompt.active:
+        if self.busy and self.cancel_event is not None:
+            footer = "中断しています… 安全な位置で停止します" if self.cancel_event.is_set() else "処理中… Esc / Q / Ctrl+C: 中断"
+        elif self.save_prompt.active:
+
             footer = "↑↓/Tab: 選択 Enter: 決定 Esc/Q: 編集に戻る"
         elif self.modal:
             editing = self.modal in ("add", "rename", "password", "student_id") or (
                 self.modal == "schedule" and self.schedule_panel.mode in ("add", "edit", "period"))
-            footer = "Esc: 戻る・保存確認  " + ("q/Q: 文字入力" if editing else "Q: 戻る")
+            footer = "Esc: 戻る・保存確認  " + ("Ctrl+S: 保存  q/Q: 文字入力" if editing else "Q: 戻る")
         canvas.put(height - 2, left, footer, curses.A_DIM, total)
         if self.demo and height >= 26:
             canvas.put(height - 3, left, "デモ: 1 未出席 / 2 出席済 / 3 受付なし / 4 履修なし / 5 エラー", curses.A_DIM, total)
@@ -1351,9 +1454,9 @@ class AttendanceScreen:
                     self.form_editors = [TextCursor(field) for field in self.form_values]
                 masked = (self.modal == "password" or (self.modal == "add" and index == 2)) and not self.password_visible
                 self.form_editors[index].draw(canvas, row + 1, left + 4, value, width - 8, active=index == self.form_index, masked=masked)
-            guide = "最後の項目でEnter: 保存"
+            guide = "Ctrl+S/最後Enter: 保存"
             if self.modal in ("add", "password"):
-                guide += "  F2: " + ("隠す" if self.password_visible else "パスワード表示")
+                guide += "  F2/Ctrl+T: " + ("隠す" if self.password_visible else "パスワード表示")
             canvas.put(top + height - 4, left + 3, guide, color(1), width - 6)
             canvas.put(top + height - 3, left + 3, self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。"), color(3) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "default":
@@ -1377,11 +1480,20 @@ class AttendanceScreen:
             canvas.button(top + height - 5, left + 25, "[ 切り替える ]", self.confirm_selection == 1)
             canvas.put(top + height - 3, left + 3, "Tab/←→で選択し、Enterで決定します。", curses.A_DIM, width - 6)
         else:
-            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 予定 L: ログ", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択、↑↓/PgUp/PgDn一覧", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。ログは L。")
+            guide = (
+                "入力: ←→で移動 / Home・End / Delete",
+                "Tab・↑↓: 項目  Ctrl+S: 保存  Enter: 決定",
+                "R: 更新  Esc/Q: 処理中断  U: ユーザー  S: 予定 L: ログ",
+                "ユーザー: Spaceで複数選択、Enterで保存",
+                "登録確認: Tab・←→で選択、↑↓/PgUp/PgDn一覧",
+                "パスワード: F2 または Ctrl+T で表示/非表示",
+                "GUIの選択を保存。既定の変更は U → D。",
+                "ユーザーごとの結果は U → V で確認。ログは L。",
+            )
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
-        guide = "Esc: 戻る・保存確認  Tab/↑↓:項目" if self.modal in ("add", "rename", "password", "student_id") else "Esc/Q: 戻る"
+        guide = "Esc: 戻る・保存確認  Tab/↑↓: 項目  Ctrl+S: 保存" if self.modal in ("add", "rename", "password", "student_id") else "Esc/Q: 戻る"
         canvas.put(top + height - 2, left + 3, guide, curses.A_DIM, width - 6)
 
     def run(self, screen):
@@ -1401,86 +1513,96 @@ class AttendanceScreen:
         screen.keypad(True)
         screen.timeout(100)
         try:
-            if self.room:
-                self.start()
-            while True:
-                self.poll()
-                self.draw(screen)
-                try:
-                    key = screen.get_wch()
-                except curses.error:
-                    continue
-                if self.busy:
-                    continue
-                if key == curses.KEY_RESIZE:
-                    continue
-                height, width = screen.getmaxyx()
-                if height < 24 or width < 62:
-                    if self.save_prompt.active:
-                        if key in ("\x1b", "q", "Q"):
-                            self.save_prompt.handle(key)
-                        continue
-                    if key in ("q", "Q", "\x03"):
-                        if self.modal:
-                            self.handle_modal("\x1b")
-                        elif self.confirm:
-                            self.confirm = False
-                            self.confirm_scroll = 0
-                        else:
-                            return 0
-                    elif key == "\x1b":
-                        if self.modal:
-                            self.handle_modal(key)
-                        elif self.confirm:
-                            self.confirm = False
-                            self.confirm_scroll = 0
-                    continue
-                if self.save_prompt.active:
-                    self.save_prompt.handle(key)
-                    continue
-                if self.confirm:
-                    self.handle_confirmation(key, height, width)
-                    continue
-                if self.modal:
-                    self.handle_modal(key)
-                    continue
-                if key in ("q", "Q", "\x03"):
-                    return 0
-                if key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
-                    self.selected = (self.selected + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % 4
-                elif key in ("r", "R"):
-                    self.start()
-                elif key in ("u", "U"):
-                    self.open_users()
-                elif key in ("s", "S"):
-                    self.schedule_panel.open()
-                elif key in ("l", "L"):
-                    self.open_logs()
-                elif key in ("h", "H", "?"):
-                    self.modal = "help"
-                elif self.demo and self.selected != 0 and key in ("1", "2", "3", "4", "5"):
-                    self.demo_state = {"1": "unattended", "2": "attended", "3": "empty", "4": "unenrolled", "5": "error"}[key]
-                    for student_id in self.selected_user_ids:
-                        self.demo_attended.discard((student_id, self.room))
-                    self.start()
-                elif key in ("\n", "\r", curses.KEY_ENTER):
-                    if self.selected == 3:
-                        self.schedule_panel.open()
-                    elif self.selected == 2:
-                        if self.can_register():
-                            self.open_confirmation()
-                    else:
-                        self.start()
-                elif self.selected == 0:
-                    if isinstance(key, str) and key and all(char in "0123456789０１２３４５６７８９" for char in key):
-                        key = unicodedata.normalize("NFKC", key)
-                    edited = self.room_editor.edit(self.room, key, limit=4, accepts=lambda value: value.isascii() and value.isdecimal())
-                    if edited != self.room:
-                        self.room = edited
-                        self.clear_target()
-                        self.message = "QR番号を入力して Enter で確認してください。"
+            with _disable_xon_flow_control():
+                return self._run_loop(screen)
         finally:
             self.clear_sensitive_state()
+
+    def _run_loop(self, screen):
+        if self.room:
+            self.start()
+        while True:
+            self.poll()
+            self.draw(screen)
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                if self.busy and (self.request_cancel() or self.cancel_event is None):
+                    continue
+                raise
+            if self.busy:
+                if key in ("\x1b", "q", "Q", "\x03"):
+                    self.request_cancel()
+                continue
+            if key == curses.KEY_RESIZE:
+                continue
+            height, width = screen.getmaxyx()
+            if height < 24 or width < 62:
+                if self.save_prompt.active:
+                    if key in ("\x1b", "q", "Q"):
+                        self.save_prompt.handle(key)
+                    continue
+                if key in ("q", "Q", "\x03"):
+                    if self.modal:
+                        self.handle_modal("\x1b")
+                    elif self.confirm:
+                        self.confirm = False
+                        self.confirm_scroll = 0
+                    else:
+                        return 0
+                elif key == "\x1b":
+                    if self.modal:
+                        self.handle_modal(key)
+                    elif self.confirm:
+                        self.confirm = False
+                        self.confirm_scroll = 0
+                continue
+            if self.save_prompt.active:
+                self.save_prompt.handle(key)
+                continue
+            if self.confirm:
+                self.handle_confirmation(key, height, width)
+                continue
+            if self.modal:
+                self.handle_modal(key)
+                continue
+            if key in ("q", "Q", "\x03"):
+                return 0
+            if key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
+                self.selected = (self.selected + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % 4
+            elif key in ("r", "R"):
+                self.start()
+            elif key in ("u", "U"):
+                self.open_users()
+            elif key in ("s", "S"):
+                self.schedule_panel.open()
+            elif key in ("l", "L"):
+                self.open_logs()
+            elif key in ("h", "H", "?"):
+                self.modal = "help"
+            elif self.demo and self.selected != 0 and key in ("1", "2", "3", "4", "5"):
+                self.demo_state = {"1": "unattended", "2": "attended", "3": "empty", "4": "unenrolled", "5": "error"}[key]
+                for student_id in self.selected_user_ids:
+                    self.demo_attended.discard((student_id, self.room))
+                self.start()
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                if self.selected == 3:
+                    self.schedule_panel.open()
+                elif self.selected == 2:
+                    if self.can_register():
+                        self.open_confirmation()
+                else:
+                    self.start()
+            elif self.selected == 0:
+                if isinstance(key, str) and key and all(char in "0123456789０１２３４５６７８９" for char in key):
+                    key = unicodedata.normalize("NFKC", key)
+                edited = self.room_editor.edit(self.room, key, limit=4, accepts=lambda value: value.isascii() and value.isdecimal())
+                if edited != self.room:
+                    self.room = edited
+                    self.clear_target()
+                    self.message = "QR番号を入力して Enter で確認してください。"
 
 
 def launch_ui(base: Path, room=None, demo=False, check=False, username=None) -> int:

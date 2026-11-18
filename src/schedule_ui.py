@@ -73,7 +73,8 @@ class SchedulePanel:
                 self.events.put((result, None))
             except Exception as exc:
                 # launchctlやファイル操作の失敗も画面に残し、再操作できるようにする。
-                message = str(exc) if isinstance(exc, (ScheduleError, ConfigurationError, OSError)) else "予定を処理できませんでした。"
+                from .config import ConfigurationError
+                message = (str(exc) or "予定を処理できませんでした。") if isinstance(exc, (ScheduleError, ConfigurationError, OSError)) else "予定を処理できませんでした。"
                 self.events.put((None, message))
         threading.Thread(target=run, daemon=True).start()
 
@@ -91,6 +92,7 @@ class SchedulePanel:
             self.fields = []
             self.initial_fields = ()
             self.editors = []
+            self.confirm_selection = 0
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
             if preview is None:
                 self.mode = "list"
@@ -364,7 +366,12 @@ class SchedulePanel:
                     self._cancel_start()
             return
         if self.mode == "delete":
-            if enter:
+            if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+                self.confirm_selection = 1 - self.confirm_selection
+            elif enter:
+                if self.confirm_selection == 0:
+                    self.discard_form()
+                    return
                 base_data = copy.deepcopy(self.data)
                 index = self.index
                 before_course = copy.deepcopy(base_data["courses"][index])
@@ -378,7 +385,7 @@ class SchedulePanel:
                 self.persist(candidate, mutator=mutator, default_raw=base_data)
             return
         if self.mode in ("add", "edit", "period"):
-            if enter and self.field_index == len(self.fields) - 1:
+            if key == "\x13" or (enter and self.field_index == len(self.fields) - 1):
                 self.submit()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
                 self.field_index = (self.field_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.fields)
@@ -394,7 +401,7 @@ class SchedulePanel:
         elif (enter or key in ("e", "E")) and courses:
             self.form("edit")
         elif key in ("d", "D") and courses:
-            self.mode, self.message = "delete", ""
+            self.mode, self.confirm_selection, self.message = "delete", 0, ""
         elif key in ("t", "T") and courses:
             base_data = copy.deepcopy(self.data)
             index = self.index
@@ -478,9 +485,18 @@ class SchedulePanel:
         elif self.mode == "confirm_start" and self.start_preview:
             self._draw_confirm_start(canvas, top, left, width, height)
         elif self.mode == "delete":
-            put(3, self.data["courses"][self.index]["course_name"], curses.A_BOLD)
-            put(6, "この授業の自動出席予定を削除します。")
-            put(8, "Enter: 削除する / Esc: 戻る", color(4))
+            course = self.data["courses"][self.index]
+            timing = registration_time(course) + (f"～{course['register_until']}" if course.get("register_until") else "")
+            timing_text = timing if course.get("register_time") else f"{timing}（開始5分後）"
+            for offset, line in enumerate(wrap_text(course["course_name"], width - 6)[:2]):
+                put(2 + offset, line, curses.A_BOLD)
+            put(5, f"曜日: {DAYS[course['weekday']]}曜  開始時刻: {course['start_time']}  QR番号: {course['room']}")
+            put(6, f"登録時刻: {timing_text}")
+            put(8, "この授業の自動出席予定を削除します。")
+            put(9, "予定ファイルから削除し、自動実行中なら反映します。", curses.A_DIM)
+            canvas.button(top + height - 6, left + 3, "[ キャンセル ]", self.confirm_selection == 0)
+            canvas.button(top + height - 6, left + 25, "[ 削除する ]", self.confirm_selection == 1)
+            put(height - 5, "Tab/←→: 選択  Enter: 決定", curses.A_DIM)
         else:
             labels = ("開始日 YYYY-MM-DD", "終了日 YYYY-MM-DD", "休講日 YYYY-MM-DD（複数はカンマ区切り）") if self.mode == "period" else ("授業名（出席画面と一致）", "曜日 mon～sun または 月～日", "授業開始時刻 HH:MM", "QR番号（例: 642、731、7301）", "登録時刻/範囲開始 HH:MM（空欄:開始5分後）", "範囲終了 HH:MM（空欄:固定時刻）")
             for i, label in enumerate(labels):
@@ -489,13 +505,14 @@ class SchedulePanel:
                 if len(self.editors) != len(self.fields):
                     self.editors = [TextCursor(value) for value in self.fields]
                 self.editors[i].draw(canvas, top + row + 1, left + 3, self.fields[i], width - 6, active=i == self.field_index)
-            put(height - 5, "Tab/↑↓:項目 ←→:編集 最後でEnter:保存", color(1))
+            put(height - 5, "Tab/↑↓:項目 ←→:編集 Ctrl+S/最後Enter:保存", color(1))
         # 長いエラーでも2行で読み取れるようにする。
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
             put(height - 4 + offset, line, color(4))
         footer = (
             "Esc/Q: 戻る  R: 再読込  L: ログ" if self.mode == "list"
             else "Tab/←→: 選択  Enter: 決定  Esc/Q: キャンセル" if self.mode == "confirm_start"
-            else "Esc: 戻る・保存確認  Ctrl+U: 全消去"
+            else "Esc/Q: キャンセルして戻る" if self.mode == "delete"
+            else "Esc: 戻る・保存確認  Ctrl+S: 保存  Ctrl+U: 全消去"
         )
         put(height - 2, footer, curses.A_DIM)

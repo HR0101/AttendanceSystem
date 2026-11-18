@@ -186,6 +186,16 @@ def _raise_login_error(page, logger=None, default_message: str = "ログイン�
     raise AttendanceError(default_message)
 
 
+class AttendanceCancelled(AttendanceError):
+    """ユーザーの中断要求により安全な位置で停止した場合。"""
+
+
+def _check_cancelled(cancel_event, logger) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        logger.info("段階=ユーザー操作により中断")
+        raise AttendanceCancelled("ユーザー操作により中断しました。")
+
+
 def _require_known_page(page, config: dict, route: str) -> None:
     try:
         current = urlparse(page.url)
@@ -199,13 +209,15 @@ def _require_known_page(page, config: dict, route: str) -> None:
         raise AttendanceError("想定外の画面です。画面の変更または追加認証を確認してください。")
 
 
-def run_attendance(page, config: dict, student_id: str, password: str, room: str, route: str, logger, expected_course: str | None = None, expected_start: str | None = None, on_snapshot=None, expected_values: dict | None = None) -> str:
+def run_attendance(page, config: dict, student_id: str, password: str, room: str, route: str, logger, expected_course: str | None = None, expected_start: str | None = None, on_snapshot=None, expected_values: dict | None = None, cancel_event=None) -> str:
     login = urlparse(config["login_url"])
     room_url = urlunparse(("https", login.netloc, f"/attendance/class_room/{route}", "", "", ""))
+    _check_cancelled(cancel_event, logger)
     logger.info("段階=教室URLへアクセス")
     page.goto(room_url, wait_until="domcontentloaded")
     _require_known_page(page, config, route)
     logged_in = False
+    _check_cancelled(cancel_event, logger)
     if urlparse(page.url).path == "/attendance/login":
         logged_in = True
         logger.info("段階=ログインフォーム入力")
@@ -218,6 +230,7 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
         login_button = page.locator("button[name=login]")
         if login_button.count() != 1 or login_button.is_disabled():
             raise AttendanceError("ログインボタンが有効になりません。画面を確認してください。")
+        _check_cancelled(cancel_event, logger)
         logger.info("段階=ログイン送信")
         with page.expect_navigation(wait_until="domcontentloaded"):
             login_button.click()
@@ -225,6 +238,7 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
         if urlparse(page.url).path == "/attendance/login":
             _raise_login_error(page, logger)
     logger.info("ログイン画面を通過")
+    _check_cancelled(cancel_event, logger)
     if logged_in or urlparse(page.url).path != f"/attendance/class_room/{route}":
         # ログイン後に元のURLへ戻るかどうかはサーバー設定に依存するため、明示的に開く。
         logger.info("段階=教室画面を再表示")
@@ -260,6 +274,7 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
         return "出席済み"
     if config.get("dry_run", False):
         return "未出席（確認のみ）"
+    _check_cancelled(cancel_event, logger)
     logger.info("段階=出席確認ダイアログ")
     page.locator("#attend").click()
     dialog = page.locator("#confirmModal")
@@ -269,6 +284,7 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
     for label in ("授業名", "時限", "教室名", "開始時刻", "終了時刻"):
         if values[label] not in body:
             raise AttendanceError("確認ダイアログの授業情報が一致しません。")
+    _check_cancelled(cancel_event, logger)
     logger.info("段階=出席登録送信")
     with page.expect_navigation(wait_until="domcontentloaded"):
         dialog.locator("#ok_confirmModal").click()
