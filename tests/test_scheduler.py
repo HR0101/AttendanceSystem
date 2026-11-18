@@ -312,6 +312,181 @@ class SchedulerTests(unittest.TestCase):
                     proc.kill()
                 proc.wait(timeout=5)
 
+    @staticmethod
+    def _raw_schedule(*courses):
+        raw = schedule_data(SCHEDULE)
+        raw["courses"] = [dict(COURSE, **fields) for fields in courses]
+        return raw
+
+    def test_rejects_same_register_time_even_with_different_start_times(self):
+        cases = (
+            (
+                {"course_name": "授業A", "start_time": "13:00", "register_time": "13:15"},
+                {"course_name": "授業B", "start_time": "13:10", "register_time": "13:15"},
+            ),
+            (
+                {"course_name": "授業A", "start_time": "13:00"},
+                {"course_name": "授業B", "start_time": "13:10", "register_time": "13:05"},
+            ),
+        )
+        for first, second in cases:
+            with self.subTest(first=first, second=second):
+                with self.assertRaises(ScheduleError) as ctx:
+                    validate_schedule(self._raw_schedule(first, second))
+                self.assertIn("授業A", str(ctx.exception))
+                self.assertIn("授業B", str(ctx.exception))
+                self.assertIn(first.get("register_time", "13:05"), str(ctx.exception))
+
+        # 別の範囲指定授業があっても同一登録時刻は衝突する。
+        with self.assertRaises(ScheduleError):
+            validate_schedule(self._raw_schedule(
+                {"course_name": "授業A", "start_time": "13:00", "register_time": "13:15"},
+                {"course_name": "授業B", "start_time": "13:10", "register_time": "13:15"},
+                {"course_name": "授業C", "weekday": "tue", "start_time": "10:00", "register_time": "10:05", "register_until": "10:15"},
+            ))
+
+    def test_rejects_same_start_time_and_weekday_even_if_register_times_differ(self):
+        with self.assertRaises(ScheduleError) as ctx:
+            validate_schedule(self._raw_schedule(
+                {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05"},
+                {"course_name": "授業B", "start_time": "14:00", "register_time": "14:50"},
+            ))
+        self.assertIn("同じ曜日・開始時刻", str(ctx.exception))
+
+    def test_delay_tolerant_window_boundary_25_minutes(self):
+        for conflict_time in ("14:20", "14:30"):
+            with self.subTest(conflict_time=conflict_time), self.assertRaises(ScheduleError) as ctx:
+                validate_schedule(self._raw_schedule(
+                    {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05"},
+                    {"course_name": "授業B", "start_time": "14:15", "register_time": conflict_time},
+                ))
+            self.assertIn("授業A", str(ctx.exception))
+            self.assertIn("授業B", str(ctx.exception))
+            self.assertIn("14:05", str(ctx.exception))
+            self.assertIn(conflict_time, str(ctx.exception))
+
+        # 開始5分後の自動計算同士でも25分境界で判定する。
+        with self.assertRaises(ScheduleError):
+            validate_schedule(self._raw_schedule(
+                {"course_name": "授業A", "start_time": "14:00"},
+                {"course_name": "授業B", "start_time": "14:25"},
+            ))
+
+        validated_fixed = validate_schedule(self._raw_schedule(
+            {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05"},
+            {"course_name": "授業B", "start_time": "14:15", "register_time": "14:31"},
+        ))
+        self.assertEqual(len(validated_fixed["courses"]), 2)
+
+        validated_default = validate_schedule(self._raw_schedule(
+            {"course_name": "授業A", "start_time": "14:00"},
+            {"course_name": "授業B", "start_time": "14:26"},
+        ))
+        self.assertEqual(len(validated_default["courses"]), 2)
+
+    def test_exact_mode_range_conflicts_and_non_overlapping_boundaries(self):
+        range_course = {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05", "register_until": "14:15"}
+        for conflicting in (
+            {"course_name": "授業B", "start_time": "14:10", "register_time": "14:10"},
+            {"course_name": "授業B", "start_time": "14:05", "register_time": "14:05"},
+            {"course_name": "授業B", "start_time": "14:15", "register_time": "14:15"},
+            {"course_name": "授業B", "start_time": "14:12", "register_time": "14:12", "register_until": "14:20"},
+            {"course_name": "授業B", "start_time": "14:15", "register_time": "14:15", "register_until": "14:20"},
+        ):
+            with self.subTest(conflicting=conflicting), self.assertRaises(ScheduleError) as ctx:
+                validate_schedule(self._raw_schedule(range_course, conflicting))
+            self.assertIn("授業A", str(ctx.exception))
+            self.assertIn("授業B", str(ctx.exception))
+
+        for non_conflicting in (
+            {"course_name": "授業B", "start_time": "14:04", "register_time": "14:04"},
+            {"course_name": "授業B", "start_time": "14:16", "register_time": "14:16"},
+            {"course_name": "授業B", "start_time": "14:16", "register_time": "14:16", "register_until": "14:20"},
+        ):
+            with self.subTest(non_conflicting=non_conflicting):
+                validated = validate_schedule(self._raw_schedule(range_course, non_conflicting))
+                self.assertEqual(len(validated["courses"]), 2)
+
+        # exact モードでは固定時刻同士が25分以内でも重複しないが、範囲授業が無効なら衝突する。
+        fixed_1 = {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05"}
+        fixed_2 = {"course_name": "授業B", "start_time": "14:15", "register_time": "14:20"}
+        tue_range = {"course_name": "授業C", "weekday": "tue", "start_time": "10:00", "register_time": "10:05", "register_until": "10:15"}
+        self.assertEqual(len(validate_schedule(self._raw_schedule(fixed_1, fixed_2, tue_range))["courses"]), 3)
+        with self.assertRaises(ScheduleError):
+            validate_schedule(self._raw_schedule(fixed_1, fixed_2, dict(tue_range, enabled=False)))
+
+    def test_week_wraparound_conflicts_and_boundaries(self):
+        # sun 23:55 (既定 -> mon 00:00..00:25) と mon 00:10 (00:10..00:35)
+        for mon_course in (
+            {"course_name": "月曜固定", "weekday": "mon", "start_time": "00:05", "register_time": "00:10"},
+            {"course_name": "月曜既定", "weekday": "mon", "start_time": "00:10"},
+        ):
+            with self.subTest(mon_course=mon_course), self.assertRaises(ScheduleError):
+                validate_schedule(self._raw_schedule(
+                    {"course_name": "日曜深夜", "weekday": "sun", "start_time": "23:55"},
+                    mon_course,
+                ))
+
+        # sun 23:50 既定 (日 23:55～月 00:20) の週またぎ区間分割
+        with self.assertRaises(ScheduleError) as ctx:
+            validate_schedule(self._raw_schedule(
+                {"course_name": "日曜深夜", "weekday": "sun", "start_time": "23:50"},
+                {"course_name": "月曜深夜", "weekday": "mon", "start_time": "00:10", "register_time": "00:10"},
+            ))
+        self.assertIn("日曜深夜", str(ctx.exception))
+        self.assertIn("月曜深夜", str(ctx.exception))
+
+        # sun 23:58 既定 (mon 00:03) と mon 00:03 は exact モードでも衝突する。
+        with self.assertRaises(ScheduleError):
+            validate_schedule(self._raw_schedule(
+                {"course_name": "日曜深夜", "weekday": "sun", "start_time": "23:58"},
+                {"course_name": "月曜深夜", "weekday": "mon", "start_time": "00:03", "register_time": "00:03"},
+                {"course_name": "火曜範囲", "weekday": "tue", "start_time": "10:00", "register_time": "10:05", "register_until": "10:15"},
+            ))
+
+        # sun 23:35 (+25m = mon 00:00) は mon 00:00 と重なり、sun 23:34 (+25m = sun 23:59) は重ならない。
+        with self.assertRaises(ScheduleError):
+            validate_schedule(self._raw_schedule(
+                {"course_name": "日曜境界", "weekday": "sun", "start_time": "23:30", "register_time": "23:35"},
+                {"course_name": "月曜境界", "weekday": "mon", "start_time": "00:00", "register_time": "00:00"},
+            ))
+        validated = validate_schedule(self._raw_schedule(
+            {"course_name": "日曜境界", "weekday": "sun", "start_time": "23:30", "register_time": "23:34"},
+            {"course_name": "月曜境界", "weekday": "mon", "start_time": "00:00", "register_time": "00:00"},
+        ))
+        self.assertEqual(len(validated["courses"]), 2)
+
+        # sun 23:55 (既定 -> mon 00:00..00:25) と mon 00:26 は衝突しない。
+        validated_non_overlap = validate_schedule(self._raw_schedule(
+            {"course_name": "日曜深夜", "weekday": "sun", "start_time": "23:55"},
+            {"course_name": "月曜深夜", "weekday": "mon", "start_time": "00:20", "register_time": "00:26"},
+        ))
+        self.assertEqual(len(validated_non_overlap["courses"]), 2)
+
+    def test_disabled_conflicting_course_is_allowed_until_enabled_and_save_rejects(self):
+        disabled_conflict = self._raw_schedule(
+            {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05", "enabled": True},
+            {"course_name": "授業B", "start_time": "14:15", "register_time": "14:20", "enabled": False},
+        )
+        validated = validate_schedule(disabled_conflict)
+        self.assertEqual(len(validated["courses"]), 2)
+
+        enabled_conflict = self._raw_schedule(
+            {"course_name": "授業A", "start_time": "14:00", "register_time": "14:05", "enabled": True},
+            {"course_name": "授業B", "start_time": "14:15", "register_time": "14:20", "enabled": True},
+        )
+        with self.assertRaises(ScheduleError):
+            validate_schedule(enabled_conflict)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule.json"
+            save_schedule(path, disabled_conflict)
+            original = path.read_bytes()
+            with self.assertRaises(ScheduleError):
+                save_schedule(path, enabled_conflict)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse(load_schedule(path)["courses"][1]["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()
