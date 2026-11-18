@@ -26,8 +26,96 @@ if [ -e "$command_path" ] || [ -L "$command_path" ]; then
     [ -L "$command_path" ] && [ "$(readlink "$command_path")" = "$tool_dir/att" ] \
         || fail "$command_path が既に存在します。内容を確認してから再実行してください。"
 fi
-[ -f "$tool_dir/requirements.lock" ] \
-    || fail "requirements.lock が見つかりません。配布元から完全なファイルを取得して再実行してください。"
+lock_path="$tool_dir/requirements.lock"
+if [ -L "$lock_path" ] || { [ -e "$lock_path" ] && [ ! -f "$lock_path" ]; }; then
+    fail "requirements.lock が通常のファイルではありません。内容を確認してから再実行してください。"
+fi
+if [ ! -e "$lock_path" ]; then
+    for rel in "src" "src/__init__.py" "src/dependencies.py" "src/dependency_lock.py" "src/updater.py" "requirements.txt"; do
+        if [ -L "$tool_dir/$rel" ]; then
+            fail "requirements.lock の復元に使う $rel がシンボリックリンクです。配布元から完全なファイルを取得して再実行してください。"
+        fi
+    done
+    if [ ! -d "$tool_dir/src" ] \
+        || [ ! -f "$tool_dir/src/__init__.py" ] \
+        || [ ! -f "$tool_dir/src/dependencies.py" ] \
+        || [ ! -f "$tool_dir/src/dependency_lock.py" ] \
+        || [ ! -f "$tool_dir/src/updater.py" ] \
+        || [ ! -f "$tool_dir/requirements.txt" ]; then
+        fail "requirements.lock が見つかりません。配布元から完全なファイルを取得して再実行してください。"
+    fi
+    # 更新用ZIPには requirements.lock が含まれないため、検証済みの埋め込みロック情報から復元する。
+    PYTHONPATH="" PYTHONNOUSERSITE=1 python3 -c '
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+tool_dir = Path(sys.argv[1])
+sys.path = [str(tool_dir), *(p for p in sys.path if p and p != ".")]
+for rel in ("src", "src/__init__.py", "src/dependencies.py", "src/dependency_lock.py", "src/updater.py", "requirements.txt"):
+    target = tool_dir / rel
+    if target.is_symlink() or (not target.is_dir() if rel == "src" else not target.is_file()):
+        raise SystemExit(1)
+lock_path = tool_dir / "requirements.lock"
+if lock_path.is_symlink() or lock_path.exists():
+    raise SystemExit(1)
+
+from src.dependencies import read_spec
+from src.updater import UpdateError
+
+try:
+    spec = read_spec(tool_dir)
+except UpdateError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+
+entries, buf = [], []
+for raw in spec["text"].splitlines():
+    line = raw.strip()
+    if not buf and (not line or line.startswith("#")):
+        continue
+    if buf and line.startswith("#"):
+        raise SystemExit(1)
+    if line.endswith("\\"):
+        buf.append(line[:-1].strip())
+        continue
+    buf.append(line)
+    entries.append(" ".join(part for part in buf if part))
+    buf.clear()
+if buf or not entries:
+    raise SystemExit(1)
+for entry in entries:
+    parts = entry.split("--hash=")
+    if len(parts) < 2:
+        raise SystemExit(1)
+    head = parts[0].strip()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?==[A-Za-z0-9.+!_*-]+(?:\s*;.*)?$", head):
+        raise SystemExit(1)
+    if re.search(r"(?:^|\s)-", head):
+        raise SystemExit(1)
+    for digest in parts[1:]:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest.strip()):
+            raise SystemExit(1)
+
+fd, tmp_name = tempfile.mkstemp(dir=tool_dir, prefix=".requirements.lock.")
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(spec["text"].encode("utf-8"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(tmp_name, 0o644)
+    if lock_path.is_symlink() or lock_path.exists():
+        raise SystemExit(1)
+    os.replace(tmp_name, lock_path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
+' "$tool_dir" || fail "requirements.lock を検証・復元できませんでした。配布元から完全なファイルを取得して再実行してください。"
+fi
+[ -f "$lock_path" ] && [ ! -L "$lock_path" ] && [ -s "$lock_path" ] \
+    || fail "requirements.lock が見つからないか不正です。配布元から完全なファイルを取得して再実行してください。"
 
 echo "Python 環境とブラウザを準備しています…"
 if [ ! -d "$tool_dir/.venv" ]; then

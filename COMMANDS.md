@@ -204,7 +204,7 @@ python3 scripts/check_update_notes.py
 
 ### 依存ライブラリのロックファイル
 
-`install.sh` とCIは、`requirements.lock` に記録した版とSHA-256ハッシュに一致する wheel パッケージだけを導入します（`pip install --no-input --require-hashes --only-binary=:all:`）。`requirements.lock` がない場合はエラーで停止します。`requirements.txt` を変更したときや依存ライブラリを更新するときは、[uv](https://docs.astral.sh/uv/) で次を実行して再生成し、両方をコミットしてください。
+`install.sh` とCIは、`requirements.lock` に記録した版とSHA-256ハッシュに一致する wheel パッケージだけを導入します（`pip install --no-input --require-hashes --only-binary=:all:`）。更新用ZIP展開環境など `requirements.lock` がないフォルダで `install.sh` を実行した場合は、同梱の `src/dependency_lock.py` を `requirements.txt` のSHA-256と突き合わせて検証したうえで `requirements.lock` を復元し、有効なロック情報がない場合はエラーで停止します。`requirements.txt` を変更したときや依存ライブラリを更新するときは、[uv](https://docs.astral.sh/uv/) で次を実行して再生成し、両方をコミットしてください。
 
 ```sh
 uv pip compile requirements.txt --universal --generate-hashes --python-version 3.10 --exclude-newer "14 days" --no-header -o requirements.lock
