@@ -6,12 +6,13 @@ import queue
 import threading
 from datetime import date
 
-from .config import load_config
+from .config import ConfigurationError, load_config
 from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
-    load_schedule, registration_time, remove_agent, save_schedule, schedule_data, validate_schedule,
+    load_schedule, next_scheduled_run, registration_time, remove_agent, save_schedule,
+    schedule_data, validate_schedule,
 )
-from .terminal_layout import color
+from .terminal_layout import color, fit_text, text_width, wrap_text
 from .text_input import TextCursor
 from .users import select_user
 
@@ -30,8 +31,14 @@ class SchedulePanel:
         self.initial_fields = ()
         self.editors = []
         self.field_index = 0
+        self.confirm_selection = 0
+        self.start_preview = None
         self.message = ""
         self.events = queue.Queue()
+
+    def _reset_start_confirmation(self):
+        self.confirm_selection = 0
+        self.start_preview = None
 
     def work(self, operation):
         self.owner.busy = True
@@ -43,7 +50,6 @@ class SchedulePanel:
                 self.events.put((result, None))
             except Exception as exc:
                 # launchctlやファイル操作の失敗も画面に残し、再操作できるようにする。
-                from .config import ConfigurationError
                 message = str(exc) if isinstance(exc, (ScheduleError, ConfigurationError, OSError)) else "予定を処理できませんでした。"
                 self.events.put((None, message))
         threading.Thread(target=run, daemon=True).start()
@@ -62,6 +68,7 @@ class SchedulePanel:
             self.fields = []
             self.initial_fields = ()
             self.editors = []
+            self._reset_start_confirmation()
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
 
     def open(self):
@@ -70,6 +77,7 @@ class SchedulePanel:
         self.fields = []
         self.initial_fields = ()
         self.editors = []
+        self._reset_start_confirmation()
         self.data = None
 
         def read():
@@ -114,27 +122,83 @@ class SchedulePanel:
             return candidate, agent_installed(base), "予定を保存し、自動実行に反映しました。" if active else "予定を保存しました。Iで自動実行を開始できます。"
         self.work(save)
 
-    def toggle_agent(self):
-        active, candidate = self.active, copy.deepcopy(self.data)
-
-        def toggle():
-            if self.owner.demo:
-                return candidate, not active, "デモ: 自動実行の状態は保存されません。"
+    def _build_start_preview(self, candidate):
+        """自動実行開始前の前提条件と次回実行予定を検証してまとめる。"""
+        if self.owner.demo:
+            config = self.owner.config
+        else:
             base = self.owner.base
-            if active:
-                remove_agent(base)
-                return candidate, False, "自動実行を停止しました。"
+            if base is None:
+                raise ScheduleError("設定ファイルの場所を確認できません。")
             config = load_config(base / "config.json")
             if not config["browser"]["headless"]:
                 raise ScheduleError("自動実行には browser.headless を true にしてください。")
-            if select_user(config) is None:
-                raise ScheduleError("ユーザー管理で既定ユーザーを登録してください。")
-            schedule = validate_schedule(candidate)
+        user = select_user(config)
+        if user is None:
+            raise ScheduleError("ユーザー管理で既定ユーザーを登録してください。")
+        schedule = validate_schedule(candidate)
+        enabled_courses = [course for course in schedule["courses"] if course.get("enabled", True)]
+        if not enabled_courses:
+            raise ScheduleError("有効な授業を設定してから自動実行を開始してください。")
+        if date.today() > schedule["active_until"]:
+            raise ScheduleError("設定した授業期間は終了しています。")
+        next_run = next_scheduled_run(schedule)
+        if next_run is None:
+            raise ScheduleError("期間内に実行できる予定がありません。休講日や授業期間を確認してください。")
+        next_at, next_course = next_run
+        return {
+            "user": user,
+            "next_at": next_at,
+            "next_course": next_course,
+            "active_from": schedule["active_from"].isoformat(),
+            "active_until": schedule["active_until"].isoformat(),
+            "enabled_count": len(enabled_courses),
+            "blackout_count": len(schedule["blackout_dates"]),
+            "schedule": schedule,
+        }
+
+    def prepare_start(self):
+        """自動実行を開始する前に確認画面を開く。"""
+        candidate = copy.deepcopy(self.data)
+        try:
+            preview = self._build_start_preview(candidate)
+        except (ScheduleError, ConfigurationError, OSError) as exc:
+            self.message = str(exc)
+            return
+        self.start_preview = preview
+        self.confirm_selection = 0
+        self.mode = "confirm_start"
+        self.message = ""
+
+    def start_agent(self):
+        """確認後に予定を保存して LaunchAgent を開始する。"""
+        candidate = copy.deepcopy(self.data)
+        self.mode = "list"
+        self._reset_start_confirmation()
+
+        def start():
+            preview = self._build_start_preview(candidate)
+            if self.owner.demo:
+                return candidate, True, "デモ: 自動実行の状態は保存されません。"
+            base = self.owner.base
             # 予定ファイルが存在しない状態では開始しない。
             save_schedule(base / "schedule.json", candidate)
-            install_agent(base, schedule)
+            install_agent(base, preview["schedule"])
             return candidate, True, "自動実行を開始しました。GUIを閉じても動作します。"
-        self.work(toggle)
+        self.work(start)
+
+    def toggle_agent(self):
+        if not self.active:
+            self.prepare_start()
+            return
+        candidate = copy.deepcopy(self.data)
+
+        def stop():
+            if self.owner.demo:
+                return candidate, False, "デモ: 自動実行の状態は保存されません。"
+            remove_agent(self.owner.base)
+            return candidate, False, "自動実行を停止しました。"
+        self.work(stop)
 
     def form(self, mode):
         self.mode, self.field_index, self.message = mode, 0, ""
@@ -151,10 +215,18 @@ class SchedulePanel:
     def discard_form(self):
         self.mode, self.fields, self.editors, self.message = "list", [], [], ""
         self.initial_fields = ()
+        self._reset_start_confirmation()
+
+    def _cancel_start(self):
+        self.mode = "list"
+        self._reset_start_confirmation()
+        self.message = "自動実行の開始をキャンセルしました。"
 
     def request_back(self):
         if self.mode == "list":
             self.owner.modal = None
+        elif self.mode == "confirm_start":
+            self._cancel_start()
         elif self.mode in ("add", "edit", "period") and tuple(self.fields) != self.initial_fields:
             self.owner.save_prompt.open("自動出席予定の編集", save=self.submit, discard=self.discard_form)
         else:
@@ -189,6 +261,15 @@ class SchedulePanel:
                 self.open()
             return
         courses = self.data["courses"]
+        if self.mode == "confirm_start":
+            if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+                self.confirm_selection = 1 - self.confirm_selection
+            elif enter:
+                if self.confirm_selection == 1:
+                    self.start_agent()
+                else:
+                    self._cancel_start()
+            return
         if self.mode == "delete":
             if enter:
                 candidate = copy.deepcopy(self.data)
@@ -225,6 +306,39 @@ class SchedulePanel:
         elif key in ("r", "R"):
             self.open()
 
+    def _draw_confirm_start(self, canvas, top, left, width, height):
+        inner = width - 6
+
+        def put(row, text, attr=0):
+            canvas.put(top + row, left + 3, text, attr, inner)
+
+        preview = self.start_preview
+        user = preview["user"]
+        suffix = f" ({user['student_id']})"
+        prefix = "既定ユーザー: "
+        available = max(0, inner - text_width(prefix) - text_width(suffix))
+        name = user["username"]
+        if text_width(name) > available:
+            name = fit_text(name, max(0, available - 1)) + ("…" if available >= 1 else "")
+        next_at = preview["next_at"]
+        course = preview["next_course"]
+        weekday_label = "月火水木金土日"[next_at.weekday()]
+        put(1, "自動実行を開始しますか？", curses.A_BOLD | color(4))
+        put(2, "GUIを閉じても既定ユーザーで実行します。", curses.A_DIM)
+        put(4, f"{prefix}{name}{suffix}", curses.A_BOLD)
+        put(5, f"次回実行日時: {next_at:%Y-%m-%d} ({weekday_label}) {next_at:%H:%M}", curses.A_BOLD)
+        course_lines = wrap_text(f"次回の授業: QR{course['room']} {course['course_name']}", inner)[:2]
+        for offset, line in enumerate(course_lines):
+            put(6 + offset, line)
+        row = 6 + len(course_lines)
+        put(row, f"適用期間: {preview['active_from']} ～ {preview['active_until']}")
+        blackout = f"（休講日 {preview['blackout_count']}日）" if preview["blackout_count"] else ""
+        put(row + 1, f"有効な予定: {preview['enabled_count']}件{blackout}")
+        button_row = min(row + 3, height - 6)
+        canvas.button(top + button_row, left + 3, "[ キャンセル ]", self.confirm_selection == 0)
+        canvas.button(top + button_row, left + 22, "[ 開始する ]", self.confirm_selection == 1)
+        put(button_row + 2, "確定するまで予定や自動実行は変更されません。", curses.A_DIM)
+
     def draw(self, canvas):
         width, height = min(canvas.width - 6, 88), min(canvas.height - 2, 26)
         left, top = (canvas.width - width) // 2, (canvas.height - height) // 2
@@ -250,6 +364,8 @@ class SchedulePanel:
                 put(5 + i - first, text, curses.A_REVERSE if i == self.index else 0)
             put(height - 6, "A 追加  Enter 編集  D 削除  T 有効/無効", color(1))
             put(height - 5, "P 期間・休講日  I 自動実行の開始/停止", color(1))
+        elif self.mode == "confirm_start" and self.start_preview:
+            self._draw_confirm_start(canvas, top, left, width, height)
         elif self.mode == "delete":
             put(3, self.data["courses"][self.index]["course_name"], curses.A_BOLD)
             put(6, "この授業の自動出席予定を削除します。")
@@ -264,7 +380,11 @@ class SchedulePanel:
                 self.editors[i].draw(canvas, top + row + 1, left + 3, self.fields[i], width - 6, active=i == self.field_index)
             put(height - 5, "Tab/↑↓:項目 ←→:編集 最後でEnter:保存", color(1))
         # 長いエラーでも2行で読み取れるようにする。
-        from .terminal_layout import wrap_text
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
             put(height - 4 + offset, line, color(4))
-        put(height - 2, "Esc/Q: 戻る  R: 再読込" if self.mode == "list" else "Esc: 戻る・保存確認  Ctrl+U: 全消去", curses.A_DIM)
+        footer = (
+            "Esc/Q: 戻る  R: 再読込" if self.mode == "list"
+            else "Tab/←→: 選択  Enter: 決定  Esc/Q: キャンセル" if self.mode == "confirm_start"
+            else "Esc: 戻る・保存確認  Ctrl+U: 全消去"
+        )
+        put(height - 2, footer, curses.A_DIM)

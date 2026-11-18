@@ -139,6 +139,40 @@ def registration_time(course: dict, course_date: date | None = None) -> str:
     return f"{minute_of_day // 60:02}:{minute_of_day % 60:02}"
 
 
+def next_scheduled_run(schedule: dict, now: datetime | None = None) -> tuple[datetime, dict] | None:
+    """有効な授業予定・期間・休講日を踏まえた次回の実行予定日時と授業を返す。"""
+    current = datetime.now() if now is None else now
+    active_from = schedule["active_from"]
+    active_until = schedule["active_until"]
+    blackout_dates = schedule["blackout_dates"]
+    if active_from > active_until:
+        return None
+    # 日付またぎの登録時刻（例: 日曜23:58開始→月曜00:03実行）も前日分の授業日から拾う。
+    start_search = max(active_from, current.date() - timedelta(days=1))
+    if start_search > active_until:
+        return None
+    best = None
+    for course in schedule["courses"]:
+        if not course.get("enabled", True):
+            continue
+        target_weekday = WEEKDAYS[course["weekday"]]
+        offset = (target_weekday - start_search.weekday()) % 7
+        candidate_date = start_search + timedelta(days=offset)
+        while candidate_date <= active_until:
+            if candidate_date not in blackout_dates:
+                run_minute = _registration_week_minute(course, candidate_date)
+                rollover = run_minute // 1440 - target_weekday
+                hour, minute = divmod(run_minute % 1440, 60)
+                run_date = candidate_date + timedelta(days=rollover)
+                run_at = datetime(run_date.year, run_date.month, run_date.day, hour, minute, tzinfo=current.tzinfo)
+                if run_at >= current:
+                    if best is None or run_at < best[0]:
+                        best = (run_at, course)
+                    break
+            candidate_date += timedelta(days=7)
+    return best
+
+
 def due_course(schedule: dict, now: datetime) -> dict | None:
     now_minute = now.weekday() * 1440 + now.hour * 60 + now.minute
     # 範囲内の各分に起動する場合、同じ授業を繰り返し処理しない。
