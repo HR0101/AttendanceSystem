@@ -1,0 +1,15 @@
+title = "AttendanceSystem gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Allow synthetic negative URL-rejection test fixture in tests/test_updater_http.py"
+condition = "AND"
+regexTarget = "line"
+paths = [
+    '''(^|/)tests/test_updater_http\.py$''',
+]
+regexes = [
+    '''"https[:]//user:pass@github\.com/file"''',
+]
