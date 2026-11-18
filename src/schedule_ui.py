@@ -63,13 +63,19 @@ class SchedulePanel:
         if error:
             self.message = error
         else:
-            self.data, self.active, self.message = result
-            self.mode = "list"
+            preview = result[3] if len(result) > 3 else None
+            self.data, self.active, self.message = result[:3]
             self.fields = []
             self.initial_fields = ()
             self.editors = []
-            self._reset_start_confirmation()
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
+            if preview is None:
+                self.mode = "list"
+                self._reset_start_confirmation()
+            else:
+                self.mode = "confirm_start"
+                self.start_preview = preview
+                self.confirm_selection = 0
 
     def open(self):
         self.owner.modal = "schedule"
@@ -170,14 +176,49 @@ class SchedulePanel:
         self.mode = "confirm_start"
         self.message = ""
 
+    @staticmethod
+    def _start_preview_changed(expected_preview, preview):
+        """確認画面で表示した対象ユーザーや次回実行条件が変わったか判定する。"""
+        if expected_preview is None or preview is None:
+            return expected_preview is not preview
+
+        def summary(item):
+            user = item["user"]
+            course = item["next_course"]
+            return (
+                user.get("username"),
+                user.get("student_id"),
+                item["next_at"],
+                course["weekday"],
+                course["start_time"],
+                course["room"],
+                course["course_name"],
+                course.get("register_time") or "",
+                course.get("register_until") or "",
+                item["active_from"],
+                item["active_until"],
+                item["enabled_count"],
+                item["blackout_count"],
+            )
+
+        return summary(expected_preview) != summary(preview)
+
     def start_agent(self):
         """確認後に予定を保存して LaunchAgent を開始する。"""
+        expected_preview = copy.deepcopy(self.start_preview)
         candidate = copy.deepcopy(self.data)
         self.mode = "list"
         self._reset_start_confirmation()
 
         def start():
             preview = self._build_start_preview(candidate)
+            if expected_preview is not None and self._start_preview_changed(expected_preview, preview):
+                return (
+                    candidate,
+                    False,
+                    "確認中に既定ユーザーまたは実行条件が変更されました。新しい内容を確認してください。",
+                    preview,
+                )
             if self.owner.demo:
                 return candidate, True, "デモ: 自動実行の状態は保存されません。"
             base = self.owner.base

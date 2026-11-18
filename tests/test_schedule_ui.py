@@ -5,7 +5,7 @@ import curses
 import json
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -251,6 +251,224 @@ class SchedulePanelTests(unittest.TestCase):
                 self.assertIn(expected_text, self.panel.message)
                 self.assertEqual(self.path.read_bytes(), original)
                 install.assert_not_called()
+
+    def test_start_reconfirms_when_default_user_changes_during_confirmation(self):
+        users = [{"username": "A", "student_id": "A1"}, {"username": "B", "student_id": "B2"}]
+        self.write_config(users=users, default_user="A")
+        self.panel.data = active_schedule()
+        save_schedule(self.path, self.panel.data)
+        original = self.path.read_bytes()
+        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.save_schedule") as save:
+            self.panel.handle("i")
+            self.assertEqual(self.panel.mode, "confirm_start")
+            self.assertEqual(self.panel.start_preview["user"]["username"], "A")
+            self.assertEqual(self.panel.confirm_selection, 0)
+
+            self.write_config(users=users, default_user="B")
+            self.panel.handle("\t")
+            self.assertEqual(self.panel.confirm_selection, 1)
+            self.panel.handle("\n")
+            self.ui.poll()
+
+            install.assert_not_called()
+            save.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), original)
+            self.assertFalse(self.panel.active)
+            self.assertEqual(self.panel.mode, "confirm_start")
+            self.assertEqual(self.panel.start_preview["user"], {"username": "B", "student_id": "B2"})
+            self.assertEqual(self.panel.confirm_selection, 0)
+            self.assertEqual(self.panel.message, "確認中に既定ユーザーまたは実行条件が変更されました。新しい内容を確認してください。")
+
+            calls = self.draw_calls()
+            drawn = "\n".join(call.args[2] for call in calls)
+            self.assertIn("B (B2)", drawn)
+            self.assertIn("確認中に既定ユーザー", drawn)
+            cancel_attrs = [call.args[3] for call in calls if "[ キャンセル ]" in call.args[2]]
+            self.assertTrue(cancel_attrs and (cancel_attrs[0] & curses.A_REVERSE))
+
+            self.panel.handle("\t")
+            self.assertEqual(self.panel.confirm_selection, 1)
+            self.panel.handle("\n")
+            self.ui.poll()
+
+            save.assert_called_once()
+            install.assert_called_once()
+            self.assertTrue(self.panel.active)
+            self.assertEqual(self.panel.mode, "list")
+            self.assertIsNone(self.panel.start_preview)
+
+            # 再確認画面の初期選択はキャンセルなので、そのまま Enter で変更せず戻る。
+            self.panel.active = False
+            self.panel.handle("i")
+            self.assertEqual(self.panel.start_preview["user"]["username"], "B")
+            self.write_config(users=users, default_user="A")
+            self.panel.handle("\t")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.assertEqual(self.panel.mode, "confirm_start")
+            self.assertEqual(self.panel.start_preview["user"]["username"], "A")
+            self.assertEqual(self.panel.confirm_selection, 0)
+            self.panel.handle("\n")
+            self.assertEqual(self.panel.mode, "list")
+            self.assertFalse(self.panel.active)
+            self.assertIsNone(self.panel.start_preview)
+            save.assert_called_once()
+            install.assert_called_once()
+
+    def test_start_reconfirms_when_target_course_or_period_changes_during_confirmation(self):
+        base_course = {"weekday": "mon", "start_time": "14:00", "room": "731", "course_name": "授業", "enabled": True}
+        extra_course = {"weekday": "fri", "start_time": "11:00", "room": "611", "course_name": "追加授業", "enabled": True}
+        future_blackout = (date.today() + timedelta(days=20)).isoformat()
+
+        def apply_student_id():
+            self.write_config(users=[{"username": "test", "student_id": "TEST999"}], default_user="test")
+
+        def apply_course():
+            self.panel.data["courses"][0] = {
+                "weekday": "mon",
+                "start_time": "14:00",
+                "room": "642",
+                "course_name": "変更後の授業",
+                "enabled": True,
+                "register_time": "14:02",
+                "register_until": "14:10",
+            }
+
+        def apply_period():
+            self.panel.data["active_until"] = (date.today() + timedelta(days=45)).isoformat()
+            self.panel.data["blackout_dates"] = [future_blackout]
+
+        def apply_enabled_count():
+            self.panel.data["courses"].append(copy.deepcopy(extra_course))
+
+        for name, mutate in (
+            ("student_id", apply_student_id),
+            ("next_course", apply_course),
+            ("period_and_blackouts", apply_period),
+            ("enabled_count", apply_enabled_count),
+        ):
+            with self.subTest(case=name), patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.save_schedule") as save:
+                self.write_config()
+                self.panel.active = False
+                self.panel.mode = "list"
+                self.panel.data = active_schedule(courses=[copy.deepcopy(base_course)])
+                self.panel.handle("i")
+                self.assertEqual(self.panel.mode, "confirm_start")
+
+                mutate()
+                self.panel.handle("\t")
+                self.panel.handle("\n")
+                self.ui.poll()
+
+                install.assert_not_called()
+                save.assert_not_called()
+                self.assertFalse(self.panel.active)
+                self.assertEqual(self.panel.mode, "confirm_start")
+                self.assertEqual(self.panel.confirm_selection, 0)
+                self.assertEqual(self.panel.message, "確認中に既定ユーザーまたは実行条件が変更されました。新しい内容を確認してください。")
+
+                self.panel.handle("\t")
+                self.panel.handle("\n")
+                self.ui.poll()
+                save.assert_called_once()
+                install.assert_called_once()
+                self.assertTrue(self.panel.active)
+                self.assertEqual(self.panel.mode, "list")
+
+        # 確認中に予定時刻を過ぎて次回日時が繰り上がった場合も再確認する。
+        first_run = datetime(2026, 11, 23, 14, 5)
+        second_run = datetime(2026, 11, 30, 14, 5)
+        self.write_config()
+        self.panel.active = False
+        self.panel.mode = "list"
+        self.panel.data = active_schedule(courses=[copy.deepcopy(base_course)])
+        course_obj = validate_schedule(self.panel.data)["courses"][0]
+        with patch("src.schedule_ui.next_scheduled_run", side_effect=[(first_run, course_obj), (second_run, course_obj), (second_run, course_obj)]), \
+             patch("src.schedule_ui.install_agent") as install, \
+             patch("src.schedule_ui.save_schedule") as save:
+            self.panel.handle("i")
+            self.assertEqual(self.panel.start_preview["next_at"], first_run)
+            self.panel.handle("\t")
+            self.panel.handle("\n")
+            self.ui.poll()
+            install.assert_not_called()
+            save.assert_not_called()
+            self.assertFalse(self.panel.active)
+            self.assertEqual(self.panel.mode, "confirm_start")
+            self.assertEqual(self.panel.start_preview["next_at"], second_run)
+            self.assertEqual(self.panel.confirm_selection, 0)
+            self.panel.handle("\t")
+            self.panel.handle("\n")
+            self.ui.poll()
+            save.assert_called_once()
+            install.assert_called_once()
+            self.assertTrue(self.panel.active)
+
+    def test_start_preview_changed_compares_all_confirmed_targets(self):
+        base_preview = {
+            "user": {"username": "A", "student_id": "A1"},
+            "next_at": datetime(2026, 11, 23, 14, 5),
+            "next_course": {
+                "weekday": "mon",
+                "start_time": "14:00",
+                "room": "731",
+                "course_name": "授業",
+                "register_time": "14:05",
+                "register_until": "14:15",
+            },
+            "active_from": "2026-09-18",
+            "active_until": "2026-12-21",
+            "enabled_count": 1,
+            "blackout_count": 0,
+        }
+        same_preview = copy.deepcopy(base_preview)
+        same_preview["user"]["extra"] = "ignored"
+        same_preview["next_course"]["route"] = "ignored"
+        self.assertFalse(self.panel._start_preview_changed(base_preview, same_preview))
+        self.assertFalse(self.panel._start_preview_changed(None, None))
+        self.assertTrue(self.panel._start_preview_changed(None, base_preview))
+        self.assertTrue(self.panel._start_preview_changed(base_preview, None))
+
+        mutations = (
+            ("user.username", lambda p: p["user"].__setitem__("username", "B")),
+            ("user.student_id", lambda p: p["user"].__setitem__("student_id", "B2")),
+            ("next_at", lambda p: p.__setitem__("next_at", datetime(2026, 11, 30, 14, 5))),
+            ("next_course.weekday", lambda p: p["next_course"].__setitem__("weekday", "tue")),
+            ("next_course.start_time", lambda p: p["next_course"].__setitem__("start_time", "15:00")),
+            ("next_course.room", lambda p: p["next_course"].__setitem__("room", "642")),
+            ("next_course.course_name", lambda p: p["next_course"].__setitem__("course_name", "別授業")),
+            ("next_course.register_time", lambda p: p["next_course"].__setitem__("register_time", "14:06")),
+            ("next_course.register_until", lambda p: p["next_course"].__setitem__("register_until", "14:20")),
+            ("active_from", lambda p: p.__setitem__("active_from", "2026-10-01")),
+            ("active_until", lambda p: p.__setitem__("active_until", "2026-12-25")),
+            ("enabled_count", lambda p: p.__setitem__("enabled_count", 2)),
+            ("blackout_count", lambda p: p.__setitem__("blackout_count", 1)),
+        )
+        for field, mutate in mutations:
+            with self.subTest(field=field):
+                changed = copy.deepcopy(base_preview)
+                mutate(changed)
+                self.assertTrue(self.panel._start_preview_changed(base_preview, changed))
+
+    def test_start_aborts_if_conditions_become_invalid_during_confirmation(self):
+        self.write_config()
+        self.panel.data = active_schedule()
+        save_schedule(self.path, self.panel.data)
+        original = self.path.read_bytes()
+        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.save_schedule") as save:
+            self.panel.handle("i")
+            self.assertEqual(self.panel.mode, "confirm_start")
+            self.write_config(browser={"headless": False, "timeout_ms": 15000})
+            self.panel.handle("\t")
+            self.panel.handle("\n")
+            self.ui.poll()
+            install.assert_not_called()
+            save.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), original)
+            self.assertFalse(self.panel.active)
+            self.assertEqual(self.panel.mode, "list")
+            self.assertIsNone(self.panel.start_preview)
+            self.assertIn("headless", self.panel.message)
 
     def test_start_failure_keeps_inactive_and_shows_error(self):
         self.write_config()
