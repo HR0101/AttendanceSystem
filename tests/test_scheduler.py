@@ -5,17 +5,22 @@ import os
 import plistlib
 import subprocess
 import tempfile
+import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import main as app_main
 from src import updater as u
+from src.credentials import CredentialError
 from src.scheduler import (
     ScheduleError,
+    _claim_path,
+    _run_key,
     calendar_intervals,
+    claim_scheduled_run,
     due_course,
     due_scheduled_course,
     install_agent,
@@ -23,6 +28,7 @@ from src.scheduler import (
     schedule_data,
     validate_schedule,
 )
+from src.verification import AttendanceError
 
 
 COURSE = {
@@ -220,45 +226,314 @@ class ScheduledExecutionAndLaunchAgentTests(unittest.TestCase):
             due_scheduled_course(self.base, schedule, datetime(2026, 10, 19, 14, 5))
         self.assertEqual(outside.read_text(encoding="utf-8"), '{"keep": true}')
 
+    def _cleanup_logger(self):
+        logger = logging.getLogger("attendance_tool")
+        for handler in list(logger.handlers):
+            handler.close()
+        logger.handlers.clear()
+
+    def _run_scheduled_main(
+        self,
+        argv: list[str],
+        schedule: dict,
+        config: dict,
+        now: datetime,
+        *,
+        run_attendance_mock=None,
+        get_credentials_mock=None,
+        open_page_mock=None,
+        setup_logging_mock=None,
+    ) -> int:
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        def default_credentials(cfg, *args, **kwargs):
+            cfg["_active_username"] = cfg.get("default_user", "test")
+            return "TEST001", "dummy"
+
+        self.addCleanup(self._cleanup_logger)
+        cred_patch = (
+            patch.object(app_main, "get_credentials", get_credentials_mock)
+            if get_credentials_mock is not None
+            else patch.object(app_main, "get_credentials", side_effect=default_credentials)
+        )
+        page_patch = (
+            patch("src.browser.open_page", open_page_mock)
+            if open_page_mock is not None
+            else patch("src.browser.open_page", return_value=nullcontext(Mock()))
+        )
+        attend_patch = (
+            patch("src.attendance.run_attendance", run_attendance_mock)
+            if run_attendance_mock is not None
+            else patch("src.attendance.run_attendance", return_value="出席登録成功")
+        )
+        log_patch = (
+            patch.object(app_main, "setup_logging", setup_logging_mock)
+            if setup_logging_mock is not None
+            else nullcontext()
+        )
+        with patch.object(app_main, "__file__", str(self.base / "main.py")), \
+                patch.object(app_main, "datetime", FixedDatetime), \
+                patch.object(app_main, "load_config", side_effect=lambda *_: dict(config)), \
+                patch.object(app_main, "load_schedule", return_value=schedule), \
+                cred_patch, page_patch, attend_patch, log_patch, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = app_main.main(argv)
+        if setup_logging_mock is None:
+            self._cleanup_logger()
+        return code
+
     def test_main_scheduled_uses_due_scheduled_course_for_boundary_and_dedup(self):
-        from contextlib import nullcontext
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+
+        attend = Mock(return_value="出席登録成功")
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, config, datetime(2026, 10, 5, 14, 6), run_attendance_mock=attend),
+            0,
+        )
+        attend.assert_called_once()
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, config, datetime(2026, 10, 5, 14, 7), run_attendance_mock=attend),
+            0,
+        )
+        attend.assert_called_once()
+
+    def test_scheduled_check_and_config_dry_run_do_not_consume_live_run(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        now = datetime(2026, 10, 5, 14, 5)
+        observed_dry_runs = []
+
+        def fake_attend(page, cfg, *args, **kwargs):
+            observed_dry_runs.append(cfg.get("dry_run"))
+            return "未出席（確認のみ）" if cfg.get("dry_run") else "出席登録成功"
+
+        # 1. --scheduled --check (CLI指定) は記録を消費しない。
+        live_config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled", "--check"], schedule, live_config, now, run_attendance_mock=Mock(side_effect=fake_attend)),
+            0,
+        )
+        # 2. config["dry_run"] == True の --scheduled も記録を消費しない。
+        dry_config = dict(live_config, dry_run=True)
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, dry_config, now, run_attendance_mock=Mock(side_effect=fake_attend)),
+            0,
+        )
+        self.assertEqual(observed_dry_runs, [True, True])
+        self.assertFalse((self.base / "logs" / "schedule-runs.json").exists())
+
+        # 3. 直後の本番 --scheduled は実行され、記録が確定して以降は抑止される。
+        live_attend = Mock(side_effect=fake_attend)
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, live_config, now, run_attendance_mock=live_attend),
+            0,
+        )
+        self.assertEqual(observed_dry_runs, [True, True, False])
+        self.assertTrue((self.base / "logs" / "schedule-runs.json").is_file())
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, live_config, now + timedelta(minutes=1), run_attendance_mock=live_attend),
+            0,
+        )
+        live_attend.assert_called_once()
+
+    def test_scheduled_pre_submit_and_non_consuming_failures_allow_retry(self):
+        class TimeoutError(Exception):
+            pass
 
         course = dict(COURSE, register_time="14:05", register_until="14:05")
         schedule = dict(SCHEDULE, courses=[course])
-        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": True}
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+        now = datetime(2026, 10, 5, 14, 5)
 
-        class FixedDatetime(datetime):
-            current = datetime(2026, 10, 5, 14, 6)
+        # 認証エラー
+        self.assertEqual(
+            self._run_scheduled_main(
+                ["--scheduled"], schedule, config, now,
+                get_credentials_mock=Mock(side_effect=CredentialError("Keychain missing")),
+                run_attendance_mock=Mock(),
+            ),
+            1,
+        )
+        # ブラウザ起動失敗
+        self.assertEqual(
+            self._run_scheduled_main(
+                ["--scheduled"], schedule, config, now,
+                open_page_mock=Mock(side_effect=RuntimeError("browser failed")),
+                run_attendance_mock=Mock(),
+            ),
+            1,
+        )
+        # 授業確認エラー・タイムアウト
+        for exc in (AttendanceError("errorModal"), TimeoutError("timed out")):
+            self.assertEqual(
+                self._run_scheduled_main(
+                    ["--scheduled"], schedule, config, now,
+                    run_attendance_mock=Mock(side_effect=exc),
+                ),
+                1,
+            )
+        # 受付対象なし・確認のみ結果
+        for non_consuming in ("出席受付対象なし（受付時間外の可能性・出席操作なし）", "未出席（確認のみ）"):
+            self.assertEqual(
+                self._run_scheduled_main(
+                    ["--scheduled"], schedule, config, now,
+                    run_attendance_mock=Mock(return_value=non_consuming),
+                ),
+                0,
+            )
+        self.assertFalse((self.base / "logs" / "schedule-runs.json").exists())
 
-            @classmethod
-            def now(cls, tz=None):
-                return cls.current
+        # その後の再試行で登録成功したら当日分が確定する。
+        attend = Mock(return_value="出席登録成功")
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, config, now + timedelta(minutes=1), run_attendance_mock=attend),
+            0,
+        )
+        attend.assert_called_once()
+        self.assertTrue((self.base / "logs" / "schedule-runs.json").is_file())
+        self.assertEqual(
+            self._run_scheduled_main(["--scheduled"], schedule, config, now + timedelta(minutes=2), run_attendance_mock=attend),
+            0,
+        )
+        attend.assert_called_once()
 
-        def fake_credentials(cfg, *args, **kwargs):
-            cfg["_active_username"] = "test"
-            return "TEST001", "dummy"
+    def test_concurrent_scheduled_runs_exclude_in_flight_claim_and_release_cleanly(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+        now = datetime(2026, 10, 5, 14, 5)
+        entered = threading.Event()
+        proceed = threading.Event()
+        should_fail = [True]
+        results = {}
 
-        def cleanup_logger():
-            logger = logging.getLogger("attendance_tool")
-            for handler in list(logger.handlers):
-                handler.close()
-            logger.handlers.clear()
+        def slow_attend(*args, **kwargs):
+            entered.set()
+            proceed.wait(timeout=5)
+            if should_fail[0]:
+                raise AttendanceError("transient failure")
+            return "出席登録成功"
 
-        self.addCleanup(cleanup_logger)
-        with patch.object(app_main, "__file__", str(self.base / "main.py")), \
-                patch.object(app_main, "datetime", FixedDatetime), \
-                patch.object(app_main, "load_config", return_value=dict(config)), \
-                patch.object(app_main, "load_schedule", return_value=schedule), \
-                patch.object(app_main, "get_credentials", side_effect=fake_credentials), \
-                patch("src.browser.open_page", return_value=nullcontext(Mock())), \
-                patch("src.attendance.run_attendance", return_value="出席登録成功") as attend, \
-                redirect_stdout(io.StringIO()):
-            self.assertEqual(app_main.main(["--scheduled"]), 0)
-            attend.assert_called_once()
-            cleanup_logger()
-            FixedDatetime.current = datetime(2026, 10, 5, 14, 7)
-            self.assertEqual(app_main.main(["--scheduled"]), 0)
-            attend.assert_called_once()
+        attend = Mock(side_effect=slow_attend)
+        log_mock = Mock(return_value=Mock())
+
+        def run_worker(name: str):
+            results[name] = self._run_scheduled_main(
+                ["--scheduled"], schedule, config, now,
+                run_attendance_mock=attend, setup_logging_mock=log_mock,
+            )
+
+        # 1. 実行中の予約は同時起動の --scheduled と読取専用の双方から排他され、失敗時に解放される。
+        first = threading.Thread(target=run_worker, args=("first",))
+        first.start()
+        self.assertTrue(entered.wait(timeout=5))
+        self.assertIsNone(due_scheduled_course(self.base, schedule, now, record=False))
+        second = threading.Thread(target=run_worker, args=("second",))
+        second.start()
+        second.join(timeout=5)
+        self.assertEqual(results["second"], 0)
+        self.assertEqual(attend.call_count, 1)
+
+        proceed.set()
+        first.join(timeout=5)
+        self.assertEqual(results["first"], 1)
+        self.assertFalse((self.base / "logs" / "schedule-runs.json").exists())
+        self.assertEqual(list((self.base / "logs").glob(".schedule-claim-*.lock")), [])
+
+        # 2. 解放後の再試行では同時実行を抑止しつつ、成功時に記録確定・ロック削除される。
+        entered.clear()
+        proceed.clear()
+        should_fail[0] = False
+        third = threading.Thread(target=run_worker, args=("third",))
+        third.start()
+        self.assertTrue(entered.wait(timeout=5))
+        fourth = threading.Thread(target=run_worker, args=("fourth",))
+        fourth.start()
+        fourth.join(timeout=5)
+        self.assertEqual(results["fourth"], 0)
+        self.assertEqual(attend.call_count, 2)
+
+        proceed.set()
+        third.join(timeout=5)
+        self.assertEqual(results["third"], 0)
+        self.assertTrue((self.base / "logs" / "schedule-runs.json").is_file())
+        self.assertEqual(list((self.base / "logs").glob(".schedule-claim-*.lock")), [])
+        self.assertIsNone(due_scheduled_course(self.base, schedule, now + timedelta(minutes=1), record=False))
+
+    def test_due_scheduled_course_read_only_and_claim_cleanup_edge_cases(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        now = datetime(2026, 10, 5, 14, 5)
+
+        # logs 未作成時の record=False は logs ディレクトリも作成しない。
+        self.assertEqual(due_scheduled_course(self.base, schedule, now, record=False), course)
+        self.assertFalse((self.base / "logs").exists())
+
+        # claim_scheduled_run が未確定のまま抜けると記録は作られず、解除後の commit() は拒否される。
+        with claim_scheduled_run(self.base, schedule, now) as (claimed, commit):
+            self.assertEqual(claimed, course)
+            self.assertIsNone(due_scheduled_course(self.base, schedule, now, record=False))
+        self.assertFalse((self.base / "logs" / "schedule-runs.json").exists())
+        with self.assertRaises(ScheduleError):
+            commit()
+
+        # 古い未使用 .schedule-claim-*.lock は掃除され、新しいもの・ロック中・シンボリックリンクは適切に扱う。
+        import fcntl
+        log_dir = self.base / "logs"
+        stale = log_dir / ".schedule-claim-stale.lock"
+        fresh = log_dir / ".schedule-claim-fresh.lock"
+        stale_held = log_dir / ".schedule-claim-held.lock"
+        stale.write_text("", encoding="utf-8")
+        fresh.write_text("", encoding="utf-8")
+        stale_held.write_text("", encoding="utf-8")
+        old_ts = (now - timedelta(days=15)).timestamp()
+        new_ts = (now - timedelta(days=1)).timestamp()
+        os.utime(stale, (old_ts, old_ts))
+        os.utime(fresh, (new_ts, new_ts))
+        os.utime(stale_held, (old_ts, old_ts))
+
+        held_fd = os.open(stale_held, os.O_RDWR)
+        try:
+            fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with claim_scheduled_run(self.base, schedule, now) as (claimed, commit):
+                self.assertEqual(claimed, course)
+                self.assertFalse(stale.exists())
+                self.assertTrue(fresh.exists())
+                self.assertTrue(stale_held.exists())
+                commit()
+        finally:
+            fcntl.flock(held_fd, fcntl.LOCK_UN)
+            os.close(held_fd)
+        self.assertTrue((log_dir / "schedule-runs.json").is_file())
+
+        # 先行授業が実行中（in-flight）でも、猶予内で開始した隣接授業は競合せずに取得できる。
+        first = dict(COURSE, start_time="14:00", register_time="14:05", register_until="14:05")
+        second = dict(COURSE, start_time="14:01", course_name="次授業", register_time="14:06", register_until="14:06")
+        adj_schedule = dict(SCHEDULE, courses=[first, second])
+        adj_day = datetime(2026, 10, 19, 14, 5)
+        with claim_scheduled_run(self.base, adj_schedule, adj_day) as (claimed_first, _):
+            self.assertEqual(claimed_first, first)
+            with claim_scheduled_run(self.base, adj_schedule, adj_day + timedelta(minutes=1)) as (claimed_second, commit_second):
+                self.assertEqual(claimed_second, second)
+                commit_second()
+
+        # 予約ロックがシンボリックリンクなら拒否する。
+        next_day = datetime(2026, 10, 12, 14, 5)
+        key = _run_key(course["weekday"], course["start_time"], next_day.date())
+        outside = self.root / "outside-claim.lock"
+        outside.write_text("keep", encoding="utf-8")
+        _claim_path(log_dir, key).symlink_to(outside)
+        with self.assertRaises(ScheduleError):
+            due_scheduled_course(self.base, schedule, next_day, record=False)
+        with self.assertRaises(ScheduleError):
+            with claim_scheduled_run(self.base, schedule, next_day):
+                pass
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
     def test_pre_startup_errors_under_scheduled_write_safe_launchagent_log(self):
         with patch.object(u, "start_update_check") as start_check:

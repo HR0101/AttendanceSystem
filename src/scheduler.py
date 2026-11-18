@@ -1,13 +1,15 @@
 """授業予定の検証と macOS LaunchAgent の管理。"""
 
 import fcntl
-import json
 import hashlib
+import json
 import os
 import plistlib
 import re
+import stat
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -287,9 +289,9 @@ def _save_schedule_runs(runs_path: Path, runs: dict[str, dict]) -> None:
     _atomic_write_bytes(runs_path, payload.encode("utf-8"), 0o600)
 
 
-def due_scheduled_course(base: Path, schedule: dict, now: datetime) -> dict | None:
-    """LaunchAgent実行向けの対象授業を判定し、同日の重複実行を防ぐ。"""
-    log_dir = _ensure_log_dir(base)
+@contextmanager
+def _schedule_runs_lock(log_dir: Path):
+    """logs/.schedule-runs.lock で排他ロックを保持する。"""
     lock_path = log_dir / ".schedule-runs.lock"
     if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
         raise ScheduleError("logs/.schedule-runs.lock が通常のファイルではないため処理できません。")
@@ -298,36 +300,226 @@ def due_scheduled_course(base: Path, schedule: dict, now: datetime) -> dict | No
     except OSError as exc:
         raise ScheduleError("logs/.schedule-runs.lock を開けません。") from exc
     with os.fdopen(fd, "a+", encoding="utf-8") as lock_file:
+        if not stat.S_ISREG(os.fstat(lock_file.fileno()).st_mode):
+            raise ScheduleError("logs/.schedule-runs.lock が通常のファイルではないため処理できません。")
         os.fchmod(lock_file.fileno(), 0o600)
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
-            runs_path = log_dir / "schedule-runs.json"
-            cutoff = now.date() - timedelta(days=RECEIPT_RETENTION_DAYS)
-            runs, dirty = _load_schedule_runs(runs_path, cutoff)
-            matches = _matching_courses(schedule, now, grace_minutes=EXACT_GRACE_MINUTES)
-            pending = [
-                (course, course_date)
-                for course, course_date in matches
-                if _run_key(course["weekday"], course["start_time"], course_date) not in runs
-            ]
-            if len(pending) > 1:
-                raise ScheduleError("受付時間が重なる授業があります。自動登録を停止しました。")
-            if not pending:
-                if dirty and runs_path.exists():
-                    _save_schedule_runs(runs_path, runs)
-                return None
-            course, course_date = pending[0]
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _claim_path(log_dir: Path, key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return log_dir / f".schedule-claim-{digest}.lock"
+
+
+def _is_claim_active(log_dir: Path, key: str, *, shared: bool) -> bool:
+    """対象授業・日付の進行中予約ロックが他プロセスに保持されているか確認する。"""
+    claim_path = _claim_path(log_dir, key)
+    if claim_path.is_symlink():
+        raise ScheduleError("予約ロックファイルがシンボリックリンクのため処理できません。")
+    try:
+        fd = os.open(claim_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ScheduleError("予約ロックファイルを開けません。") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ScheduleError("予約ロックファイルが通常のファイルではないため処理できません。")
+        mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, mode)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _acquire_claim(log_dir: Path, key: str) -> tuple[Path, int, int] | None:
+    """進行中予約ロックを非ブロッキングで取得する。先着がいれば None を返す。"""
+    claim_path = _claim_path(log_dir, key)
+    if claim_path.is_symlink() or (claim_path.exists() and not claim_path.is_file()):
+        raise ScheduleError("予約ロックファイルが通常のファイルではないため処理できません。")
+    try:
+        fd = os.open(claim_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ScheduleError("予約ロックファイルを開けません。") from exc
+    keep_open = False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ScheduleError("予約ロックファイルが通常のファイルではないため処理できません。")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        os.utime(fd, None)
+        claim_ino = os.fstat(fd).st_ino
+        keep_open = True
+        return claim_path, fd, claim_ino
+    finally:
+        if not keep_open:
+            os.close(fd)
+
+
+def _release_claim(base: Path, claim_path: Path, claim_fd: int, claim_ino: int) -> None:
+    """進行中予約ロックを解放し、対応するロックファイルを削除する。"""
+    closed = False
+    try:
+        log_dir = _ensure_log_dir(base)
+        with _schedule_runs_lock(log_dir):
+            try:
+                if not claim_path.is_symlink() and os.lstat(claim_path).st_ino == claim_ino:
+                    claim_path.unlink()
+            except OSError:
+                pass
+            try:
+                fcntl.flock(claim_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(claim_fd)
+                closed = True
+    except ScheduleError:
+        pass
+    finally:
+        if not closed:
+            try:
+                fcntl.flock(claim_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(claim_fd)
+
+
+def _prune_stale_claims(log_dir: Path, now: datetime) -> None:
+    """保持期間を過ぎた未使用の予約ロックファイルを掃除する。"""
+    cutoff_ts = (now - timedelta(days=RECEIPT_RETENTION_DAYS)).timestamp()
+    for path in log_dir.glob(".schedule-claim-*.lock"):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff_ts:
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            try:
+                if os.lstat(path).st_ino == os.fstat(fd).st_ino:
+                    path.unlink()
+            except OSError:
+                pass
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+
+
+def _select_pending_course(
+    log_dir: Path | None, schedule: dict, now: datetime, *, shared_probe: bool
+) -> tuple[dict | None, date | None, dict[str, dict], bool]:
+    cutoff = now.date() - timedelta(days=RECEIPT_RETENTION_DAYS)
+    if log_dir is None:
+        runs, dirty = {}, False
+    else:
+        runs, dirty = _load_schedule_runs(log_dir / "schedule-runs.json", cutoff)
+    matches = _matching_courses(schedule, now, grace_minutes=EXACT_GRACE_MINUTES)
+    pending = []
+    for course, course_date in matches:
+        key = _run_key(course["weekday"], course["start_time"], course_date)
+        if key in runs:
+            continue
+        if log_dir is not None and _is_claim_active(log_dir, key, shared=shared_probe):
+            continue
+        pending.append((course, course_date))
+    if len(pending) > 1:
+        raise ScheduleError("受付時間が重なる授業があります。自動登録を停止しました。")
+    if not pending:
+        return None, None, runs, dirty
+    return pending[0][0], pending[0][1], runs, dirty
+
+
+@contextmanager
+def claim_scheduled_run(base: Path, schedule: dict, now: datetime):
+    """LaunchAgent実行向けに実行枠を一時予約し、成功時のみ当日記録を確定する。"""
+    log_dir = _ensure_log_dir(base)
+    runs_path = log_dir / "schedule-runs.json"
+    cutoff = now.date() - timedelta(days=RECEIPT_RETENTION_DAYS)
+    claim: tuple[Path, int, int] | None = None
+    course = None
+    course_date = None
+    key = None
+    with _schedule_runs_lock(log_dir):
+        _prune_stale_claims(log_dir, now)
+        course, course_date, runs, dirty = _select_pending_course(log_dir, schedule, now, shared_probe=False)
+        if course is None:
+            if dirty and runs_path.exists():
+                _save_schedule_runs(runs_path, runs)
+        else:
             key = _run_key(course["weekday"], course["start_time"], course_date)
-            runs[key] = {
+            claim = _acquire_claim(log_dir, key)
+            if claim is None:
+                course = None
+    if course is None or claim is None:
+        yield None, lambda: None
+        return
+    claim_path, claim_fd, claim_ino = claim
+    committed = False
+    released = False
+
+    def commit() -> None:
+        nonlocal committed
+        if released:
+            raise ScheduleError("予約解除後は実行記録を確定できません。")
+        if committed:
+            return
+        verified_log_dir = _ensure_log_dir(base)
+        with _schedule_runs_lock(verified_log_dir):
+            latest_runs, _ = _load_schedule_runs(verified_log_dir / "schedule-runs.json", cutoff)
+            latest_runs[key] = {
                 "weekday": course["weekday"],
                 "start_time": course["start_time"],
                 "course_date": course_date.isoformat(),
                 "recorded_at": now.isoformat(timespec="seconds"),
             }
-            _save_schedule_runs(runs_path, runs)
-            return course
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _save_schedule_runs(verified_log_dir / "schedule-runs.json", latest_runs)
+        committed = True
+
+    try:
+        yield course, commit
+    finally:
+        released = True
+        _release_claim(base, claim_path, claim_fd, claim_ino)
+
+
+def due_scheduled_course(base: Path, schedule: dict, now: datetime, *, record: bool = True) -> dict | None:
+    """LaunchAgent実行向けの対象授業を判定し、record=True なら同日の重複実行防止記録を保存する。"""
+    if not record:
+        log_dir = base / "logs"
+        if log_dir.is_symlink():
+            raise ScheduleError("logs がシンボリックリンクのため処理できません。")
+        if log_dir.exists() and not log_dir.is_dir():
+            raise ScheduleError("logs がフォルダではないため処理できません。")
+        course, _, _, _ = _select_pending_course(log_dir if log_dir.exists() else None, schedule, now, shared_probe=True)
+        return course
+    with claim_scheduled_run(base, schedule, now) as (course, commit):
+        if course is not None:
+            commit()
+        return course
 
 
 def calendar_intervals(courses: list[dict]) -> list[dict]:
