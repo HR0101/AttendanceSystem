@@ -13,6 +13,7 @@ from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
     load_schedule, next_scheduled_run, registration_time, remove_agent, save_schedule,
     schedule_data, valid_time, update_schedule, validate_schedule,
+    schedule_digest, schedule_lock,
 )
 from .terminal_layout import color, fit_text, text_width, wrap_text
 from .text_input import TextCursor
@@ -81,6 +82,7 @@ class SchedulePanel:
         self.confirm_selection = 0
         self.start_preview = None
         self.message = ""
+        self.undo_state = None
         self.events = queue.Queue()
 
     def _reset_start_confirmation(self):
@@ -110,44 +112,49 @@ class SchedulePanel:
         self.owner.busy = False
         if error:
             self.message = error
-        else:
-            preview = result[3] if len(result) > 3 else None
-            self.data, self.active, self.message = result[:3]
-            self.fields = []
-            self.initial_fields = ()
-            self.editors = []
-            self.confirm_selection = 0
-            self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
-            if preview is None:
-                self.mode = "list"
-                self._reset_start_confirmation()
-            else:
-                self.mode = "confirm_start"
-                self.start_preview = preview
-                self.confirm_selection = 0
+            if self.data is None:
+                self.undo_state = None
+            return
+        if not isinstance(result, dict):
+            result = {"data": result[0], "active": result[1], "message": result[2],
+                      "preview": result[3] if len(result) > 3 else None}
+        self.data, self.active, self.message = result["data"], result["active"], result["message"]
+        if "undo_state" in result:
+            self.undo_state = result["undo_state"]
+        self.fields, self.initial_fields, self.editors = [], (), []
+        self._reset_start_confirmation()
+        self.index = min(result.get("index", self.index), max(0, len(self.data["courses"]) - 1))
+        self.start_preview = result.get("preview")
+        self.mode = "confirm_start" if self.start_preview else "list"
 
-    def open(self):
+    def open(self, *, clear_undo=False):
         if hasattr(self.owner, "expire_password"):
             self.owner.expire_password()
+        self._reset_start_confirmation()
         self.owner.modal = "schedule"
         self.mode = "list"
         self.fields = []
         self.initial_fields = ()
         self.editors = []
-        self._reset_start_confirmation()
         self.data = None
+        previous_undo = None if (clear_undo or self.owner.demo) else self.undo_state
 
         def read():
             base = self.owner.base
-            schedule_path = base / "schedule.json" if base is not None else None
-            has_file = schedule_path is not None and (schedule_path.is_symlink() or schedule_path.exists())
             if self.owner.demo:
-                data = schedule_data(load_schedule(schedule_path)) if has_file else self.empty_data()
-                return data, False, "デモ: 変更は保存されません。"
+                data = schedule_data(load_schedule(base / "schedule.json")) if base and (base / "schedule.json").exists() else self.empty_data()
+                return {"data": data, "active": False, "message": "デモ: 変更は保存されません。", "undo_state": None}
             if base is None:
                 raise ScheduleError("設定ファイルの場所を確認できません。")
-            data = schedule_data(load_schedule(schedule_path)) if has_file else self.empty_data()
-            return data, agent_installed(base), "Aで授業を追加できます。"
+            path = base / "schedule.json"
+            with schedule_lock(path, exclusive=False):
+                exists = path.exists()
+                data = schedule_data(load_schedule(path)) if exists else self.empty_data()
+                digest = schedule_digest(path) if exists else None
+            # 再読込(R)時はクリアし、画面を閉じて開き直した時は外部変更がなければ1段階の元に戻すを維持する。
+            undo_state = previous_undo if (previous_undo is not None and digest is not None and previous_undo.get("disk_sha256") == digest) else None
+            message = "Aで授業を追加できます。Zで直前の変更を元に戻せます。" if undo_state else "Aで授業を追加できます。"
+            return {"data": data, "active": agent_installed(base), "message": message, "undo_state": undo_state}
         self.work(read)
 
     @staticmethod
@@ -155,7 +162,108 @@ class SchedulePanel:
         today = date.today()
         return {"active_from": today.isoformat(), "active_until": date(today.year, 12, 31).isoformat(), "blackout_dates": [], "courses": []}
 
-    def persist(self, candidate, mutator=None, default_raw=None):
+    @staticmethod
+    def _sync_agent(base, schedule) -> bool:
+        """有効な授業があれば LaunchAgent を更新し、なければ削除する。失敗時は False を返す。"""
+        try:
+            if calendar_intervals(schedule["courses"]):
+                install_agent(base, schedule)
+            else:
+                remove_agent(base)
+            return True
+        except (ScheduleError, OSError):
+            return False
+
+    def undo(self):
+        """直前に成功した予定変更を1段階だけ元に戻す。"""
+        if self.undo_state is None:
+            self.message = "元に戻せる直前の予定変更はありません。"
+            return
+        state = self.undo_state
+        try:
+            restored = schedule_data(validate_schedule(state["data"]))
+        except ScheduleError as exc:
+            self.undo_state = None
+            self.message = f"直前の予定を復元できません（{exc}）。Rで再読込してください。"
+            return
+        active = self.active
+        restore_active = bool(state.get("restore_active"))
+        should_sync = active or restore_active
+        current_data = self.data
+        current_index = self.index
+        target_index = state.get("index", current_index)
+        label = state.get("label", "直前の予定変更")
+
+        def restore():
+            if self.owner.demo:
+                restored_active = bool(calendar_intervals(restored["courses"])) if should_sync else False
+                if should_sync and not active and restored_active:
+                    message = f"デモ: {label}を元に戻し、自動実行を再開しました（変更は保存されません）。"
+                else:
+                    message = f"デモ: {label}を元に戻しました（変更は保存されません）。"
+                return {
+                    "data": restored,
+                    "active": restored_active,
+                    "message": message,
+                    "undo_state": None,
+                    "index": target_index,
+                }
+            base = self.owner.base
+            if base is None:
+                raise ScheduleError("設定ファイルの場所を確認できません。")
+            path = base / "schedule.json"
+            expected_sha256 = state.get("disk_sha256")
+            try:
+                with schedule_lock(path, exclusive=True):
+                    if path.is_symlink():
+                        return {
+                            "data": current_data,
+                            "active": active,
+                            "message": "schedule.json がシンボリックリンクのため元に戻せません。Rで再読込して確認してください。",
+                            "undo_state": None,
+                            "index": current_index,
+                        }
+                    current_sha256 = schedule_digest(path)
+                    # 他プロセス・CLIによる更新や削除があれば、古い状態で上書きしない。
+                    if expected_sha256 is None or current_sha256 != expected_sha256:
+                        return {
+                            "data": current_data,
+                            "active": active,
+                            "message": "他の画面またはCLIで予定が変更されたため元に戻せません。Rで再読込してください。",
+                            "undo_state": None,
+                            "index": current_index,
+                        }
+                    schedule = validate_schedule(restored)
+                    save_schedule(path, restored)
+            except (ScheduleError, OSError) as exc:
+                return {
+                    "data": current_data,
+                    "active": active,
+                    "message": f"元に戻せず現在の予定を維持しました。\nZで再試行またはRで再読込してください。({exc})",
+                    "undo_state": state,
+                    "index": current_index,
+                }
+            synced = self._sync_agent(base, schedule) if should_sync else True
+            installed = agent_installed(base)
+            if should_sync and not synced:
+                action = "Iで停止→再開" if active else "Iで開始"
+                message = f"予定ファイルのみ保存済み。自動実行への反映に失敗しました。{action}またはRで再読込してください。"
+            elif should_sync and not active and installed:
+                message = f"{label}を元に戻し、自動実行を再開しました。"
+            elif should_sync:
+                message = f"{label}を元に戻し、自動実行に反映しました。"
+            else:
+                message = f"{label}を元に戻しました。"
+            return {
+                "data": restored,
+                "active": installed,
+                "message": message,
+                "undo_state": None,
+                "index": target_index,
+            }
+        self.work(restore)
+
+    def persist(self, candidate, mutator=None, default_raw=None, *, undo_label="予定の変更"):
         # 入力エラーはフォームを閉じずに表示する。
         try:
             candidate = schedule_data(validate_schedule(candidate))
@@ -163,26 +271,68 @@ class SchedulePanel:
             self.message = str(exc)
             return
         active = self.active
+        before_index = self.index
+        before_data = None
+        if self.data is not None:
+            try:
+                before_data = schedule_data(validate_schedule(self.data))
+            except ScheduleError:
+                before_data = copy.deepcopy(self.data)
+        changed = before_data is not None and candidate != before_data
+        previous_undo = self.undo_state
+
+        def make_undo(disk_sha256, *, restore_active=False):
+            if changed and undo_label is not None:
+                return {
+                    "data": before_data,
+                    "disk_sha256": disk_sha256,
+                    "label": undo_label,
+                    "index": before_index,
+                    "restore_active": restore_active,
+                }
+            return None
 
         def save():
+            nonlocal before_data, changed, candidate
+            schedule = validate_schedule(candidate)
+            has_enabled = bool(calendar_intervals(schedule["courses"]))
             if self.owner.demo:
-                return candidate, active, "デモ: 変更は保存されません。"
+                demo_active = bool(active and has_enabled)
+                restore_active = bool(active and not has_enabled)
+                new_undo = make_undo(None, restore_active=restore_active) if changed else previous_undo
+                message = "デモ: 変更は保存されません（Zで直前の変更を元に戻せます）。" if new_undo else "デモ: 変更は保存されません。"
+                return {"data": candidate, "active": demo_active, "message": message, "undo_state": new_undo}
             base = self.owner.base
+            if base is None:
+                raise ScheduleError("設定ファイルの場所を確認できません。")
             path = base / "schedule.json"
-            if mutator is None:
-                schedule = save_schedule(path, candidate)
+            with schedule_lock(path, exclusive=True):
+                before_data = schedule_data(load_schedule(path)) if path.exists() else copy.deepcopy(default_raw or self.data)
+                if mutator is None:
+                    schedule = save_schedule(path, candidate)
+                else:
+                    schedule = update_schedule(path, mutator, default_raw=default_raw, writer=save_schedule)
+                candidate = schedule_data(schedule)
+                has_enabled = bool(calendar_intervals(schedule["courses"]))
+                changed = before_data is not None and candidate != before_data
+                disk_sha256 = schedule_digest(path)
+            synced = self._sync_agent(base, schedule) if active else True
+            installed = agent_installed(base)
+            restore_active = bool(active and synced and not installed and not has_enabled)
+            if changed:
+                new_undo = make_undo(disk_sha256, restore_active=restore_active)
+            elif previous_undo is not None and disk_sha256 == previous_undo.get("disk_sha256"):
+                new_undo = previous_undo
             else:
-                schedule = update_schedule(path, mutator, default_raw=default_raw, writer=save_schedule)
-            saved = schedule_data(schedule)
-            if active:
-                try:
-                    if calendar_intervals(schedule["courses"]):
-                        install_agent(base, schedule)
-                    else:
-                        remove_agent(base)
-                except (ScheduleError, OSError):
-                    return saved, agent_installed(base), "保存済み。自動実行への反映に失敗。Iで停止→再開してください。"
-            return saved, agent_installed(base), "予定を保存し、自動実行に反映しました。" if active else "予定を保存しました。Iで自動実行を開始できます。"
+                new_undo = None
+            undo_hint = "（Zで直前の変更を元に戻せます）" if new_undo else ""
+            if active and not synced:
+                message = f"保存済み。自動実行への反映に失敗。Iで停止→再開してください。{undo_hint}"
+            elif active:
+                message = f"予定を保存し、自動実行に反映しました。{undo_hint}"
+            else:
+                message = f"予定を保存しました。Iで自動実行を開始できます。{undo_hint}"
+            return {"data": candidate, "active": installed, "message": message, "undo_state": new_undo}
         self.work(save)
 
     def _build_start_preview(self, candidate):
@@ -280,10 +430,12 @@ class SchedulePanel:
                             "確認中に既定ユーザーまたは実行条件が変更されました。新しい内容を確認してください。",
                             preview)
                 if self.owner.demo:
-                    return current, True, "デモ: 自動実行の状態は保存されません。"
+                    return {"data": current, "active": True, "message": "デモ: 自動実行の状態は保存されません。",
+                            "undo_state": {**self.undo_state, "restore_active": False} if self.undo_state else None}
                 save_schedule(base / "schedule.json", current)
                 install_agent(base, preview["schedule"])
-                return current, True, "自動実行を開始しました。GUIを閉じても動作します。"
+                return {"data": current, "active": True, "message": "自動実行を開始しました。GUIを閉じても動作します。",
+                        "undo_state": {**self.undo_state, "restore_active": False} if self.undo_state else None}
         self.work(start)
 
     def toggle_agent(self):
@@ -292,11 +444,13 @@ class SchedulePanel:
             return
         candidate = copy.deepcopy(self.data)
 
+        cleared_undo = {**self.undo_state, "restore_active": False} if self.undo_state else None
+
         def stop():
             if self.owner.demo:
-                return candidate, False, "デモ: 自動実行の状態は保存されません。"
+                return {"data": candidate, "active": False, "message": "デモ: 自動実行の状態は保存されません。", "undo_state": cleared_undo}
             remove_agent(self.owner.base)
-            return candidate, False, "自動実行を停止しました。"
+            return {"data": candidate, "active": False, "message": "自動実行を停止しました。", "undo_state": cleared_undo}
         self.work(stop)
 
     def form(self, mode):
@@ -442,6 +596,7 @@ class SchedulePanel:
             def mutator(current):
                 current.update(active_from=values[0], active_until=values[1], blackout_dates=list(blackouts))
                 return current
+            undo_label = "期間・休講日の変更"
         else:
             name, day, start, room, register, until = values
             day = _normalize_weekday(day)
@@ -457,13 +612,15 @@ class SchedulePanel:
                     edited = dict(course, enabled=current["courses"][idx].get("enabled", True))
                     current["courses"][idx] = edited
                     return current
+                undo_label = "授業の編集"
             else:
                 candidate["courses"].append(course)
 
                 def mutator(current):
                     current["courses"].append(copy.deepcopy(course))
                     return current
-        self.persist(candidate, mutator=mutator, default_raw=base_data)
+                undo_label = "授業の追加"
+        self.persist(candidate, mutator=mutator, default_raw=base_data, undo_label=undo_label)
 
     def handle(self, key):
         if self.owner.save_prompt.active:
@@ -475,7 +632,7 @@ class SchedulePanel:
             return
         if self.data is None:
             if key in ("r", "R"):
-                self.open()
+                self.open(clear_undo=True)
             elif key in ("l", "L"):
                 self.owner.open_logs(parent="schedule")
             return
@@ -506,7 +663,7 @@ class SchedulePanel:
                     idx = _find_course_index(current["courses"], before_course, index)
                     del current["courses"][idx]
                     return current
-                self.persist(candidate, mutator=mutator, default_raw=base_data)
+                self.persist(candidate, mutator=mutator, default_raw=base_data, undo_label="授業の削除")
             return
         if self.mode in ("add", "edit", "period"):
             if key == "\x13" or (enter and self.field_index == len(self.fields) - 1):
@@ -540,15 +697,17 @@ class SchedulePanel:
                 idx = _find_course_index(current["courses"], before_course, index)
                 current["courses"][idx]["enabled"] = not current["courses"][idx].get("enabled", True)
                 return current
-            self.persist(candidate, mutator=mutator, default_raw=base_data)
+            self.persist(candidate, mutator=mutator, default_raw=base_data, undo_label="授業の有効/無効切替")
         elif key in ("p", "P"):
             self.form("period")
         elif key in ("i", "I"):
             self.toggle_agent()
         elif key in ("l", "L"):
             self.owner.open_logs(parent="schedule")
+        elif key in ("z", "Z", "\x1a"):
+            self.undo()
         elif key in ("r", "R"):
-            self.open()
+            self.open(clear_undo=True)
 
     def _draw_confirm_start(self, canvas, top, left, width, height):
         inner = width - 6
@@ -636,9 +795,11 @@ class SchedulePanel:
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
             put(height - 4 + offset, line, color(4))
         footer = (
-            "Esc/Q: 戻る  R: 再読込  L: ログ" if self.mode == "list"
+            "Esc/Q:戻る R:再読込" if self.mode == "list"
             else "Tab/←→: 選択  Enter: 決定  Esc/Q: キャンセル" if self.mode == "confirm_start"
             else "Esc/Q: キャンセルして戻る" if self.mode == "delete"
             else "Esc: 戻る・保存確認  Ctrl+S: 保存  Ctrl+U: 全消去"
         )
+        if self.mode == "list" and self.data is not None:
+            footer += "  " + ("Z: 直前の変更を元に戻す" if self.undo_state else "(Z 元に戻す: 不可)")
         put(height - 2, footer, curses.A_DIM)
