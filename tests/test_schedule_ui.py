@@ -418,8 +418,9 @@ class SchedulePanelTests(unittest.TestCase):
 
     def test_demo_undo_does_not_touch_disk_lock_or_agent(self):
         original = self.path.read_bytes()
+        (self.base / "schedule.json.lock").unlink(missing_ok=True)
         self.ui.demo = True
-        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.remove_agent") as remove, patch("src.schedule_ui.save_schedule") as save, patch("src.schedule_ui.agent_installed") as installed:
+        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.remove_agent") as remove, patch("src.schedule_ui.save_schedule") as save, patch("src.schedule_ui.agent_installed") as installed, patch("src.schedule_ui.schedule_lock") as lock:
             self.panel.form("edit")
             self.panel.fields[0] = "デモ編集"
             self.panel.submit()
@@ -447,7 +448,9 @@ class SchedulePanelTests(unittest.TestCase):
             self.assertIn("元に戻せる直前の予定変更はありません", self.panel.message)
 
         self.assertEqual(self.path.read_bytes(), original)
+        self.assertFalse((self.base / "schedule.json.lock").exists())
         self.assertFalse((self.base / ".schedule.json.lock").exists())
+        lock.assert_not_called()
         install.assert_not_called()
         remove.assert_not_called()
         save.assert_not_called()
@@ -521,6 +524,231 @@ class SchedulePanelTests(unittest.TestCase):
             self.panel.handle("z")
             self.ui.poll()
         self.assertEqual(load_schedule(self.path)["courses"][0]["course_name"], "授業")
+
+    def test_undo_deleting_last_enabled_course_while_active_resumes_agent(self):
+        self.panel.active = True
+        installed = [True]
+
+        def install(*_args):
+            installed[0] = True
+
+        def remove(*_args):
+            installed[0] = False
+
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove) as remove_mock:
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            remove_mock.assert_called_once_with(self.base)
+            install_mock.assert_not_called()
+            self.assertFalse(self.panel.active)
+            self.assertTrue(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("z")
+            self.ui.poll()
+
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 1)
+        self.assertEqual(len(self.panel.data["courses"]), 1)
+        install_mock.assert_called_once()
+        self.assertTrue(self.panel.active)
+        self.assertIsNone(self.panel.undo_state)
+        self.assertIn("再開しました", self.panel.message)
+
+    def test_undo_disabling_last_course_while_active_resumes_agent(self):
+        self.panel.active = True
+        installed = [True]
+
+        def install(*_args):
+            installed[0] = True
+
+        def remove(*_args):
+            installed[0] = False
+
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove) as remove_mock:
+            self.panel.handle("t")
+            self.ui.poll()
+            remove_mock.assert_called_once_with(self.base)
+            self.assertFalse(self.panel.active)
+            self.assertFalse(load_schedule(self.path)["courses"][0]["enabled"])
+            self.assertTrue(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("z")
+            self.ui.poll()
+
+        self.assertTrue(load_schedule(self.path)["courses"][0]["enabled"])
+        self.assertTrue(self.panel.data["courses"][0]["enabled"])
+        install_mock.assert_called_once()
+        self.assertTrue(self.panel.active)
+        self.assertIn("再開しました", self.panel.message)
+
+    def test_undo_after_explicit_stop_with_i_does_not_restart_agent(self):
+        two_courses = {
+            **DATA,
+            "courses": [
+                DATA["courses"][0],
+                {"weekday": "wed", "start_time": "10:30", "room": "642", "course_name": "2件目", "enabled": True, "register_time": "", "register_until": ""},
+            ],
+        }
+        save_schedule(self.path, two_courses)
+        self.panel.data = copy.deepcopy(two_courses)
+        self.panel.active = True
+        installed = [True]
+
+        def install(*_args):
+            installed[0] = True
+
+        def remove(*_args):
+            installed[0] = False
+
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove) as remove_mock:
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.assertEqual(install_mock.call_count, 1)
+            self.assertTrue(self.panel.active)
+
+            self.panel.handle("i")
+            self.ui.poll()
+            remove_mock.assert_called_once_with(self.base)
+            self.assertFalse(self.panel.active)
+            self.assertFalse(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("z")
+            self.ui.poll()
+
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 2)
+        self.assertEqual(install_mock.call_count, 1)
+        self.assertFalse(self.panel.active)
+        self.assertNotIn("再開", self.panel.message)
+
+        # 直前に restore_active=True が設定されていた状態でも、明示停止(I)で必ず解除される。
+        self.panel.active = True
+        self.panel.undo_state = {
+            "data": copy.deepcopy(two_courses),
+            "disk_sha256": self.panel.undo_state["disk_sha256"] if self.panel.undo_state else None,
+            "label": "授業の削除",
+            "index": 0,
+            "restore_active": True,
+        }
+        save_schedule(self.path, DATA)
+        self.panel.data = copy.deepcopy(DATA)
+        from src.scheduler import schedule_digest
+        self.panel.undo_state["disk_sha256"] = schedule_digest(self.path)
+        installed[0] = True
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove):
+            self.panel.handle("i")
+            self.ui.poll()
+            self.assertFalse(self.panel.active)
+            self.assertFalse(self.panel.undo_state["restore_active"])
+            self.panel.handle("z")
+            self.ui.poll()
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 2)
+        install_mock.assert_not_called()
+        self.assertFalse(self.panel.active)
+
+    def test_undo_reopening_panel_preserves_restore_active_unless_externally_changed(self):
+        self.panel.active = True
+        installed = [True]
+
+        def install(*_args):
+            installed[0] = True
+
+        def remove(*_args):
+            installed[0] = False
+
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove):
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.assertFalse(self.panel.active)
+            self.assertTrue(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("\x1b")
+            self.assertIsNone(self.ui.modal)
+            self.panel.open()
+            self.ui.poll()
+            self.assertIsNotNone(self.panel.undo_state)
+            self.assertTrue(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("z")
+            self.ui.poll()
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 1)
+        install_mock.assert_called_once()
+        self.assertTrue(self.panel.active)
+
+        # 再閉開の間に外部変更があれば、restore_active ごと undo_state を破棄する。
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.install_agent", side_effect=install) as install_mock, patch("src.schedule_ui.remove_agent", side_effect=remove):
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.panel.handle("\x1b")
+            external = copy.deepcopy(DATA)
+            external["courses"][0]["room"] = "642"
+            save_schedule(self.path, external)
+            self.panel.open()
+            self.ui.poll()
+            self.assertIsNone(self.panel.undo_state)
+            self.panel.handle("z")
+            self.assertIn("元に戻せる直前の予定変更はありません", self.panel.message)
+        install_mock.assert_not_called()
+        self.assertFalse(self.panel.active)
+
+    def test_undo_resume_agent_failure_reports_partial_state(self):
+        self.panel.active = True
+        installed = [True]
+
+        def remove(*_args):
+            installed[0] = False
+
+        with patch("src.schedule_ui.agent_installed", side_effect=lambda _: installed[0]), patch("src.schedule_ui.remove_agent", side_effect=remove):
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.assertFalse(self.panel.active)
+
+        with patch("src.schedule_ui.install_agent", side_effect=ScheduleError("launchctl失敗")), patch("src.schedule_ui.agent_installed", return_value=False):
+            self.panel.handle("z")
+            self.ui.poll()
+
+        self.assertEqual(len(load_schedule(self.path)["courses"]), 1)
+        self.assertEqual(len(self.panel.data["courses"]), 1)
+        self.assertFalse(self.panel.active)
+        self.assertIsNone(self.panel.undo_state)
+        self.assertIn("反映に失敗", self.panel.message)
+        self.assertNotIn("元に戻し", self.panel.message)
+
+    def test_demo_deleting_last_course_while_active_and_undo_or_explicit_stop(self):
+        self.ui.demo = True
+        self.panel.active = True
+        with patch("src.schedule_ui.install_agent") as install, patch("src.schedule_ui.remove_agent") as remove:
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.assertFalse(self.panel.active)
+            self.assertTrue(self.panel.undo_state["restore_active"])
+
+            self.panel.handle("z")
+            self.ui.poll()
+            self.assertEqual(len(self.panel.data["courses"]), 1)
+            self.assertTrue(self.panel.active)
+            self.assertIn("再開しました", self.panel.message)
+
+            self.panel.handle("d")
+            self.panel.handle("\n")
+            self.ui.poll()
+            self.panel.handle("i")
+            self.ui.poll()
+            self.assertTrue(self.panel.active)
+            self.assertFalse(self.panel.undo_state["restore_active"])
+            self.panel.handle("i")
+            self.ui.poll()
+            self.assertFalse(self.panel.active)
+            self.panel.handle("z")
+            self.ui.poll()
+            self.assertEqual(len(self.panel.data["courses"]), 1)
+            self.assertFalse(self.panel.active)
+        install.assert_not_called()
+        remove.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
+import contextlib
+import fcntl
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
+from src import config
 from src.scheduler import (
     ScheduleError, calendar_intervals, due_course, registration_time,
     save_schedule, schedule_data, schedule_digest, schedule_lock, validate_schedule,
@@ -105,8 +112,10 @@ class SchedulerTests(unittest.TestCase):
             save_schedule(path, schedule_data(SCHEDULE))
             digest = schedule_digest(path)
             self.assertEqual(len(digest), 64)
+            lock_path = base / "schedule.json.lock"
+            lock_path.write_text("", encoding="utf-8")
+            os.chmod(lock_path, 0o644)
             with schedule_lock(path, exclusive=True):
-                lock_path = base / ".schedule.json.lock"
                 self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
                 with self.assertRaises(BlockingIOError):
                     with schedule_lock(path, exclusive=True, blocking=False):
@@ -117,11 +126,120 @@ class SchedulerTests(unittest.TestCase):
             path.symlink_to(target)
             with self.assertRaises(ScheduleError):
                 schedule_digest(path)
+            with self.assertRaises(ScheduleError):
+                save_schedule(path, schedule_data(SCHEDULE))
+            self.assertEqual(target.read_text(encoding="utf-8"), "{}")
             lock_path.unlink()
             lock_path.symlink_to(target)
             with self.assertRaises(ScheduleError):
                 with schedule_lock(path, exclusive=True):
                     pass
+            lock_path.unlink()
+            lock_path.mkdir()
+            with self.assertRaises(ScheduleError):
+                with schedule_lock(path, exclusive=True):
+                    pass
+            lock_path.rmdir()
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(lock_path, 0o600)
+                with self.assertRaises(ScheduleError):
+                    with schedule_lock(path, exclusive=True):
+                        pass
+
+    def test_schedule_lock_reentrancy_and_nonblocking_conflict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schedule.json"
+            with schedule_lock(path, exclusive=True, blocking=True):
+                with schedule_lock(path, exclusive=True, blocking=True):
+                    with schedule_lock(path, exclusive=False, blocking=True):
+                        with self.assertRaises(BlockingIOError):
+                            with schedule_lock(path, exclusive=True, blocking=False):
+                                pass
+            with schedule_lock(path, exclusive=False, blocking=True):
+                with schedule_lock(path, exclusive=False, blocking=False):
+                    pass
+                with self.assertRaises(BlockingIOError):
+                    with schedule_lock(path, exclusive=True, blocking=False):
+                        pass
+
+    def test_schedule_lock_excludes_independent_flock_and_subprocess(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = base / "schedule.json"
+            lock_path = base / "schedule.json.lock"
+
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with self.assertRaises(BlockingIOError):
+                    with schedule_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with schedule_lock(path, exclusive=False, blocking=False):
+                        pass
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            self.assertEqual([p.name for p in base.iterdir()], ["schedule.json.lock"])
+
+            with schedule_lock(path, exclusive=True):
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import fcntl, os, sys; "
+                            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600); "
+                            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+                        ),
+                        str(lock_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(probe.returncode, 0)
+                self.assertIn("BlockingIOError", probe.stderr)
+
+    def test_schedule_lock_delegates_to_config_private_file_lock_when_present(self):
+        calls = []
+
+        @contextlib.contextmanager
+        def fake_private_lock(target, *, exclusive=True, blocking=True):
+            calls.append((target, exclusive, blocking))
+            yield target.with_name(f"{target.name}.lock")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schedule.json"
+            with patch.object(config, "private_file_lock", fake_private_lock, create=True):
+                with schedule_lock(path, exclusive=False, blocking=True) as entered:
+                    self.assertEqual(entered, path.with_name("schedule.json.lock"))
+            self.assertEqual(calls, [(path, False, True)])
+
+            @contextlib.contextmanager
+            def symlink_error_lock(target, *, exclusive=True, blocking=True):
+                raise OSError("schedule.json.lock にシンボリックリンクは使用できません。")
+                yield
+
+            with patch.object(config, "private_file_lock", symlink_error_lock, create=True):
+                with self.assertRaises(ScheduleError):
+                    with schedule_lock(path, exclusive=True):
+                        pass
+
+            @contextlib.contextmanager
+            def blocking_error_lock(target, *, exclusive=True, blocking=True):
+                raise BlockingIOError("already locked")
+                yield
+
+            with patch.object(config, "private_file_lock", blocking_error_lock, create=True):
+                with self.assertRaises(BlockingIOError):
+                    with schedule_lock(path, exclusive=True, blocking=False):
+                        pass
+
+            with patch.object(config, "private_file_lock", fake_private_lock, create=True):
+                with self.assertRaises(PermissionError):
+                    with schedule_lock(path, exclusive=True):
+                        raise PermissionError("body error untouched")
 
 
 if __name__ == "__main__":

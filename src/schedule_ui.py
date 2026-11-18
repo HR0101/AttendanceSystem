@@ -135,22 +135,26 @@ class SchedulePanel:
         changed = before_data is not None and candidate != before_data
         previous_undo = self.undo_state
 
-        def make_undo(disk_sha256):
+        def make_undo(disk_sha256, *, restore_active=False):
             if changed and undo_label is not None:
                 return {
                     "data": before_data,
                     "disk_sha256": disk_sha256,
                     "label": undo_label,
                     "index": before_index,
+                    "restore_active": restore_active,
                 }
             return None
 
         def save():
             schedule = validate_schedule(candidate)
+            has_enabled = bool(calendar_intervals(schedule["courses"]))
             if self.owner.demo:
-                new_undo = make_undo(None) if changed else previous_undo
+                demo_active = bool(active and has_enabled)
+                restore_active = bool(active and not has_enabled)
+                new_undo = make_undo(None, restore_active=restore_active) if changed else previous_undo
                 message = "デモ: 変更は保存されません（Zで直前の変更を元に戻せます）。" if new_undo else "デモ: 変更は保存されません。"
-                return {"data": candidate, "active": active, "message": message, "undo_state": new_undo}
+                return {"data": candidate, "active": demo_active, "message": message, "undo_state": new_undo}
             base = self.owner.base
             if base is None:
                 raise ScheduleError("設定ファイルの場所を確認できません。")
@@ -158,14 +162,15 @@ class SchedulePanel:
             with schedule_lock(path, exclusive=True):
                 save_schedule(path, candidate)
                 disk_sha256 = schedule_digest(path)
+            synced = self._sync_agent(base, schedule) if active else True
+            installed = agent_installed(base)
+            restore_active = bool(active and synced and not installed and not has_enabled)
             if changed:
-                new_undo = make_undo(disk_sha256)
+                new_undo = make_undo(disk_sha256, restore_active=restore_active)
             elif previous_undo is not None and disk_sha256 == previous_undo.get("disk_sha256"):
                 new_undo = previous_undo
             else:
                 new_undo = None
-            synced = self._sync_agent(base, schedule) if active else True
-            installed = agent_installed(base)
             undo_hint = "（Zで直前の変更を元に戻せます）" if new_undo else ""
             if active and not synced:
                 message = f"保存済み。自動実行への反映に失敗。Iで停止→再開してください。{undo_hint}"
@@ -189,6 +194,8 @@ class SchedulePanel:
             self.message = f"直前の予定を復元できません（{exc}）。Rで再読込してください。"
             return
         active = self.active
+        restore_active = bool(state.get("restore_active"))
+        should_sync = active or restore_active
         current_data = self.data
         current_index = self.index
         target_index = state.get("index", current_index)
@@ -196,10 +203,15 @@ class SchedulePanel:
 
         def restore():
             if self.owner.demo:
+                restored_active = bool(calendar_intervals(restored["courses"])) if should_sync else False
+                if should_sync and not active and restored_active:
+                    message = f"デモ: {label}を元に戻し、自動実行を再開しました（変更は保存されません）。"
+                else:
+                    message = f"デモ: {label}を元に戻しました（変更は保存されません）。"
                 return {
                     "data": restored,
-                    "active": active,
-                    "message": f"デモ: {label}を元に戻しました（変更は保存されません）。",
+                    "active": restored_active,
+                    "message": message,
                     "undo_state": None,
                     "index": target_index,
                 }
@@ -238,11 +250,14 @@ class SchedulePanel:
                     "undo_state": state,
                     "index": current_index,
                 }
-            synced = self._sync_agent(base, schedule) if active else True
+            synced = self._sync_agent(base, schedule) if should_sync else True
             installed = agent_installed(base)
-            if active and not synced:
-                message = "予定ファイルのみ保存済み。自動実行への反映に失敗しました。Iで停止→再開またはRで再読込してください。"
-            elif active:
+            if should_sync and not synced:
+                action = "Iで停止→再開" if active else "Iで開始"
+                message = f"予定ファイルのみ保存済み。自動実行への反映に失敗しました。{action}またはRで再読込してください。"
+            elif should_sync and not active and installed:
+                message = f"{label}を元に戻し、自動実行を再開しました。"
+            elif should_sync:
                 message = f"{label}を元に戻し、自動実行に反映しました。"
             else:
                 message = f"{label}を元に戻しました。"
@@ -257,16 +272,29 @@ class SchedulePanel:
 
     def toggle_agent(self):
         active, candidate = self.active, copy.deepcopy(self.data)
+        previous_undo = self.undo_state
+        # 明示的な開始・停止後は、Zで直前の停止操作を取り消して意図せず再開しないようにする。
+        cleared_undo = {**previous_undo, "restore_active": False} if previous_undo is not None else None
 
         def toggle():
             if self.owner.demo:
-                return {"data": candidate, "active": not active, "message": "デモ: 自動実行の状態は保存されません。"}
+                return {
+                    "data": candidate,
+                    "active": not active,
+                    "message": "デモ: 自動実行の状態は保存されません。",
+                    "undo_state": cleared_undo,
+                }
             base = self.owner.base
             if base is None:
                 raise ScheduleError("設定ファイルの場所を確認できません。")
             if active:
                 remove_agent(base)
-                return {"data": candidate, "active": False, "message": "自動実行を停止しました。"}
+                return {
+                    "data": candidate,
+                    "active": False,
+                    "message": "自動実行を停止しました。",
+                    "undo_state": cleared_undo,
+                }
             config = load_config(base / "config.json")
             if not config["browser"]["headless"]:
                 raise ScheduleError("自動実行には browser.headless を true にしてください。")
@@ -278,7 +306,12 @@ class SchedulePanel:
             with schedule_lock(path, exclusive=True):
                 save_schedule(path, candidate)
             install_agent(base, schedule)
-            return {"data": candidate, "active": True, "message": "自動実行を開始しました。GUIを閉じても動作します。"}
+            return {
+                "data": candidate,
+                "active": True,
+                "message": "自動実行を開始しました。GUIを閉じても動作します。",
+                "undo_state": cleared_undo,
+            }
         self.work(toggle)
 
     def form(self, mode):
