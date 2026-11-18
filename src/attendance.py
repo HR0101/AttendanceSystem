@@ -20,7 +20,9 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
     logger.info("段階=教室URLへアクセス")
     page.goto(room_url, wait_until="domcontentloaded")
     _require_known_page(page, config, route)
+    logged_in = False
     if urlparse(page.url).path == "/attendance/login":
+        logged_in = True
         logger.info("段階=ログインフォーム入力")
         if page.locator("#userid").count() != 1 or page.locator("#password").count() != 1:
             raise AttendanceError("ログイン画面が変更されています。")
@@ -38,12 +40,13 @@ def run_attendance(page, config: dict, student_id: str, password: str, room: str
         if urlparse(page.url).path == "/attendance/login":
             raise AttendanceError("ログインを確認できません。IDまたはパスワードを確認してください。")
     logger.info("ログイン画面を通過")
-    # ログイン後に元のURLへ戻るかどうかはサーバー設定に依存するため、明示的に開く。
-    logger.info("段階=教室画面を再表示")
-    page.goto(room_url, wait_until="domcontentloaded")
-    _require_known_page(page, config, route)
-    if urlparse(page.url).path == "/attendance/login":
-        raise AttendanceError("教室URLへのアクセス後にログイン画面へ戻りました。")
+    if logged_in or urlparse(page.url).path != f"/attendance/class_room/{route}":
+        # ログイン後に元のURLへ戻るかどうかはサーバー設定に依存するため、明示的に開く。
+        logger.info("段階=教室画面を再表示")
+        page.goto(room_url, wait_until="domcontentloaded")
+        _require_known_page(page, config, route)
+        if urlparse(page.url).path == "/attendance/login":
+            raise AttendanceError("教室URLへのアクセス後にログイン画面へ戻りました。")
     require_student_identity(page, student_id)
     if page.locator("#errorModal").count():
         raise AttendanceError("出席画面にエラーが表示されています。")

@@ -1,6 +1,8 @@
 """複数選択、ユーザー別の認証・照合と一括登録。大学には接続しない。"""
 
 import curses
+import io
+import logging
 import threading
 import time
 import unittest
@@ -236,6 +238,48 @@ class MultiUserUITests(unittest.TestCase):
             self.assertIn("user1、user2", drawn)
             self.assertIn("2人を登録します（対象外 0人）", drawn)
             ui.confirm = False
+
+    def test_parallel_logs_include_anonymous_worker_ids_and_safe_failure_reasons(self):
+        stream = io.StringIO()
+        logger = logging.getLogger("test_multi_user_logs")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger.addHandler(handler)
+
+        users = [{"username": f"user{i}", "student_id": f"TEST00{i}"} for i in range(1, 4)]
+        config = {"users": users, "default_user": "user1", "_active_username": "user1", "dry_run": False}
+        ui = AttendanceScreen(config, "TEST001", "secret1", logger, "731", base=Path("/unused"))
+        ui.selected_user_ids = {user["student_id"] for user in users}
+
+        def credentials(cfg, path, *, interactive, username):
+            if username == "user2":
+                raise CredentialError("Keychainにパスワードがありません。")
+            return self.credentials(cfg, path, interactive=interactive, username=username)
+
+        def run(page, cfg, student_id, password, room, route, worker_logger, course, start, *, on_snapshot, expected_values):
+            worker_logger.info("段階=教室URLへアクセス")
+            if student_id == "TEST003":
+                raise AttendanceError("確認に失敗しました。")
+            on_snapshot(VALUES, False, False)
+            return "未出席（確認のみ）"
+
+        with patch("src.terminal_ui.get_credentials", side_effect=credentials), \
+                patch("src.browser.open_page", side_effect=lambda cfg: nullcontext(Mock())), \
+                patch("src.attendance.run_attendance", side_effect=run):
+            ui.start()
+            self.wait_for_operation(ui)
+
+        logs = stream.getvalue()
+        lines = logs.splitlines()
+        self.assertIn("INFO 対象=1/3 段階=教室URLへアクセス", lines)
+        self.assertIn("INFO 対象=1/3 画面操作 結果=未出席（確認のみ）", lines)
+        self.assertIn("ERROR 対象=2/3 画面操作停止 種別=CredentialError 理由=Keychainにパスワードがありません。", lines)
+        self.assertIn("INFO 対象=3/3 段階=教室URLへアクセス", lines)
+        self.assertIn("ERROR 対象=3/3 画面操作停止 種別=AttendanceError 理由=確認に失敗しました。", lines)
+        for pii in ("user1", "user2", "user3", "TEST001", "TEST002", "TEST003", "secret1", "secret2", "secret3"):
+            self.assertNotIn(pii, logs)
 
 
 if __name__ == "__main__":
