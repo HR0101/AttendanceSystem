@@ -22,6 +22,15 @@ from src.users import select_user
 from src.version import VERSION
 
 
+def _handle_interrupt(exc: BaseException, logger=None, started: float | None = None) -> int:
+    """Ctrl+C / Ctrl+D による中断を安全な終了コードとメッセージへ変換する。"""
+    is_ctrl_c = isinstance(exc, KeyboardInterrupt)
+    if logger is not None and started is not None:
+        logger.info("中断 種別=%s 所要時間=%.1f秒", type(exc).__name__, time.monotonic() - started)
+    print("処理を中断しました。" if is_ctrl_c else "入力を中断しました。", file=sys.stderr)
+    return 130 if is_ctrl_c else 1
+
+
 def schedule_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="att schedule", description="自動出席の予定を管理します。")
     parser.add_argument("action", choices=("status", "install", "remove"))
@@ -44,6 +53,8 @@ def schedule_command(argv: list[str]) -> int:
         path = install_agent(base, schedule)
         print(f"自動実行を登録しました: {path}")
         return 0
+    except (EOFError, KeyboardInterrupt) as exc:
+        return _handle_interrupt(exc)
     except (ScheduleError, ConfigurationError) as exc:
         print(f"自動実行を設定できません: {exc}", file=sys.stderr)
         return 1
@@ -114,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("結果=%s 所要時間=%.1f秒", result, time.monotonic() - started)
         print(f"結果: {result}")
         return 0
+    except (EOFError, KeyboardInterrupt) as exc:
+        return _handle_interrupt(exc, logger, started)
     except (ConfigurationError, CredentialError, AttendanceError, RoomError, ScheduleError) as exc:
         logger.error("失敗 種別=%s 理由=%s", type(exc).__name__, exc)
         print(f"処理を停止しました: {exc}", file=sys.stderr)

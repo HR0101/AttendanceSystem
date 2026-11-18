@@ -1,7 +1,7 @@
 """匿名の画面データで、対象の照合と安全な停止を確認する。"""
 
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
@@ -173,9 +173,97 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(snapshot.call_args.args[1])
         self.assertEqual(posts, [])
 
+    def test_redirect_to_top_without_login_still_re_navigates(self):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        expected_url = CONFIG["top_url"].replace("/top", "/class_room/7301")
+        visited = []
+
+        def serve(route):
+            visited.append(route.request.url)
+            if route.request.url == expected_url:
+                body = attendance_html() + ("<script>history.replaceState(null, '', '/attendance/top');</script>" if len(visited) == 1 else "")
+                route.fulfill(status=200, body=body, content_type="text/html; charset=utf-8")
+            else:
+                route.abort()
+
+        page.route("**/*", serve)
+        logger = Mock()
+        with patch.object(page, "goto", wraps=page.goto) as goto_spy:
+            result = run_attendance(page, dict(CONFIG, dry_run=True), "TEST001", "dummy", "731", "7301", logger)
+        self.assertEqual(result, "未出席（確認のみ）")
+        self.assertEqual(goto_spy.call_count, 2)
+        self.assertEqual(visited, [expected_url, expected_url])
+        self.assertIn("段階=教室画面を再表示", [call.args[0] for call in logger.info.call_args_list])
+
     def test_changed_course_after_redirect_still_stops(self):
         with self.assertRaisesRegex(AttendanceError, "予定した授業名"):
             self.run_with_mocked_page(attendance_html(), expected_course="別の授業", redirect_to_top=True)
+
+    def test_already_logged_in_skips_redundant_second_goto(self):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        get_urls = []
+
+        def serve(route):
+            get_urls.append((route.request.method, route.request.url))
+            if route.request.method == "GET" and route.request.url.endswith("/attendance/class_room/7301"):
+                route.fulfill(status=200, body=attendance_html(), content_type="text/html; charset=utf-8")
+            else:
+                route.abort()
+
+        page.route("**/*", serve)
+        logger = Mock()
+        with patch.object(page, "goto", wraps=page.goto) as goto_spy:
+            result = run_attendance(page, dict(CONFIG, dry_run=True), "TEST001", "dummy", "731", "7301", logger)
+        expected_url = CONFIG["top_url"].replace("/top", "/class_room/7301")
+        self.assertEqual(result, "未出席（確認のみ）")
+        goto_spy.assert_called_once_with(expected_url, wait_until="domcontentloaded")
+        self.assertEqual(get_urls, [("GET", expected_url)])
+        logged_stages = [call.args[0] for call in logger.info.call_args_list]
+        self.assertNotIn("段階=教室画面を再表示", logged_stages)
+
+    def test_redirect_or_login_re_navigates_to_room_url(self):
+        expected_url = CONFIG["top_url"].replace("/top", "/class_room/7301")
+        for post_login_action in ("/attendance/top", "/attendance/class_room/7301"):
+            with self.subTest(post_login_action=post_login_action):
+                page = self.browser.new_page()
+                self.addCleanup(page.close)
+                authenticated = False
+                get_urls = []
+
+                login_html = f"""<!doctype html><html lang="ja"><body>
+                    <script>history.replaceState(null, '', '/attendance/login');</script>
+                    <form method="post" action="{post_login_action}">
+                      <input id="userid" name="username">
+                      <input id="password" name="password">
+                      <button name="login" disabled>ログイン</button>
+                    </form>
+                    <script>document.querySelector('#password').addEventListener('keyup',
+                      () => document.querySelector('button[name=login]').disabled = false);</script>
+                </body></html>"""
+
+                def serve(route):
+                    nonlocal authenticated
+                    if route.request.method == "POST" and route.request.url.endswith(post_login_action):
+                        authenticated = True
+                        route.fulfill(status=200, body=attendance_html(), content_type="text/html; charset=utf-8")
+                    elif route.request.method == "GET" and route.request.url == expected_url:
+                        get_urls.append(route.request.url)
+                        body = attendance_html() if authenticated else login_html
+                        route.fulfill(status=200, body=body, content_type="text/html; charset=utf-8")
+                    else:
+                        route.abort()
+
+                page.route("**/*", serve)
+                logger = Mock()
+                with patch.object(page, "goto", wraps=page.goto) as goto_spy:
+                    result = run_attendance(page, dict(CONFIG, dry_run=True), "TEST001", "dummy", "731", "7301", logger)
+                self.assertEqual(result, "未出席（確認のみ）")
+                self.assertEqual(goto_spy.call_count, 2)
+                self.assertEqual(get_urls, [expected_url, expected_url])
+                logged_stages = [call.args[0] for call in logger.info.call_args_list]
+                self.assertIn("段階=教室画面を再表示", logged_stages)
 
     def test_wrong_url_stops(self):
         from src.attendance import _require_known_page
