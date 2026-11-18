@@ -23,7 +23,7 @@ from .logging_utils import setup_logging
 from .room import RoomError, parse_room
 from .scheduler import agent_installed
 from .verification import AttendanceError
-from .terminal_layout import Canvas, color, fit_text, text_width, wrap_text
+from .terminal_layout import Canvas, fit_text, init_colors, no_color_enabled, prefix_text, text_width, wrap_text
 from .users import change_student_id_config, get_users, remove_user_config, select_user, ui_selection, valid_username
 from .text_input import TextCursor
 from .unsaved_changes import SavePrompt
@@ -278,6 +278,9 @@ class AttendanceScreen:
         self.confirm_scroll = 0
         self.demo_state = "unattended"
         self.demo_attended = set()
+        self.message_error = False
+        self._account_notice = False
+        self.use_colors = not no_color_enabled()
         self.schedule_panel = SchedulePanel(self)
         self.log_tab = 0
         self.log_offset = 0
@@ -339,6 +342,7 @@ class AttendanceScreen:
         self.user_results = {}
         self.attended = self.unenrolled = self.checked = self.failed = self.cancelled = self.confirm = False
         self.confirm_scroll = 0
+        self.message_error = self._account_notice = False
         self.updated = "未確認"
 
     def request_cancel(self):
@@ -422,6 +426,8 @@ class AttendanceScreen:
             room, route = parse_room(self.room)
         except RoomError as exc:
             self.message = str(exc)
+            self.message_error = True
+            self._account_notice = False
             return
         if register and not self.can_register():
             return
@@ -436,6 +442,7 @@ class AttendanceScreen:
         self.cancel_event = cancel_event
         self.busy, self.confirm, self.confirm_scroll = True, False, 0
         self.failed = self.cancelled = False
+        self.message_error = self._account_notice = False
         self.message = f"{len(targets)}人の出席登録中…" if register else f"{len(targets)}人の授業情報を取得中…"
         # 古い授業情報は、新しい取得に成功するまで登録に利用しない。
         self.values = {}
@@ -538,6 +545,8 @@ class AttendanceScreen:
         self.unenrolled = bool(results) and all(result["unenrolled"] for result in results)
         self.failed = any(result["failed"] for result in results)
         self.cancelled = cancelled_any
+        self.message_error = self.failed
+        self._account_notice = False
         self.checked, self.busy = True, False
         self.updated = datetime.now().strftime("%H:%M:%S")
         if len(users) == 1:
@@ -548,7 +557,7 @@ class AttendanceScreen:
         else:
             attended = sum(result["attended"] for result in results)
             self.message = f"{'一括登録' if register else '確認'}完了: 出席済み {attended}/{len(users)}人。Uで個別結果を確認できます。"
-        self.history.appendleft((self.updated, self.room, self.message))
+        self.history.appendleft((self.updated, self.room, prefix_text("error", self.message) if self.failed else self.message))
 
     def poll(self):
         self.expire_password()
@@ -583,7 +592,8 @@ class AttendanceScreen:
                     state["unenrolled"] = True
                 if len(self.selected_user_ids) > 1:
                     name = next((user["username"] for user in self.selected_users() if user["student_id"] == student_id), student_id)
-                    self.history.appendleft((datetime.now().strftime("%H:%M:%S"), self.room, f"{name}: {result}"))
+                    entry = prefix_text("error", f"{name}: {result}") if kind == "user_error" else f"{name}: {result}"
+                    self.history.appendleft((datetime.now().strftime("%H:%M:%S"), self.room, entry))
             elif kind == "complete":
                 self.complete_attendance(data)
             elif kind == "account":
@@ -626,6 +636,8 @@ class AttendanceScreen:
                 self.back_after_save = False
                 self.form_parent_users = False
                 self.message = {"switch": f"{len(self.selected_user_ids)}人のユーザーを選択しました。", "add": "ユーザーを登録しました。Uで選択できます。", "rename": "ユーザーネームを変更しました。", "password": "保存パスワードを更新しました。", "default": f"既定ユーザーとこの画面の出席対象を「{config['_active_username']}」に切り替えました。", "delete": "ユーザーを削除しました。", "student_id": "学籍番号を変更しました。授業情報を再確認してください。"}[action]
+                self.message_error = False
+                self._account_notice = True
                 self.user_index = min(self.user_index, max(0, len(get_users(config)) - 1))
                 if action == "delete" and not get_users(config):
                     self.modal = "users"
@@ -643,16 +655,22 @@ class AttendanceScreen:
                     self.password_visible = False
                 self.form_error = data
                 self.message = data
+                self.message_error = True
+                self._account_notice = False
             else:
                 self.busy = False
                 self.message = data
                 self.updated = datetime.now().strftime("%H:%M:%S")
+                self._account_notice = False
                 if kind == "error":
                     self.values = {}
                     self.failed = True
-                elif data in ("出席登録成功", "出席済み", "デモ: 出席済み"):
-                    self.attended = True
-                self.history.appendleft((self.updated, self.room, self.message))
+                    self.message_error = True
+                else:
+                    self.message_error = False
+                    if data in ("出席登録成功", "出席済み", "デモ: 出席済み"):
+                        self.attended = True
+                self.history.appendleft((self.updated, self.room, prefix_text("error", self.message) if self.failed else self.message))
 
     def account_action(self, action, name, new_name="", student_id="", password=""):
         if self.busy:
@@ -664,6 +682,8 @@ class AttendanceScreen:
         self.busy = True
         self.form_error = ""
         self.message = "ユーザー情報を処理中…"
+        self.message_error = False
+        self._account_notice = True
         self.submitted_form = ((self.modal, list(self.form_values), list(self.form_editors), self.form_index,
                                 self.form_initial_values, self.form_parent_users, set(self.pending_user_ids))
                                if self.modal in ("add", "rename", "password", "student_id") and self.form_values else None)
@@ -1121,23 +1141,37 @@ class AttendanceScreen:
                 limit = 256 if self.modal == "password" or (self.modal == "add" and self.form_index == 2) else 60
                 self.form_values[self.form_index] = self.form_editors[self.form_index].edit(self.form_values[self.form_index], key, limit=limit)
 
+    def display_status_title(self, title=None, tone=None):
+        """色覚や NO_COLOR 環境でも状態種別を区別できるよう表示用接頭辞を付ける。"""
+        if title is None or tone is None:
+            title, tone, _ = self.status()
+        if tone == 3:
+            kind = "warning" if self.unenrolled and not self.failed else "error"
+        elif tone == 4:
+            kind = "warning"
+        elif tone == 2:
+            kind = "success"
+        else:
+            kind = ""
+        return prefix_text(kind, title)
+
     def draw(self, screen):
         screen.erase()
-        canvas = Canvas(screen)
+        canvas = Canvas(screen, use_colors=self.use_colors)
         height, width = canvas.height, canvas.width
         if height < 24 or width < 62:
             canvas.put(1, 1, "画面を広げてください（幅62 × 高さ24以上）。", curses.A_BOLD)
-            canvas.put(3, 1, self.status()[0])
+            canvas.put(3, 1, self.display_status_title())
             busy_hint = ("中断しています…" if self.cancel_event is not None and self.cancel_event.is_set()
                          else "処理中… Esc/Q: 中断" if self.cancel_event is not None
                          else "処理中… 完了までお待ちください。")
             canvas.put(5, 1, busy_hint if self.busy else "Q: 終了")
             if self.update_version:
-                canvas.put(7, 1, f"更新あり: v{self.update_version}", curses.A_BOLD)
+                canvas.put(7, 1, prefix_text("update", f"更新あり: v{self.update_version}"), curses.A_BOLD)
                 canvas.put(8, 1, "内容: att update --notes")
                 canvas.put(9, 1, "適用: att update")
             if self.save_prompt.active:
-                canvas.put(7, 1, "未保存の変更があります。画面を広げてください。")
+                canvas.put(11 if self.update_version else 7, 1, prefix_text("warning", "未保存の変更があります。画面を広げてください。"), curses.A_BOLD)
             screen.refresh()
             return
 
@@ -1146,15 +1180,15 @@ class AttendanceScreen:
         left = (width - total) // 2
         main_width = total - 32 if wide else total
         if self.update_version:
-            canvas.put(0, left, f"アップデートがあります: v{self.update_version}", color(4) | curses.A_BOLD, total)
-            canvas.put(4, left, "内容: att update --notes / 適用: att update", color(4), total)
+            canvas.put(0, left, prefix_text("update", f"アップデートがあります: v{self.update_version}"), canvas.color(4) | curses.A_BOLD, total)
+            canvas.put(4, left, "内容: att update --notes / 適用: att update", canvas.color(4), total)
         name = self.config.get("_active_username", self.student_id)
         default = select_user(self.config)
         is_default = default and default["student_id"] == self.student_id
-        canvas.put(1, left, "ATTENDANCE", color(1) | curses.A_BOLD)
+        canvas.put(1, left, "ATTENDANCE", canvas.color(1) | curses.A_BOLD)
         canvas.put(1, left + 13, "/ 出席確認", curses.A_BOLD)
-        mode = "DEMO / 接続なし" if self.demo else "確認のみ" if self.config.get("dry_run") else "出席登録"
-        canvas.put(1, left + total - 20, mode, color(4), 20)
+        mode = "[DEMO / 接続なし]" if self.demo else "[確認のみ]" if self.config.get("dry_run") else "[出席登録]"
+        canvas.put(1, left + total - 20, mode, canvas.color(4) | curses.A_BOLD, 20)
         if len(self.selected_user_ids) > 1:
             names = "、".join(user["username"] for user in self.selected_users())
             canvas.put(2, left, f"選択中 {len(self.selected_user_ids)}人: {names}", curses.A_BOLD, main_width - 1)
@@ -1167,14 +1201,15 @@ class AttendanceScreen:
             cursor = self.room_editor.sync(self.room)
             caret = self.room[cursor:cursor + 1] or "_"
             canvas.put(5, left + 1 + text_width("QR番号 [ ") + text_width(self.room[:cursor]),
-                       caret, color(1) | curses.A_REVERSE | curses.A_UNDERLINE | curses.A_BOLD, max(1, text_width(caret)))
+                       caret, canvas.color(1) | curses.A_REVERSE | curses.A_UNDERLINE | curses.A_BOLD, max(1, text_width(caret)))
         canvas.button(5, left + 28, "[ 更新 R ]", self.selected == 1, not self.busy)
         title, tone, detail = self.status()
-        canvas.fill(7, left, main_width, 2, color(tone) | curses.A_REVERSE)
-        canvas.put(7, left + 2, title, color(tone) | curses.A_REVERSE | curses.A_BOLD, main_width - 4)
-        canvas.put(8, left + 2, detail, color(tone) | curses.A_REVERSE, main_width - 4)
+        banner_attr = canvas.color(tone) | curses.A_REVERSE
+        canvas.fill(7, left, main_width, 2, banner_attr)
+        canvas.put(7, left + 2, self.display_status_title(title, tone), banner_attr | curses.A_BOLD, main_width - 4)
+        canvas.put(8, left + 2, detail, banner_attr, main_width - 4)
 
-        canvas.box(10, left, main_width, 7, "授業情報", color(1))
+        canvas.box(10, left, main_width, 7, "授業情報", canvas.color(1))
         course = self.values.get("授業名", "授業情報はまだ取得されていません")
         course_lines = wrap_text(course, main_width - 6)
         for index, line in enumerate(course_lines[:2]):
@@ -1190,15 +1225,18 @@ class AttendanceScreen:
         canvas.put(18, left + 27, f"最終確認 {self.updated}", curses.A_DIM, main_width - 27)
         canvas.button(19, left, "[ スケジュール登録 S ]", self.selected == 3, not self.busy)
         canvas.put(19, left + 30, "曜日・時刻・教室を設定", curses.A_DIM, main_width - 30)
-        for index, line in enumerate(wrap_text(self.message, main_width - 2)[:2]):
-            canvas.put(20 + index, left + 1, line, color(3 if self.failed or self.cancelled else 1), main_width - 2)
+        is_error_message = self.message_error or (self.failed and not self._account_notice)
+        display_message = prefix_text("error", self.message) if is_error_message else self.message
+        message_attr = (canvas.color(3) | curses.A_BOLD) if is_error_message else canvas.color(1)
+        for index, line in enumerate(wrap_text(display_message, main_width - 2)[:2]):
+            canvas.put(20 + index, left + 1, line, message_attr, main_width - 2)
 
         if wide:
             side = left + main_width + 2
-            canvas.box(5, side, 30, 7, "操作ガイド", color(1))
+            canvas.box(5, side, 30, 7, "操作ガイド", canvas.color(1))
             for row, text in enumerate(("Enter  選択項目を実行", "R 更新 / U ユーザー", "S      自動出席の予定", "L      ログを表示", "H ヘルプ / Q 終了"), 6):
                 canvas.put(row, side + 2, text, width=26)
-            canvas.box(13, side, 30, min(height - 17, 14), "今回の操作履歴", color(1))
+            canvas.box(13, side, 30, min(height - 17, 14), "今回の操作履歴", canvas.color(1))
             if not self.history:
                 canvas.put(15, side + 2, "まだ操作はありません", curses.A_DIM, 26)
             for index, (stamp, qr, message) in enumerate(list(self.history)[:max(0, (min(height - 17, 14) - 2) // 3)]):
@@ -1206,7 +1244,7 @@ class AttendanceScreen:
                 canvas.put(row, side + 2, f"{stamp}  QR {qr}", curses.A_DIM, 26)
                 canvas.put(row + 1, side + 2, message, width=26)
         elif height >= 29:
-            canvas.box(23, left, main_width, height - 26, "今回の操作履歴", color(1))
+            canvas.box(23, left, main_width, height - 26, "今回の操作履歴", canvas.color(1))
             for index, (stamp, qr, message) in enumerate(list(self.history)[:height - 28]):
                 canvas.put(24 + index, left + 2, f"{stamp}  QR {qr}  {message}", width=main_width - 4)
         footer = ("Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 L ログ H ヘルプ Q 終了" if total >= 68
@@ -1339,7 +1377,7 @@ class AttendanceScreen:
         left = (canvas.width - width) // 2
         top = max(1, (canvas.height - height) // 2)
         inner = width - 6
-        canvas.box(top, left, width, height, "出席登録の確認", color(4))
+        canvas.box(top, left, width, height, prefix_text("warning", "出席登録の確認"), canvas.color(4))
 
         entries = self.confirmation_entries()
         eligible_entries = [entry for entry in entries if entry["eligible"]]
@@ -1367,7 +1405,7 @@ class AttendanceScreen:
                 preview = "対象: " + names
             canvas.put(top + 2, left + 3, preview, curses.A_BOLD, inner)
         else:
-            canvas.put(top + 2, left + 3, "対象: なし（登録できるユーザーはいません）", color(3) | curses.A_BOLD, inner)
+            canvas.put(top + 2, left + 3, "対象: なし（登録できるユーザーはいません）", canvas.color(3) | curses.A_BOLD, inner)
 
         canvas.put(top + 3, left + 3, "授業名", curses.A_DIM, 6)
         canvas.put(top + 3, left + 11, self.values.get("授業名", "--"), curses.A_BOLD, inner - 8)
@@ -1381,22 +1419,22 @@ class AttendanceScreen:
         canvas.put(top + 5, left + 11, time_range, curses.A_BOLD, inner - 8)
 
         list_header = "選択ユーザー一覧（↑↓/PgUp/PgDnで移動）" if total > per_page else "選択ユーザー一覧"
-        canvas.put(top + 6, left + 3, list_header, color(1), inner)
+        canvas.put(top + 6, left + 3, list_header, canvas.color(1), inner)
         for index, entry in enumerate(visible):
             row = top + 7 + index * 2
             prefix = "[+] " if entry["eligible"] else "[-] "
             user_line = self._format_confirmation_user(prefix, entry["username"], entry["student_id"], inner)
-            user_attr = (color(2) | curses.A_BOLD) if entry["eligible"] else curses.A_BOLD
+            user_attr = (canvas.color(2) | curses.A_BOLD) if entry["eligible"] else curses.A_BOLD
             canvas.put(row, left + 3, user_line, user_attr, inner)
             reason_line = "    登録対象" if entry["eligible"] else f"    対象外: {entry['reason']}"
-            reason_attr = color(2) if entry["eligible"] else color(3 if entry["reason"] in ("確認失敗", "授業情報不一致") else 4)
+            reason_attr = canvas.color(2) if entry["eligible"] else canvas.color(3 if entry["reason"] in ("確認失敗", "授業情報不一致") else 4)
             canvas.put(row + 1, left + 3, reason_line, reason_attr, inner)
 
         canvas.put(top + height - 5, left + 3, f"{eligible_count}人を登録します（対象外 {excluded_count}人）。", width=inner)
         can_reg = self.can_register()
         if not can_reg:
             note = "確認のみモードのため登録できません。" if self.config.get("dry_run") else "登録できる対象ユーザーがいません。"
-            canvas.put(top + height - 4, left + 3, note, color(3), inner)
+            canvas.put(top + height - 4, left + 3, note, canvas.color(3), inner)
         elif total > per_page:
             canvas.put(top + height - 4, left + 3, f"↑↓/PgUp/PgDn でスクロール（{start}-{end} / {total}人）", curses.A_DIM, inner)
 
@@ -1411,11 +1449,11 @@ class AttendanceScreen:
         left = (canvas.width - width) // 2
         top = (canvas.height - height) // 2
         inner_width = max(10, width - 6)
-        canvas.box(top, left, width, height, "ログ確認", color(1))
+        canvas.box(top, left, width, height, "ログ確認", canvas.color(1))
         x = left + 3
         for index, (_, label) in enumerate(LOG_TABS):
             tab = f" {label} "
-            attr = (color(1) | curses.A_REVERSE | curses.A_BOLD) if index == self.log_tab else curses.A_DIM
+            attr = (canvas.color(1) | curses.A_REVERSE | curses.A_BOLD) if index == self.log_tab else curses.A_DIM
             canvas.put(top + 1, x, tab, attr, left + width - 3 - x)
             x += text_width(tab) + 1
         wrapped = [part for line in self.log_lines for part in wrap_text(line, inner_width)] if self.log_lines else []
@@ -1430,7 +1468,7 @@ class AttendanceScreen:
             pos = f"{'末尾 ' if self.log_offset == 0 else ''}{start + 1}-{end}/{len(wrapped)}行"
             canvas.put(top + 2, left + 3, f"{self.log_source} ({pos})", curses.A_DIM, inner_width)
             for row, line in enumerate(wrapped[start:end], top + 3):
-                attr = color(3) if " ERROR " in line or "失敗" in line else 0
+                attr = canvas.color(3) if " ERROR " in line or "失敗" in line else 0
                 canvas.put(row, left + 3, line, attr, inner_width)
         else:
             canvas.put(top + 2, left + 3, self.log_source, curses.A_DIM, inner_width)
@@ -1450,7 +1488,7 @@ class AttendanceScreen:
         height = min(canvas.height - 4, 20)
         top = (canvas.height - height) // 2
         title = {"users": "ユーザー選択・管理", "user_result": "ユーザーごとの結果", "add": "ユーザー登録", "rename": "ユーザーネームの変更", "password": "保存パスワードの変更", "student_id": "学籍番号の変更", "delete": "ユーザーの削除", "default": "既定ユーザーを変更", "help": "操作ヘルプ"}[self.modal]
-        canvas.box(top, left, width, height, title, color(1))
+        canvas.box(top, left, width, height, title, canvas.color(1))
         if self.modal == "users":
             users = get_users(self.config)
             default = select_user(self.config)
@@ -1465,21 +1503,31 @@ class AttendanceScreen:
                 attr = curses.A_REVERSE if index == self.user_index else 0
                 canvas.fill(row, left + 2, width - 4, 1, attr)
                 canvas.put(row, left + 3, f"{marker} {user['username']} / {user['student_id']}{tags}", attr, width - 6)
-                result = self.user_results.get(user["student_id"], {}).get("result", "未確認")
-                canvas.put(row + 1, left + 7, result, curses.A_DIM, width - 10)
-            canvas.put(top + height - 6, left + 3, "A 追加  N 名前変更  P パスワード変更", color(1), width - 6)
-            canvas.put(top + height - 5, left + 3, "I 学籍番号変更  X 削除", color(1), width - 6)
-            canvas.put(top + height - 4, left + 3, "D 既定に設定  V 結果の詳細", color(1), width - 6)
-            canvas.put(top + height - 3, left + 3, self.form_error or "Esc/Qで戻る（変更があれば保存確認）。", color(3) if self.form_error else curses.A_DIM, width - 6)
+                entry = self.user_results.get(user["student_id"], {})
+                result = entry.get("result", "未確認")
+                if entry.get("failed"):
+                    result = prefix_text("error", result)
+                    result_attr = canvas.color(3) | curses.A_BOLD
+                else:
+                    result_attr = curses.A_DIM
+                canvas.put(row + 1, left + 7, result, result_attr, width - 10)
+            canvas.put(top + height - 6, left + 3, "A 追加  N 名前変更  P パスワード変更", canvas.color(1), width - 6)
+            canvas.put(top + height - 5, left + 3, "I 学籍番号変更  X 削除", canvas.color(1), width - 6)
+            canvas.put(top + height - 4, left + 3, "D 既定に設定  V 結果の詳細", canvas.color(1), width - 6)
+            error_text = prefix_text("error", self.form_error) if self.form_error else ""
+            canvas.put(top + height - 3, left + 3, error_text or "Esc/Qで戻る（変更があれば保存確認）。", (canvas.color(3) | curses.A_BOLD) if self.form_error else curses.A_DIM, width - 6)
         elif self.modal == "user_result":
             user = get_users(self.config)[self.user_index]
             canvas.put(top + 2, left + 3, f"{user['username']} / {user['student_id']}", curses.A_BOLD, width - 6)
             result = self.user_results.get(user["student_id"], {})
             details = result.get("result", "未確認です。ユーザーを選択して授業情報を取得してください。")
+            if result.get("failed"):
+                details = prefix_text("error", details)
             if result.get("values"):
                 details += "\n\n" + "\n".join(f"{label}: {value}" for label, value in result["values"].items())
             for index, line in enumerate(wrap_text(details, width - 6)[:height - 7]):
-                canvas.put(top + 4 + index, left + 3, line, width=width - 6)
+                attr = (canvas.color(3) | curses.A_BOLD) if result.get("failed") and index == 0 else 0
+                canvas.put(top + 4 + index, left + 3, line, attr, width - 6)
         elif self.modal == "delete":
             user = get_users(self.config)[self.user_index]
             canvas.put(top + 2, left + 3, user["username"], curses.A_BOLD, width - 6)
@@ -1514,9 +1562,9 @@ class AttendanceScreen:
             guide = "Ctrl+S/最後Enter: 保存"
             if self.modal in ("add", "password"):
                 guide += "  F2/Ctrl+T: " + ("隠す" if self.password_visible else "パスワード表示")
-            canvas.put(top + height - 5, left + 3, guide, color(1), width - 6)
-            footer_text = self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。")
-            footer_attr = color(3) if self.form_error else curses.A_DIM
+            canvas.put(top + height - 5, left + 3, guide, canvas.color(1), width - 6)
+            footer_text = prefix_text("error", self.form_error) if self.form_error else ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。")
+            footer_attr = canvas.color(3) if self.form_error else curses.A_DIM
             for offset, line in enumerate(wrap_text(footer_text, width - 6)[:2]):
                 canvas.put(top + height - 4 + offset, left + 3, line, footer_attr, width - 6)
         elif self.modal == "default":
@@ -1525,7 +1573,7 @@ class AttendanceScreen:
                 user = users[min(self.user_index, len(users) - 1)]
                 if self._default_agent_active is _UNSET:
                     self._default_agent_active = self._automation_active()
-                canvas.put(top + 2, left + 3, f"変更先: {user['username']} ({user['student_id']})", curses.A_BOLD, width - 6)
+                canvas.put(top + 2, left + 3, prefix_text("warning", f"変更先: {user['username']} ({user['student_id']})"), curses.A_BOLD, width - 6)
                 paragraphs = [wrap_text(entry, width - 6) for entry in self.default_switch_impact(user, agent_active=self._default_agent_active)]
                 row, limit = top + 4, top + height - 6
                 spaced = sum(len(lines) for lines in paragraphs) + max(0, len(paragraphs) - 1) <= limit - row
@@ -1561,15 +1609,7 @@ class AttendanceScreen:
             curses.curs_set(0)
         except curses.error:
             pass
-        if curses.has_colors():
-            curses.start_color()
-            background = -1
-            try:
-                curses.use_default_colors()
-            except curses.error:
-                background = curses.COLOR_BLACK
-            for number, foreground in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW), 1):
-                curses.init_pair(number, foreground, background)
+        self.use_colors = init_colors()
         screen.keypad(True)
         screen.timeout(100)
         try:
