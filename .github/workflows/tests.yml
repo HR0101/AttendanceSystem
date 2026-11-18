@@ -25,7 +25,8 @@ jobs:
       - name: Validate update notes
         run: python scripts/check_update_notes.py --ci
       # ロックファイルのハッシュと一致する wheel だけを導入する。
-      - run: python -m pip install --no-input --require-hashes --only-binary=:all: -r requirements.lock
+      - run: |
+          python -m pip install --no-input --require-hashes --only-binary=:all: -r requirements.lock
       - run: python -m playwright install --with-deps chromium
       - name: Audit dependencies
         # 監査ツールはテスト用の環境と分け、既知の脆弱性があれば失敗させる。

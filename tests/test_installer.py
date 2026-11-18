@@ -167,6 +167,15 @@ class WorkflowSupplyChainTests(unittest.TestCase):
     def test_ci_workflow_requires_hashes_and_binary_wheels_for_all_pip_installs(self):
         workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         self.assertRegex(workflow, r"(?m)^  test:\s*$")
+        for line_number, line in enumerate(workflow.splitlines(), start=1):
+            match = re.match(r"^\s*(?:-\s*)?[A-Za-z0-9_-]+:\s+(.+)$", line)
+            if match:
+                value = match.group(1).strip()
+                if value not in ("|", "|-", ">", ">-") and not value.startswith(("'", '"', "#")):
+                    self.assertNotIn(
+                        ": ", value.split(" #", 1)[0],
+                        f"tests.yml line {line_number} contains ': ' inside an unquoted plain YAML scalar",
+                    )
         pip_install_lines = [
             line.strip() for line in workflow.splitlines()
             if not line.lstrip().startswith("#") and re.search(r"\bpip\s+install\b", line)
