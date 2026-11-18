@@ -36,11 +36,15 @@ class ScheduleError(Exception):
     pass
 
 
-def _valid_time(value) -> bool:
+def valid_time(value) -> bool:
+    """HH:MM 形式の時刻かどうかを判定する。"""
     return (isinstance(value, str) and len(value) == 5 and value[2] == ":"
             and value[:2].isascii() and value[3:].isascii()
             and value[:2].isdecimal() and value[3:].isdecimal()
             and int(value[:2]) < 24 and int(value[3:]) < 60)
+
+
+_valid_time = valid_time
 
 
 def load_schedule(path: Path) -> dict:

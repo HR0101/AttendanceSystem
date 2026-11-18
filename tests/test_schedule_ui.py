@@ -173,7 +173,7 @@ class SchedulePanelTests(unittest.TestCase):
             self.ui.poll()
             self.assertEqual(load_schedule(self.path)["active_until"].isoformat(), "2026-12-25")
             self.panel.handle("a")
-            self.panel.fields[2] = "99:99"
+            self.panel.fields = ["不正な授業", "mon", "99:99", "731", "", ""]
             self.panel.field_index = 2
             self.panel.handle("\x13")
             self.assertEqual(self.panel.mode, "add")
