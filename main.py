@@ -31,9 +31,11 @@ from src.users import select_user
 from src.version import VERSION
 
 
-_NON_CONSUMING_RESULTS = frozenset({
-    "未出席（確認のみ）",
-    "出席受付対象なし（受付時間外の可能性・出席操作なし）",
+# 当日の実行枠を消費するのは出席完了を確認できた結果（出席登録成功・出席済み）のみ。
+# 履修登録なし・受付対象なし・確認のみ等の未完了結果では確定せず、修正後の同一枠内再試行を許す。
+_CONSUMING_RESULTS = frozenset({
+    "出席登録成功",
+    "出席済み",
 })
 
 
@@ -142,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_start = course["start_time"]
                 logger.info("自動実行対象 開始=%s 教室=%s", expected_start, room)
                 result = _execute_attendance(config, base, args, room, route, logger, expected_course, expected_start)
-                if commit is not None and not dry_run and result not in _NON_CONSUMING_RESULTS:
+                if commit is not None and not dry_run and result in _CONSUMING_RESULTS:
                     commit()
         else:
             room, route = parse_room(args.room) if args.room is not None else ask_room()

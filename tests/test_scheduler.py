@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import logging
@@ -239,11 +240,14 @@ class ScheduledExecutionAndLaunchAgentTests(unittest.TestCase):
         config: dict,
         now: datetime,
         *,
+        base: Path | None = None,
         run_attendance_mock=None,
         get_credentials_mock=None,
         open_page_mock=None,
         setup_logging_mock=None,
     ) -> int:
+        target_base = base or self.base
+
         class FixedDatetime(datetime):
             @classmethod
             def now(cls, tz=None):
@@ -274,9 +278,9 @@ class ScheduledExecutionAndLaunchAgentTests(unittest.TestCase):
             if setup_logging_mock is not None
             else nullcontext()
         )
-        with patch.object(app_main, "__file__", str(self.base / "main.py")), \
+        with patch.object(app_main, "__file__", str(target_base / "main.py")), \
                 patch.object(app_main, "datetime", FixedDatetime), \
-                patch.object(app_main, "load_config", side_effect=lambda *_: dict(config)), \
+                patch.object(app_main, "load_config", side_effect=lambda *_: copy.deepcopy(config)), \
                 patch.object(app_main, "load_schedule", return_value=schedule), \
                 cred_patch, page_patch, attend_patch, log_patch, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -401,6 +405,173 @@ class ScheduledExecutionAndLaunchAgentTests(unittest.TestCase):
             0,
         )
         attend.assert_called_once()
+
+    def test_scheduled_non_completed_outcomes_do_not_consume_slot_and_allow_retry(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+        now = datetime(2026, 10, 5, 14, 5)
+        expected_key = _run_key(course["weekday"], course["start_time"], now.date())
+        non_completed_outcomes = (
+            "履修登録なし（出席操作なし）",
+            "履修登録なし・出席済み表示（仮登録の可能性、要確認）",
+            "履修登録なし（登録後に警告を検出・要確認）",
+            "出席受付対象なし（受付時間外の可能性・出席操作なし）",
+            "未出席（確認のみ）",
+        )
+
+        for idx, outcome in enumerate(non_completed_outcomes):
+            with self.subTest(outcome=outcome):
+                case_base = self.root / f"non-completed-{idx}"
+                case_base.mkdir()
+                attend = Mock(side_effect=[outcome, "出席登録成功"])
+
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled"], schedule, config, now,
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 1)
+                self.assertFalse((case_base / "logs" / "schedule-runs.json").exists())
+                self.assertEqual(list((case_base / "logs").glob(".schedule-claim-*.lock")), [])
+                self.assertEqual(due_scheduled_course(case_base, schedule, now, record=False), course)
+
+                # 状態修正後に受付枠・猶予枠内で再試行すると登録を実行し、成功時に実行記録を作成する。
+                retry_now = now + timedelta(minutes=1)
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled"], schedule, config, retry_now,
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 2)
+                runs_path = case_base / "logs" / "schedule-runs.json"
+                self.assertTrue(runs_path.is_file())
+                self.assertIn(expected_key, json.loads(runs_path.read_text(encoding="utf-8"))["runs"])
+                self.assertEqual(list((case_base / "logs").glob(".schedule-claim-*.lock")), [])
+                self.assertIsNone(due_scheduled_course(case_base, schedule, retry_now, record=False))
+
+                # 確定後は同じ猶予枠内で再実行されない。
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled"], schedule, config, now + timedelta(minutes=2),
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 2)
+
+    def test_scheduled_unenrolled_then_user_fix_retry_succeeds(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        now = datetime(2026, 10, 5, 14, 5)
+        config_a = {
+            "users": [
+                {"username": "A", "student_id": "A1"},
+                {"username": "B", "student_id": "B2"},
+            ],
+            "default_user": "A",
+            "dry_run": False,
+        }
+        config_b = dict(config_a, default_user="B")
+        seen_student_ids = []
+
+        def fake_credentials(cfg, *args, **kwargs):
+            active = cfg["default_user"]
+            cfg["_active_username"] = active
+            student_id = next(user["student_id"] for user in cfg["users"] if user["username"] == active)
+            return student_id, "dummy"
+
+        def fake_attend(page, cfg, student_id, *args, **kwargs):
+            seen_student_ids.append(student_id)
+            return "履修登録なし（出席操作なし）" if student_id == "A1" else "出席登録成功"
+
+        # 既定ユーザーAで未履修になっても当日枠を消費しない。
+        self.assertEqual(
+            self._run_scheduled_main(
+                ["--scheduled"], schedule, config_a, now,
+                get_credentials_mock=Mock(side_effect=fake_credentials),
+                run_attendance_mock=Mock(side_effect=fake_attend),
+            ),
+            0,
+        )
+        self.assertEqual(seen_student_ids, ["A1"])
+        self.assertFalse((self.base / "logs" / "schedule-runs.json").exists())
+        self.assertEqual(list((self.base / "logs").glob(".schedule-claim-*.lock")), [])
+
+        # 既定ユーザーをBへ変更して受付枠内に再試行すると登録成功し、以降同日は再実行されない。
+        self.assertEqual(
+            self._run_scheduled_main(
+                ["--scheduled"], schedule, config_b, now + timedelta(minutes=1),
+                get_credentials_mock=Mock(side_effect=fake_credentials),
+                run_attendance_mock=Mock(side_effect=fake_attend),
+            ),
+            0,
+        )
+        self.assertEqual(seen_student_ids, ["A1", "B2"])
+        self.assertTrue((self.base / "logs" / "schedule-runs.json").is_file())
+        self.assertEqual(list((self.base / "logs").glob(".schedule-claim-*.lock")), [])
+
+        self.assertEqual(
+            self._run_scheduled_main(
+                ["--scheduled"], schedule, config_b, now + timedelta(minutes=2),
+                get_credentials_mock=Mock(side_effect=fake_credentials),
+                run_attendance_mock=Mock(side_effect=fake_attend),
+            ),
+            0,
+        )
+        self.assertEqual(seen_student_ids, ["A1", "B2"])
+
+    def test_scheduled_confirmed_completion_outcomes_consume_daily_slot(self):
+        course = dict(COURSE, register_time="14:05", register_until="14:05")
+        schedule = dict(SCHEDULE, courses=[course])
+        config = {"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test", "dry_run": False}
+        now = datetime(2026, 10, 5, 14, 5)
+        expected_key = _run_key(course["weekday"], course["start_time"], now.date())
+
+        for idx, outcome in enumerate(("出席済み", "出席登録成功")):
+            with self.subTest(outcome=outcome):
+                case_base = self.root / f"confirmed-{idx}"
+                case_base.mkdir()
+                attend = Mock(return_value=outcome)
+
+                # --check 時は「出席済み」が返っても当日枠を消費しない。
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled", "--check"], schedule, config, now,
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 1)
+                self.assertFalse((case_base / "logs" / "schedule-runs.json").exists())
+
+                # 本番実行で完了結果が返ると当日記録を確定し、同日の猶予枠内再実行を抑止する。
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled"], schedule, config, now,
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 2)
+                runs_path = case_base / "logs" / "schedule-runs.json"
+                self.assertTrue(runs_path.is_file())
+                self.assertIn(expected_key, json.loads(runs_path.read_text(encoding="utf-8"))["runs"])
+                self.assertEqual(list((case_base / "logs").glob(".schedule-claim-*.lock")), [])
+                self.assertIsNone(due_scheduled_course(case_base, schedule, now + timedelta(minutes=1), record=False))
+
+                self.assertEqual(
+                    self._run_scheduled_main(
+                        ["--scheduled"], schedule, config, now + timedelta(minutes=1),
+                        base=case_base, run_attendance_mock=attend,
+                    ),
+                    0,
+                )
+                self.assertEqual(attend.call_count, 2)
 
     def test_concurrent_scheduled_runs_exclude_in_flight_claim_and_release_cleanly(self):
         course = dict(COURSE, register_time="14:05", register_until="14:05")
