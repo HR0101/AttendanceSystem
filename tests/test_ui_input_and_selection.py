@@ -172,6 +172,31 @@ class UIInputAndSelectionTests(unittest.TestCase):
         self.assertEqual(ui.room, "761")
         start.assert_called_once_with()
 
+    def test_qr_input_accepts_fullwidth_and_four_digit_route_numbers(self):
+        for keys, expected_room, expected_route in (
+            (["６", "４", "２", "\n", "q"], "642", "642"),
+            (["7", "3", "0", "1", "5", "\n", "q"], "7301", "7301"),
+            (["７", "３", "０", "１", "\n", "q"], "7301", "7301"),
+        ):
+            with self.subTest(keys=keys):
+                ui = self.screen(demo=True, room="")
+                screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+                screen.get_wch.side_effect = keys
+                with patch("src.terminal_ui.curses.has_colors", return_value=False):
+                    self.assertEqual(ui.run(screen), 0)
+                self.assertEqual(ui.room, expected_room)
+                self.assertEqual(ui.values.get("教室名"), f"{expected_route if expected_room == '642' else '731'}講義室")
+
+    def test_qr_input_rejects_non_decimal_symbols_and_draws_wide_initial_room(self):
+        ui = self.screen(demo=True, room="６４２")
+        self.assertIn("６４２", self.drawn(ui, 80))
+        ui.room = ""
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        screen.get_wch.side_effect = ["a", "①", "６", "q"]
+        with patch("src.terminal_ui.curses.has_colors", return_value=False):
+            self.assertEqual(ui.run(screen), 0)
+        self.assertEqual(ui.room, "6")
+
     def test_schedule_name_and_time_can_be_edited_in_middle(self):
         ui = self.screen(demo=True)
         panel = ui.schedule_panel

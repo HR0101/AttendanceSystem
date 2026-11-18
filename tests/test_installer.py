@@ -126,8 +126,58 @@ fi
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(command.read_text(), "another command")
+        self.assertIn(f'rm "{command}"', result.stderr)
+        self.assertIn("bash install.sh", result.stderr)
         self.assertNotIn("-m pip", self.log.read_text())
         self.assertFalse((self.home / ".zshrc").exists())
+
+    def test_broken_and_moved_symlinks_include_recovery_commands(self):
+        command = self.home / ".local/bin/att"
+        command.parent.mkdir(parents=True)
+        other = self.base / "other/att"
+        for case, exists in (("broken", False), ("moved", True)):
+            with self.subTest(case=case):
+                if command.is_symlink() or command.exists():
+                    command.unlink()
+                if exists:
+                    other.parent.mkdir(parents=True, exist_ok=True)
+                    other.write_text("#!/bin/sh\n")
+                command.symlink_to(other)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(command.is_symlink())
+                self.assertEqual(os.readlink(command), str(other))
+                self.assertIn(f'rm "{command}"', result.stderr)
+                self.assertIn("bash install.sh", result.stderr)
+                self.assertNotIn("-m pip", self.log.read_text())
+                if other.exists():
+                    other.unlink()
+
+    def test_broken_or_old_venv_includes_recovery_command(self):
+        venv = self.project / ".venv"
+        cases = ("missing_python", "broken_symlink", "old_python", "non_dir")
+        for case in cases:
+            with self.subTest(case=case):
+                if venv.is_dir():
+                    shutil.rmtree(venv)
+                elif venv.exists() or venv.is_symlink():
+                    venv.unlink()
+                if case == "non_dir":
+                    venv.write_text("not a dir")
+                else:
+                    (venv / "bin").mkdir(parents=True)
+                    python = venv / "bin/python"
+                    if case == "broken_symlink":
+                        python.symlink_to(self.base / "missing-python")
+                    elif case == "old_python":
+                        python.write_text("#!/bin/bash\nexit 1\n")
+                        python.chmod(0o755)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'rm -rf "{venv}"', result.stderr)
+                self.assertIn("bash install.sh", result.stderr)
+                self.assertFalse((self.home / ".local/bin/att").exists())
+                self.assertFalse((self.home / ".local/bin/att").is_symlink())
 
     def test_dependency_failure_does_not_register_command(self):
         self.env["FAIL_PIP"] = "1"

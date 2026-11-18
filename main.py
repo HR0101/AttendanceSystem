@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         return user_command(Path(__file__).resolve().parent, argv[1:])
     parser = argparse.ArgumentParser(prog="att", description="大学の出席画面を確認・登録します。")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    parser.add_argument("room", nargs="?", help="教室番号（例: 642、731）。省略時は入力します。")
+    parser.add_argument("room", nargs="?", help="教室番号（例: 642、731、7301）。省略時は入力します。")
     parser.add_argument("--check", action="store_true", help="登録せずに状態だけ確認します。")
     parser.add_argument("--ui", action="store_true", help="ターミナル内に出席確認画面を開きます。")
     parser.add_argument("--demo", action="store_true", help="接続せずに出席確認画面を試します。")

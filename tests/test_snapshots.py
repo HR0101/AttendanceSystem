@@ -203,11 +203,19 @@ class SnapshotTests(unittest.TestCase):
 
     def test_room_url_numbers(self):
         self.assertEqual(parse_room("642"), ("642", "642"))
+        self.assertEqual(parse_room("６４２"), ("642", "642"))
+        self.assertEqual(parse_room("　６４２　"), ("642", "642"))
         self.assertEqual(parse_room("731"), ("731", "7301"))
+        self.assertEqual(parse_room("７３１"), ("731", "7301"))
+        self.assertEqual(parse_room("7301"), ("731", "7301"))
+        self.assertEqual(parse_room("７３０１"), ("731", "7301"))
         self.assertEqual(parse_room("732"), ("732", "7302"))
         self.assertEqual(parse_room("741"), ("741", "7401"))
-        with self.assertRaises(RoomError):
-            parse_room("73a")
+        self.assertEqual(parse_room("7401"), ("741", "7401"))
+        self.assertEqual(parse_room("7000"), ("700", "7000"))
+        for invalid in ("", "73", "73a", "6402", "7312", "73012", "73.1", "-731", "あいう", None):
+            with self.subTest(invalid=invalid), self.assertRaises(RoomError):
+                parse_room(invalid)
 
 
 if __name__ == "__main__":
