@@ -33,13 +33,48 @@ v0.2.3以降は取得開始時とすべてのリダイレクトで、HTTPSと正
 
 上の `sha256` と `size` は説明用の仮の値。`scripts/build_release.py` が実際のZIPから値を計算する。対応する形式バージョンは整数の1、版番号はプレフィックスのない安定版の3整数形式に限定する。ZIP名は固定で、任意の取得先URLをJSONから受け取らない。
 
-JSONは更新用ZIPの外に置く。v0.2.1以前はZIP内の未知のファイルを拒否するが、別アセットとして添付するJSONは旧版のZIP検証に影響しない。ZIPとJSONはHTTPSで同じ配布元から取得するため、SHA-256は破損・取り違えを検出するものであり、独立した発行者署名ではない。
+JSONは更新用ZIPの外に置く。v0.2.1以前はZIP内の未知のファイルを拒否するが、別アセットとして添付するJSONは旧版のZIP検証に影響しない。ZIPとJSONはHTTPSで同じ配布元から取得するため、SHA-256単体は破損・取り違えの検出であり、配布元権限が侵害された場合の防御には独立した発行者署名が必要になる。
 
 v0.2.3以降のビルドは `updates/X.Y.Z.md` を必須とし、同じテキストを `release_notes` とGitHub Releaseの説明に使う。16KiB以内、先頭の版番号、変更内容・利用者の操作の具体的な箇条書きを検証する。古いリリースにはこのフィールドがないため、受信側では省略を許可し、`att update --notes` でリリースページへ案内する。未知のフィールドを許可する既存の形式バージョン1との互換性を保つ。
 
+## 暗号署名とビルド来歴（SLSA Build Provenance）
+
+Issue #17 により、外部依存ライブラリを増やさず標準ライブラリと OS 標準の OpenSSL / LibreSSL（`dgst -sha256`）を用いた ECDSA P-256 暗号署名・検証と、GitHub Artifact Attestations による SLSA Build Provenance を導入した。
+
+### マニフェスト内署名と分離署名
+
+署名鍵が指定されたリリースビルドでは、`attendance-update.json` に次の `signature` ブロックを追加し、同時に生のアーカイブ署名 `attendance-update.zip.sig` を生成する（`archive` 辞書の形式 `{"name", "sha256", "size"}` は従来どおり維持する）。
+
+```json
+{
+  "signature": {
+    "algorithm": "ecdsa-p256-sha256",
+    "value": "<Base64エンコードされたECDSA P-256 DER署名>"
+  }
+}
+```
+
+- **マニフェスト署名対象**: `schema_version`、`version`、`archive.name`、`archive.sha256`、`archive.size` をキー順で正規化した JSON バイト列。版番号の差し替えやアーカイブのすり替えを単体で検出できる。
+- **クライアント検証（`src/signing.py`・`src/updater.py`）**: `validate_manifest` は `signature` 存在時に形式（アルゴリズム名・Base64妥当性・サイズ上限）を検証する。`PUBLIC_KEY_PEM`（または `config.json` の `update_public_key`、`verify_manifest_signature(..., require_signature=True)`）が設定されている場合、`prepare_update` は `validate_payload` の展開前に署名を検証し、未署名・不正署名・偽造署名・改ざん済みマニフェスト・改ざん済みZIPを `UpdateError` で拒否する。HTTP リクエストは従来と同じ `[MANIFEST_URL, archive_url]` の2回だけを維持する。
+- **署名鍵の未設定時互換**: `PUBLIC_KEY_PEM` が空文字で `require_signature=False` の間は、署名を持たない従来リリースとも互換性を保つ。
+
+### ビルドと検証コマンド
+
+```sh
+# 署名付きビルド（--signing-key または環境変数 RELEASE_SIGNING_KEY_FILE）
+python3 scripts/build_release.py v0.2.8 --signing-key /path/to/release-private.pem
+
+# 分離署名の手動検証（OpenSSL / LibreSSL 共通）
+openssl dgst -sha256 -verify release-public.pem -signature dist/attendance-update.zip.sig dist/attendance-update.zip
+
+# GitHub Artifact Attestations（SLSA Build Provenance）の検証
+gh attestation verify attendance-update.zip --repo HR0101/AttendanceSystem
+gh attestation verify attendance-update.json --repo HR0101/AttendanceSystem
+```
+
 ## 配布
 
-`python3 scripts/check_update_notes.py` で更新内容を確認し、`python3 scripts/build_release.py v0.2.3` でZIPとJSONを同時に生成する。CIは通常ブランチでは既定ブランチから、PRではベースコミットからの差分に現在版の更新ファイルが含まれることも確認する。既定ブランチへのpushでは変更前コミットと比較する。タグではファイルと版・タグの一致を検証する。配布CIは既存の読み取り専用テストジョブと公開ジョブの分離を維持し、両アセットをドラフトへ添付した後で公開・latest指定する。新しい依存ライブラリは不要。
+`python3 scripts/check_update_notes.py` で更新内容を確認し、`python3 scripts/build_release.py v0.2.3` でZIPとJSONを同時に生成する（署名鍵指定時は `attendance-update.zip.sig` も生成する）。CIは通常ブランチでは既定ブランチから、PRではベースコミットからの差分に現在版の更新ファイルが含まれることも確認する。既定ブランチへのpushでは変更前コミットと比較する。タグではファイルと版・タグの一致を検証する。配布CIは既存の読み取り専用テストジョブと公開ジョブの分離を維持し、公開ジョブに `id-token: write` と `attestations: write` を追加して `actions/attest-build-provenance`（コミットSHA固定）で `dist/attendance-update.zip` と `dist/attendance-update.json` に来歴アテステーションを付与する。`secrets.RELEASE_SIGNING_KEY` が設定されている場合のみ `0600` の一時ファイル経由で署名し、`trap` で即時に削除して `dist/attendance-update.zip.sig` を添付する（未設定時も署名なしフォールバックで壊れない）。新しい依存ライブラリは不要。
 
 JSONがない最新リリースは、配布準備が不足している場合とリリース自体がない場合を区別できない。そのため404を「最新版」として扱わず、JSONが見つからないことを表示する。
 

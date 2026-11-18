@@ -138,6 +138,7 @@ fi
     || fail ".venv の Python は 3.10 以降である必要があります（または .venv が破損しています）。rm -rf \"${tool_dir}/.venv\" を実行してから bash install.sh を再実行してください。"
 # ロックファイルに記録したハッシュと一致する wheel だけを導入する。
 "$tool_dir/.venv/bin/python" -m pip install --no-input --require-hashes --only-binary=:all: -r "$tool_dir/requirements.lock"
+unset PLAYWRIGHT_DOWNLOAD_HOST PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT
 "$tool_dir/.venv/bin/python" -m playwright install chromium
 
 if [ ! -e "$tool_dir/config.json" ] && [ ! -L "$tool_dir/config.json" ]; then

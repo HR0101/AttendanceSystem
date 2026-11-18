@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -28,12 +30,38 @@ jobs:
       - name: Build update archive
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         # build_release.py は標準ライブラリだけを使うため、ランナー標準の python3 で実行する。
-        run: python3 scripts/build_release.py "$RELEASE_TAG"
+        run: |
+          key_file=""
+          cleanup() {
+            if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+              rm -f "$key_file"
+            fi
+          }
+          trap cleanup EXIT
+          if [ -n "${RELEASE_SIGNING_KEY:-}" ]; then
+            umask 077
+            key_file=$(mktemp "${RUNNER_TEMP:-/tmp}/release-signing-key.XXXXXX")
+            printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key_file"
+            python3 scripts/build_release.py "$RELEASE_TAG" --signing-key "$key_file"
+          else
+            python3 scripts/build_release.py "$RELEASE_TAG"
+          fi
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/attendance-update.zip
+            dist/attendance-update.json
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" dist/attendance-update.zip dist/attendance-update.json --verify-tag --notes-file "updates/${RELEASE_TAG#v}.md" --draft
+          assets=(dist/attendance-update.zip dist/attendance-update.json)
+          if [ -f dist/attendance-update.zip.sig ]; then
+            assets+=(dist/attendance-update.zip.sig)
+          fi
+          gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --notes-file "updates/${RELEASE_TAG#v}.md" --draft
           gh release edit "$RELEASE_TAG" --draft=false --latest

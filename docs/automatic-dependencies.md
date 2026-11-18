@@ -34,12 +34,20 @@ venvには絶対パスが含まれるため、候補環境は最終配置先で�
 
 実行環境の参照はUUID・ロックハッシュ・Python・プラットフォーム・実際の配置先・準備完了記録で検証する。任意のパスやシンボリックリンクを実行先として受け入れない。復元処理で必要な検証は標準ライブラリだけで実行でき、パッケージやアプリのモジュールが壊れていても復元記録を読み取れる。
 
+## Chromium の取得元・バージョン検証
+
+Playwright のブラウザ取得は環境変数の上書きによって配布元ホストやスキップ設定を差し替えられるため、`install.sh` と `src/dependencies.py`（`prepare_environment`）の双方で取得前に保護を行う。
+
+1. **上書き環境変数の無害化**: `PLAYWRIGHT_DOWNLOAD_HOST`、`PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST`、`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`、`PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT` を `install.sh` では `unset`、`prepare_environment`（`sanitized_environment`）ではプロセス環境から除外してから `playwright install chromium` および起動確認を実行する。
+2. **配置先・シンボリックリンク・ピン留めリビジョン検証**: 導入後の起動確認ステップで、`p.chromium.executable_path` が `PLAYWRIGHT_BROWSERS_PATH` 配下に実在し（親ディレクトリを含めシンボリックリンクを経由しない実行可能な通常ファイル）、かつハッシュ検証済みで導入された `playwright` パッケージ内の `driver/package/browsers.json` に記録された Chromium リビジョン（`chromium-<revision>`）と一致することを検証してから `headless=True` で起動確認を行う。
+
 ## Issueとの対応
 
 - #10: 403の利用制限を通常の拒否と区別し、解除時刻を表示・保存して、その時刻まで自動確認を抑止する。
 - #11: API呼び出しゼロを維持したまま公開JSONのETagを保存し、304時は検証済みのキャッシュを使う。キャッシュ不正時は条件なしで取得し直す。
 - #12: v0.2.2で実装したJSON方式に、取得開始・リダイレクト先のホストとHTTPSの検証を追加する。APIへのフォールバックは行わない。
 - #22: 更新適用・ロールバック完了時に、現在・待機中・バックアップ・復元記録のいずれからも参照されていない `.updates/environments/<UUID>/` を排他ロック下で自動削除し、現在版以下の古い `pending` も更新確認前に破棄する。
+- #17: 更新アーカイブ・マニフェストへの ECDSA P-256 署名検証、SLSA Build Provenance アテステーション、および Chromium 取得元環境変数の除外とピン留めリビジョン・配置検証を導入する。
 
 ## 検証
 
