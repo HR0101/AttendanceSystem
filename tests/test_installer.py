@@ -130,6 +130,39 @@ fi
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('export PATH=', profile.read_text())
 
+    def test_installer_unsets_untrusted_playwright_download_overrides(self):
+        mock_python = self.base / "mock-bin/python3"
+        env_log = self.base / "playwright-env.log"
+        mock_python.write_text(
+            '#!/bin/bash\n'
+            'printf "%s\\n" "$*" >> "$INSTALL_LOG"\n'
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then\n'
+            '    mkdir -p "$3/bin"\n'
+            '    cp "$0" "$3/bin/python"\n'
+            'fi\n'
+            'if [ "$1" = -m ] && [ "$2" = playwright ]; then\n'
+            '    printf "HOST=%s\\nCHROMIUM=%s\\nSKIP=%s\\nTIMEOUT=%s\\n" '
+            '"${PLAYWRIGHT_DOWNLOAD_HOST:-UNSET}" '
+            '"${PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST:-UNSET}" '
+            '"${PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:-UNSET}" '
+            '"${PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT:-UNSET}" > "$PW_ENV_LOG"\n'
+            'fi\n'
+        )
+        mock_python.chmod(0o755)
+        self.env.update({
+            "PW_ENV_LOG": str(env_log),
+            "PLAYWRIGHT_DOWNLOAD_HOST": "https://mirror.example.invalid",
+            "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": "https://chromium.example.invalid",
+            "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+            "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT": "1",
+        })
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            env_log.read_text().splitlines(),
+            ["HOST=UNSET", "CHROMIUM=UNSET", "SKIP=UNSET", "TIMEOUT=UNSET"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

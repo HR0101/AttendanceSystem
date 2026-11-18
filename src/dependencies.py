@@ -8,9 +8,75 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import uuid
 
 from .updater import UpdateError, atomic_write, file_lock, runtime_directory, write_json
+
+UNTRUSTED_PLAYWRIGHT_ENV_VARS = (
+    "PLAYWRIGHT_DOWNLOAD_HOST",
+    "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT",
+)
+
+_BROWSER_VERIFY_SCRIPT = textwrap.dedent("""
+    import json, os, pathlib, keyring, playwright
+    from playwright.sync_api import sync_playwright
+
+    browsers_path = pathlib.Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+    if browsers_path.is_symlink():
+        raise RuntimeError("PLAYWRIGHT_BROWSERS_PATH must not be a symlink")
+    browsers_root = browsers_path.resolve()
+    browsers_meta = pathlib.Path(playwright.__file__).resolve().parent / "driver/package/browsers.json"
+    browsers_data = json.loads(browsers_meta.read_text(encoding="utf-8"))
+    chromium = next(item for item in browsers_data["browsers"] if item.get("name") == "chromium")
+    revisions = {str(chromium["revision"])}
+    revisions.update(str(v) for v in (chromium.get("revisionOverrides") or {}).values())
+    if not revisions or any(not rev or not rev.isascii() or not rev.isalnum() for rev in revisions):
+        raise RuntimeError("Invalid Chromium revision in playwright browsers.json")
+    expected_dirs = {f"chromium-{rev}" for rev in revisions}
+
+    p = sync_playwright().start()
+    try:
+        executable = p.chromium.executable_path
+        if not executable:
+            raise RuntimeError("Chromium executable_path is empty")
+        exe = pathlib.Path(executable)
+        if (
+            not exe.is_absolute()
+            or ".." in exe.parts
+            or not exe.exists()
+            or exe.is_symlink()
+            or not exe.is_file()
+            or not os.access(exe, os.X_OK)
+        ):
+            raise RuntimeError("Chromium executable is missing, not executable, or a symlink")
+        resolved = exe.resolve()
+        rel = resolved.relative_to(browsers_root)
+        if not rel.parts or rel.parts[0] not in expected_dirs:
+            raise RuntimeError("Chromium revision does not match playwright browsers.json")
+        cur = exe
+        while cur.resolve() != browsers_root:
+            if cur.is_symlink() or cur == cur.parent:
+                raise RuntimeError("Chromium executable path must not traverse symlinks")
+            cur = cur.parent
+        browser = p.chromium.launch(headless=True)
+        browser.close()
+    finally:
+        p.stop()
+""").strip()
+
+
+def sanitized_environment(directory):
+    """ブラウザ取得元の上書き環境変数を除外し、専用venv用の環境変数を組み立てる。"""
+    environment = {key: value for key, value in os.environ.items() if key not in UNTRUSTED_PLAYWRIGHT_ENV_VARS}
+    environment.update({
+        "PLAYWRIGHT_BROWSERS_PATH": str(directory / "browsers"),
+        "PYTHONNOUSERSITE": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    })
+    return environment
 
 
 def run_command(command, *, env, stdout, timeout):
@@ -64,8 +130,7 @@ def prepare_environment(base, spec):
         state = {"id": uuid.uuid4().hex, "lock_hash": spec["lock_hash"]}
         directory = environments / state["id"]
         python = directory / "bin/python"
-        environment = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": str(directory / "browsers"),
-                       "PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+        environment = sanitized_environment(directory)
         log_path = updates / "dependencies.log"
         stage = "仮想環境の作成"
         try:
@@ -87,8 +152,7 @@ def prepare_environment(base, spec):
                 stage = "Chromiumの導入"
                 run([str(python), "-m", "playwright", "install", "chromium"])
                 stage = "起動確認"
-                run([str(python), "-c", "import keyring; from playwright.sync_api import sync_playwright; "
-                     "p = sync_playwright().start(); b = p.chromium.launch(headless=True); b.close(); p.stop()"], 60)
+                run([str(python), "-c", _BROWSER_VERIFY_SCRIPT], 60)
             write_json(directory / "ready.json", {"directory": str(directory), "lock_hash": spec["lock_hash"],
                                                   "python": list(sys.version_info[:2]), "platform": sys.platform,
                                                   "machine": platform.machine()})

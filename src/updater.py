@@ -35,6 +35,8 @@ MAX_MANIFEST = 64 * 1024
 MAX_ARCHIVE = 8 * 1024 * 1024
 DOWNLOAD_HOSTS = frozenset({"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
                             "github-releases.githubusercontent.com"})
+# リリース署名検証用の ECDSA P-256 公開鍵（PEM）。未設定時は署名が存在しない従来配布を許可する。
+PUBLIC_KEY_PEM = ""
 ROOT_FILES = frozenset({
     "main.py", "att", "attendance", "start.command", "install.command", "install.sh",
     "requirements.txt", "config.example.json", "schedule.example.json", "README.md",
@@ -42,7 +44,7 @@ ROOT_FILES = frozenset({
 })
 REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
     "__init__", "attendance", "browser", "config", "credentials", "dependencies", "dependency_lock", "logging_utils", "room",
-    "release_notes", "schedule_ui", "scheduler", "terminal_layout", "terminal_ui", "text_input", "unsaved_changes", "updater", "user_commands",
+    "release_notes", "schedule_ui", "scheduler", "signing", "terminal_layout", "terminal_ui", "text_input", "unsaved_changes", "updater", "user_commands",
     "users", "verification", "version",
 )}
 
@@ -352,7 +354,56 @@ def validate_manifest(manifest):
             validate_notes(manifest["release_notes"], version)
         except (ValueError, UnicodeError) as exc:
             raise UpdateError("更新情報JSONの更新内容が不正です。") from exc
+    if "signature" in manifest:
+        from .signing import SignatureError, validate_signature_block
+        try:
+            validate_signature_block(manifest["signature"])
+        except SignatureError as exc:
+            raise UpdateError("更新情報JSONの署名形式が不正です。") from exc
     return manifest
+
+
+def _configured_public_key(base, public_key_pem=None):
+    if public_key_pem is not None:
+        return public_key_pem
+    if PUBLIC_KEY_PEM:
+        return PUBLIC_KEY_PEM
+    config = read_json(base / "config.json", {})
+    if isinstance(config, dict):
+        configured = config.get("update_public_key")
+        if isinstance(configured, str) and configured.strip():
+            return configured
+    return ""
+
+
+def verify_manifest_signature(manifest, archive_data=None, *, public_key_pem=None, require_signature=False):
+    """公開鍵の設定または必須指定に応じてマニフェスト署名とアーカイブ整合性を検証する。"""
+    validate_manifest(manifest)
+    key_pem = PUBLIC_KEY_PEM if public_key_pem is None else public_key_pem
+    if not isinstance(key_pem, str):
+        raise UpdateError("リリース署名検証用の公開鍵の設定が不正です。")
+    has_key = bool(key_pem.strip())
+    if require_signature and not has_key:
+        raise UpdateError("リリース署名検証用の公開鍵が設定されていません。")
+    if has_key:
+        if "signature" not in manifest:
+            raise UpdateError("更新情報JSONに署名がありません。")
+        from .signing import SignatureError, canonical_manifest_payload, validate_signature_block, verify_bytes
+        try:
+            sig_bytes = validate_signature_block(manifest["signature"])
+            verify_bytes(canonical_manifest_payload(manifest), sig_bytes, key_pem)
+        except SignatureError as exc:
+            raise UpdateError("更新情報JSONの署名検証に失敗しました。") from exc
+    if archive_data is not None:
+        if len(archive_data) != manifest["archive"]["size"]:
+            raise UpdateError("更新ファイルのサイズが更新情報JSONと一致しません。")
+        if hashlib.sha256(archive_data).hexdigest() != manifest["archive"]["sha256"]:
+            raise UpdateError("更新ファイルのチェックサムが一致しません。")
+    return has_key
+
+
+def _module_public_key_active():
+    return not isinstance(PUBLIC_KEY_PEM, str) or bool(PUBLIC_KEY_PEM.strip())
 
 
 def fetch_manifest(state, deadline):
@@ -360,6 +411,8 @@ def fetch_manifest(state, deadline):
     cached = state.get("manifest")
     try:
         validate_manifest(cached)
+        if _module_public_key_active():
+            verify_manifest_signature(cached)
     except (UpdateError, ValueError, TypeError):
         cached = None
     etag = state.get("etag")
@@ -381,6 +434,8 @@ def fetch_manifest(state, deadline):
                 continue
             raise UpdateError("更新情報JSONが304を返しましたが、再利用できるキャッシュがありません。") from exc
         manifest = validate_manifest(json.loads(data))
+        if _module_public_key_active():
+            verify_manifest_signature(manifest)
         state["manifest"] = manifest
         value = header_value(received, "ETag")
         state.pop("etag", None)
@@ -496,7 +551,10 @@ def available_message(manifest):
 def cached_manifest(base):
     state = read_json(base / ".updates/check.json", {})
     try:
-        return validate_manifest(state.get("manifest"))
+        manifest = validate_manifest(state.get("manifest"))
+        if _module_public_key_active():
+            verify_manifest_signature(manifest)
+        return manifest
     except (AttributeError, UpdateError, ValueError, TypeError):
         return None
 
@@ -566,7 +624,7 @@ def show_update_notes(base):
         print(f"https://github.com/{REPOSITORY}/releases/tag/v{manifest['version']}")
 
 
-def prepare_update(base, force=False):
+def prepare_update(base, force=False, *, public_key_pem=None, require_signature=False):
     """att updateで通信と検証を行う。起動中のコードは変更しない。"""
     updates = base / ".updates"
     with file_lock(updates / "download.lock", exclusive=True, blocking=False):
@@ -577,6 +635,13 @@ def prepare_update(base, force=False):
         if result is None:
             return None
         manifest, state, deadline = result
+        effective_key = _configured_public_key(base, public_key_pem)
+        if not isinstance(effective_key, str) or effective_key.strip() or require_signature:
+            verify_manifest_signature(
+                manifest,
+                public_key_pem=effective_key,
+                require_signature=require_signature,
+            )
         from .version import VERSION
         version = manifest["version"]
         if not force and version == state.get("skip_version"):
@@ -594,10 +659,12 @@ def prepare_update(base, force=False):
         except HTTPError as exc:
             record_rate_limit(updates, state, exc)
             raise
-        if len(data) != manifest["archive"]["size"]:
-            raise UpdateError("更新ファイルのサイズが更新情報JSONと一致しません。")
-        if hashlib.sha256(data).hexdigest() != manifest["archive"]["sha256"]:
-            raise UpdateError("更新ファイルのチェックサムが一致しません。")
+        verify_manifest_signature(
+            manifest,
+            data,
+            public_key_pem=effective_key,
+            require_signature=require_signature,
+        )
         with tempfile.TemporaryDirectory(dir=updates, prefix="download-") as temp:
             temporary = Path(temp)
             archive = temporary / "release.zip"

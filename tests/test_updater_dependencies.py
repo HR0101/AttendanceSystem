@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -72,6 +73,103 @@ class DependencyUpdateTests(unittest.TestCase):
         with patch.object(d, "run_command") as command:
             self.assertEqual(d.prepare_environment(self.base, current), state)
             command.assert_not_called()
+
+    def test_untrusted_playwright_download_env_vars_are_stripped(self):
+        untrusted = {
+            "PLAYWRIGHT_DOWNLOAD_HOST": "https://mirror.example.invalid",
+            "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": "https://chromium.example.invalid",
+            "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+            "PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT": "1",
+        }
+        calls, run = self.fake_install()
+        with patch.dict(os.environ, untrusted), patch.object(d, "run_command", side_effect=run):
+            d.prepare_environment(self.base, spec("env-sanitization lock"))
+        self.assertEqual(len(calls), 5)
+        for command, kwargs in calls:
+            env = kwargs["env"]
+            for key in d.UNTRUSTED_PLAYWRIGHT_ENV_VARS:
+                self.assertNotIn(key, env, f"{key} must be stripped before {command}")
+
+    def test_browser_verification_rejects_outside_symlink_nonexec_and_revision_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            site = root / "site"
+            (site / "keyring").mkdir(parents=True)
+            (site / "keyring/__init__.py").write_text("# stub\n")
+            pkg = site / "playwright"
+            (pkg / "driver/package").mkdir(parents=True)
+            (pkg / "__init__.py").write_text("__version__ = '1.0.0'\n")
+            (pkg / "driver/package/browsers.json").write_text(json.dumps({"browsers": [{"name": "chromium", "revision": "1243"}]}))
+            (pkg / "sync_api.py").write_text(
+                "import os\n"
+                "class Browser:\n def close(self): pass\n"
+                "class Chromium:\n"
+                " @property\n def executable_path(self): return os.environ['TEST_EXECUTABLE_PATH']\n"
+                " def launch(self, **kwargs): return Browser()\n"
+                "class Playwright:\n chromium = Chromium()\n def start(self): return self\n def stop(self): pass\n"
+                "def sync_playwright(): return Playwright()\n"
+            )
+
+            browsers = root / "browsers"
+            valid_exe = browsers / "chromium-1243/chrome"
+            valid_exe.parent.mkdir(parents=True)
+            valid_exe.write_text("#!/bin/sh\n")
+            valid_exe.chmod(0o755)
+
+            outside_exe = root / "outside/chrome"
+            outside_exe.parent.mkdir(parents=True)
+            outside_exe.write_text("#!/bin/sh\n")
+            outside_exe.chmod(0o755)
+
+            symlink_exe = browsers / "chromium-1243/chrome-link"
+            symlink_exe.symlink_to(valid_exe)
+
+            symlink_dir = browsers / "chromium-1243/sub-link"
+            symlink_dir.symlink_to(valid_exe.parent)
+
+            wrong_rev_exe = browsers / "chromium-9999/chrome"
+            wrong_rev_exe.parent.mkdir(parents=True)
+            wrong_rev_exe.write_text("#!/bin/sh\n")
+            wrong_rev_exe.chmod(0o755)
+
+            nonexec_exe = browsers / "chromium-1243/chrome-nonexec"
+            nonexec_exe.write_text("#!/bin/sh\n")
+            nonexec_exe.chmod(0o644)
+
+            symlink_browsers = root / "browsers-link"
+            symlink_browsers.symlink_to(browsers)
+
+            def run_verify(browsers_path, executable_path):
+                env = {
+                    **os.environ,
+                    "PYTHONPATH": str(site),
+                    "PLAYWRIGHT_BROWSERS_PATH": str(browsers_path),
+                    "TEST_EXECUTABLE_PATH": str(executable_path),
+                }
+                return subprocess.run(
+                    [sys.executable, "-c", d._BROWSER_VERIFY_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+            ok = run_verify(browsers, valid_exe)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+
+            bad_cases = (
+                ("outside_path", browsers, outside_exe),
+                ("symlink_executable", browsers, symlink_exe),
+                ("symlink_parent_dir", browsers, symlink_dir / "chrome"),
+                ("symlink_browsers_root", symlink_browsers, symlink_browsers / "chromium-1243/chrome"),
+                ("wrong_revision", browsers, wrong_rev_exe),
+                ("not_executable", browsers, nonexec_exe),
+                ("empty_path", browsers, ""),
+            )
+            for name, browsers_path, exe_path in bad_cases:
+                with self.subTest(case=name):
+                    res = run_verify(browsers_path, exe_path)
+                    self.assertNotEqual(res.returncode, 0)
 
     def test_failure_at_any_setup_stage_keeps_working_environment_and_removes_candidate(self):
         old = seed_environment(self.base, "old lock")

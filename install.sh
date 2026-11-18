@@ -42,6 +42,7 @@ else
     echo "      最新版を取得すると、検証付きで導入できます。" >&2
     "$tool_dir/.venv/bin/python" -m pip install -r "$tool_dir/requirements.txt"
 fi
+unset PLAYWRIGHT_DOWNLOAD_HOST PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT
 "$tool_dir/.venv/bin/python" -m playwright install chromium
 
 if [ ! -e "$tool_dir/config.json" ] && [ ! -L "$tool_dir/config.json" ]; then
