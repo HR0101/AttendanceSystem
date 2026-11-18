@@ -92,6 +92,21 @@ class SchedulerTests(unittest.TestCase):
         schedule["blackout_dates"] = frozenset({date(2026, 10, 4)})
         self.assertIsNone(due_course(schedule, datetime(2026, 10, 5, 0, 3)))
 
+    def test_schedule_normalizes_fullwidth_and_four_digit_rooms(self):
+        raw = schedule_data(SCHEDULE)
+        raw["courses"][0]["room"] = "７３０１"
+        validated = validate_schedule(raw)
+        self.assertEqual(validated["courses"][0]["room"], "731")
+        self.assertEqual(validated["courses"][0]["route"], "7301")
+        raw["courses"][0]["room"] = "６４２"
+        validated = validate_schedule(raw)
+        self.assertEqual(validated["courses"][0]["room"], "642")
+        self.assertEqual(validated["courses"][0]["route"], "642")
+        for bad_room in ("6402", "7312", None):
+            with self.subTest(bad_room=bad_room), self.assertRaises(ScheduleError):
+                raw["courses"][0]["room"] = bad_room
+                validate_schedule(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

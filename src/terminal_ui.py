@@ -6,6 +6,7 @@ import queue
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -656,8 +657,9 @@ class AttendanceScreen:
         canvas.button(5, left, f"QR番号 [ {self.room or '___'} ]", self.selected == 0)
         if self.selected == 0:
             cursor = self.room_editor.sync(self.room)
-            canvas.put(5, left + 1 + text_width("QR番号 [ ") + cursor,
-                       self.room[cursor:cursor + 1] or "_", color(1) | curses.A_REVERSE | curses.A_UNDERLINE | curses.A_BOLD, 1)
+            caret = self.room[cursor:cursor + 1] or "_"
+            canvas.put(5, left + 1 + text_width("QR番号 [ ") + text_width(self.room[:cursor]),
+                       caret, color(1) | curses.A_REVERSE | curses.A_UNDERLINE | curses.A_BOLD, max(1, text_width(caret)))
         canvas.button(5, left + 28, "[ 更新 R ]", self.selected == 1, not self.busy)
         title, tone, detail = self.status()
         canvas.fill(7, left, main_width, 2, color(tone) | curses.A_REVERSE)
@@ -914,7 +916,9 @@ class AttendanceScreen:
                 else:
                     self.start()
             elif self.selected == 0:
-                edited = self.room_editor.edit(self.room, key, limit=3, accepts=lambda value: all(char in "0123456789" for char in value))
+                if isinstance(key, str) and key and all(char in "0123456789０１２３４５６７８９" for char in key):
+                    key = unicodedata.normalize("NFKC", key)
+                edited = self.room_editor.edit(self.room, key, limit=4, accepts=lambda value: value.isascii() and value.isdecimal())
                 if edited != self.room:
                     self.room = edited
                     self.clear_target()
