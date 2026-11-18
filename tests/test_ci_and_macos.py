@@ -312,7 +312,7 @@ class MacOSCredentialsBoundaryTests(unittest.TestCase):
     def test_keychain_backend_accepts_macos_keyring_on_darwin(self):
         from keyring.backends.macOS import Keyring as MacOSKeyring
 
-        fake_backend = Mock(spec=MacOSKeyring)
+        fake_backend = MacOSKeyring()
         with patch.object(credentials.sys, "platform", "darwin"), \
                 patch("keyring.get_keyring", return_value=fake_backend):
             self.assertIs(credentials.keychain_backend(), fake_backend)
