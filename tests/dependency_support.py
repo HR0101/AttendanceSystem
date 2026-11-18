@@ -51,13 +51,25 @@ def test_packages(root, version):
     keyring = wheel(root, "keyring", "25.0.0", {"keyring/__init__.py": "# No Keychain access in this fixture\n"})
     playwright = wheel(root, "playwright", version, {
         "playwright/__init__.py": f"__version__ = {version!r}\n",
-        "playwright/__main__.py": "import os; from pathlib import Path; "
-            "p = Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']); p.mkdir(parents=True, exist_ok=True); (p / 'installed').write_text('ok')\n",
-        "playwright/sync_api.py": "import os\nfrom pathlib import Path\n"
+        "playwright/driver/package/browsers.json": '{"browsers": [{"name": "chromium", "revision": "1243"}]}\n',
+        "playwright/__main__.py": (
+            "import os; from pathlib import Path; "
+            "p = Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']) / 'chromium-1243'; "
+            "p.mkdir(parents=True, exist_ok=True); "
+            "exe = p / 'chrome'; exe.write_text('#!/bin/sh\\n'); exe.chmod(0o755)\n"
+        ),
+        "playwright/sync_api.py": (
+            "import os\nfrom pathlib import Path\n"
             "class Browser:\n def close(self): pass\n"
-            "class Chromium:\n def launch(self, **kwargs):\n  assert (Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']) / 'installed').is_file()\n  return Browser()\n"
+            "class Chromium:\n"
+            " @property\n def executable_path(self):\n"
+            "  return str(Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']) / 'chromium-1243' / 'chrome')\n"
+            " def launch(self, **kwargs):\n"
+            "  assert Path(self.executable_path).is_file()\n"
+            "  return Browser()\n"
             "class Playwright:\n chromium = Chromium()\n def start(self): return self\n def stop(self): pass\n"
-            "def sync_playwright(): return Playwright()\n",
+            "def sync_playwright(): return Playwright()\n"
+        ),
     })
     return "\n".join(f"{name}=={ver} --hash=sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
                      for name, ver, path in (("keyring", "25.0.0", keyring), ("playwright", version, playwright))) + "\n"

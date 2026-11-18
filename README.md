@@ -78,9 +78,9 @@ att --version            # 現在のバージョン
 att update --rollback    # 直前の更新前の版へ戻す
 ```
 
-`att update` は更新情報JSONの版番号・ZIPサイズ・SHA-256と、更新用ZIPの実サイズ・SHA-256・ファイル構成・Python構文・起動を確認してから適用します。JSONとZIPが食い違う場合は適用しません。取得時のリダイレクトもHTTPSのGitHub配布用ホストだけに限定します。適用中に失敗した場合は元に戻し、途中でプロセスが終了した場合は次回起動時に復元します。通常起動や `--notes` では、すでに準備された更新も適用しません。
+`att update` は更新情報JSONの版番号・ZIPサイズ・SHA-256（および公開鍵設定時は ECDSA P-256 署名）と、更新用ZIPの実サイズ・SHA-256・ファイル構成・Python構文・起動を確認してから適用します。JSONとZIPが食い違う場合や署名が不正な場合は適用しません。取得時のリダイレクトもHTTPSのGitHub配布用ホストだけに限定します。また、GitHub Releases の公開成果物には SLSA Build Provenance アテステーションが付与され、`gh attestation verify attendance-update.zip --repo HR0101/AttendanceSystem` でビルド来歴を検証できます。適用中に失敗した場合は元に戻し、途中でプロセスが終了した場合は次回起動時に復元します。通常起動や `--notes` では、すでに準備された更新も適用しません。
 
-v0.2.3以降は、`att update` で依存パッケージが変わる更新も自動で準備します。配布元が固定した版・SHA-256のパッケージと対応するChromiumを専用の仮想環境へダウンロードし、整合性とブラウザ起動を確認してから、アプリ本体と一緒に切り替えます。準備に失敗した場合は現在のアプリと実行環境を維持します。ロールバックでは依存環境も戻します。元の `.venv` は保持します。
+v0.2.3以降は、`att update` で依存パッケージが変わる更新も自動で準備します。配布元が固定した版・SHA-256のパッケージと対応するChromiumを専用の仮想環境へダウンロードし、Playwright の取得元上書き環境変数を除外したうえで、ピン留めされた Chromium リビジョン・配置先・整合性・ブラウザ起動を確認してから、アプリ本体と一緒に切り替えます。準備に失敗した場合は現在のアプリと実行環境を維持します。ロールバックでは依存環境も戻します。元の `.venv` は保持します。
 
 初回の移行後も、通常起動は既存の `.venv` を利用します。専用環境の準備は最初の `att update` で行い、そのダウンロード中はインターネット接続が必要です。ヘルプ・バージョン表示・デモ・`update --notes`・`update --rollback` は準備なしで利用できます。依存関係の記録は `.updates/dependencies.log`、更新確認の失敗は `.updates/updater.log` に保存します。更新の確認・通知を止める場合は `ATTENDANCE_NO_UPDATE=1 att --ui` を使ってください。
 
@@ -96,7 +96,7 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 
 `src/version.py` の `VERSION` と同じ版の `updates/X.Y.Z.md` に「変更内容」「利用者の操作」を記載します。CIはファイルの欠落・版不一致・空欄・未記入の目印を拒否します。PRでは変更に合わせてこのファイルも作成・追記してください。既存ファイルを変更せずコードだけ変えたPRもCIで失敗します（[記載例](updates/0.2.3.md)）。
 
-`python3 scripts/check_update_notes.py` で確認し、変更をGitHubへ反映して、その版と一致する `vX.Y.Z` タグをpushしてください。`.github/workflows/release.yml` が全テストを実行し、個人設定を含まない `attendance-update.zip` と、版番号・サイズ・SHA-256・更新内容を記載した `attendance-update.json` を作成します。MarkdownはGitHub Releaseの説明にも使います。両方をドラフトに添付してから正式リリースとして公開するため、利用者はそろった配布データを取得できます。通常のコミットをpushするだけでは更新を配信しません。
+`python3 scripts/check_update_notes.py` で確認し、変更をGitHubへ反映して、その版と一致する `vX.Y.Z` タグをpushしてください。`.github/workflows/release.yml` が全テストを実行し、個人設定を含まない `attendance-update.zip` と、版番号・サイズ・SHA-256・更新内容を記載した `attendance-update.json` を作成し、GitHub Artifact Attestations でビルド来歴を付与します。`secrets.RELEASE_SIGNING_KEY`（またはローカル実行時の `--signing-key` / `RELEASE_SIGNING_KEY_FILE`）が設定されている場合は ECDSA P-256 署名（JSON 内 `signature` と `attendance-update.zip.sig`）も生成します。MarkdownはGitHub Releaseの説明にも使います。アセットをドラフトに添付してから正式リリースとして公開するため、利用者はそろった配布データを取得できます。通常のコミットをpushするだけでは更新を配信しません。
 
 リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` と配布用の `src/dependency_lock.py` を再生成してください（[手順](COMMANDS.md#tests)）。ロック情報はPythonのデータファイルとしてZIPに同梱します。旧版の自動更新が未知の `.lock` ファイルを拒否するため、`requirements.lock` 自体はZIPに追加しません。ビルド時に両方の内容が一致するか検証します。v0.2.2以前から最初に移行するリリースでは `requirements.txt` を変更しないでください。v0.2.3への移行後は、依存変更も `att update` で取得・適用できます。
 
