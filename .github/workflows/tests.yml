@@ -24,13 +24,13 @@ jobs:
           python-version: '3.11'
       - name: Validate update notes
         run: python scripts/check_update_notes.py --ci
-      # ロックファイルのハッシュと一致するパッケージだけを導入する。
-      - run: python -m pip install --require-hashes -r requirements.lock
+      # ロックファイルのハッシュと一致する wheel だけを導入する。
+      - run: python -m pip install --no-input --require-hashes --only-binary=:all: -r requirements.lock
       - run: python -m playwright install --with-deps chromium
       - name: Audit dependencies
         # 監査ツールはテスト用の環境と分け、既知の脆弱性があれば失敗させる。
         run: |
           python -m venv "$RUNNER_TEMP/audit"
-          "$RUNNER_TEMP/audit/bin/python" -m pip install --disable-pip-version-check pip-audit==2.10.1
+          "$RUNNER_TEMP/audit/bin/python" -m pip install --no-input --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-audit.lock
           "$RUNNER_TEMP/audit/bin/pip-audit" -r requirements.lock --require-hashes --disable-pip --progress-spinner off
       - run: python -m unittest discover -s tests
