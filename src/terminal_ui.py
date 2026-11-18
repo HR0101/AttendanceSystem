@@ -6,6 +6,7 @@ import queue
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -22,6 +23,47 @@ from .text_input import TextCursor
 from .unsaved_changes import SavePrompt
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
+
+
+def _validate_username_field(value, users, *, current_student_id=None, label="ユーザーネーム", allow_empty=False):
+    """ユーザーネームの入力規則と重複を検証し、案内文を返す。"""
+    if not value:
+        return None if allow_empty else f"{label}を入力してください（1～60文字）。"
+    if not value.strip():
+        return f"{label}は空白だけにできません。1～60文字で入力してください。"
+    if value != value.strip():
+        return f"{label}の前後に空白は使えません。"
+    if any(unicodedata.category(c).startswith("C") for c in value):
+        return f"{label}に制御文字は使えません。"
+    if len(value) > 60:
+        return f"{label}は60文字以内で入力してください。"
+    if any(u["username"] == value and u["student_id"] != current_student_id for u in users):
+        return "そのユーザーネームは登録済みです。"
+    return None
+
+
+def _validate_student_id_field(value, users, *, current_user=None, label="学籍番号", allow_empty=False):
+    """学籍番号の全角文字・空白・記号・重複を検証し、案内文を返す。"""
+    if not value:
+        return None if allow_empty else f"{label}を半角英数字で入力してください。"
+    has_space = any(c.isspace() for c in value)
+    has_fullwidth = any(unicodedata.east_asian_width(c) in ("F", "W") for c in value)
+    if has_fullwidth and has_space:
+        return f"{label}に全角文字・空白は使えません。半角英数字で入力してください。"
+    if has_fullwidth:
+        return f"{label}に全角文字は使えません。半角英数字で入力してください。"
+    if has_space:
+        return f"{label}に空白は使えません。半角英数字で入力してください。"
+    if not value.isascii() or not value.isalnum():
+        return f"{label}は半角英数字のみで入力してください（記号不可）。"
+    if current_user is not None:
+        if value == current_user["student_id"]:
+            return "現在と異なる学籍番号を入力してください。"
+        if any(u["student_id"] == value and u["username"] != current_user["username"] for u in users):
+            return "その学籍番号は登録済みです。"
+    elif any(u["student_id"] == value for u in users):
+        return "その学籍番号は登録済みです。"
+    return None
 
 
 class AttendanceScreen:
@@ -288,6 +330,7 @@ class AttendanceScreen:
                     self.start()
             elif kind == "account_error":
                 self.busy = False
+                self.back_after_save = False
                 if self.submitted_form is not None:
                     draft = self.submitted_form
                     (self.modal, self.form_values, self.form_editors, self.form_index, self.form_initial_values,
@@ -503,49 +546,71 @@ class AttendanceScreen:
         else:
             self.discard_modal()
 
-    def submit_account_form(self):
+    def validate_account_field(self, index, *, allow_empty=False):
+        """現在のユーザーフォームで指定項目の入力を検証し、エラー文を返す。"""
+        users = get_users(self.config)
+        value = self.form_values[index]
         if self.modal == "add":
-            name, student_id, password = self.form_values
-            if not valid_username(name.strip()) or not student_id.strip() or not student_id.strip().isascii() or not student_id.strip().isalnum() or not password:
-                self.form_error = "名前・半角英数字の学生番号・パスワードを入力してください。"
-                return
-            if any(u["username"] == name.strip() or u["student_id"] == student_id.strip() for u in get_users(self.config)):
-                self.form_error = "その名前または学生番号は登録済みです。"
-                return
-            self.account_action("add", self.form_values[0].strip(), student_id=self.form_values[1].strip(), password=self.form_values[2])
+            if index == 0:
+                return _validate_username_field(value, users, allow_empty=allow_empty)
+            if index == 1:
+                return _validate_student_id_field(value, users, label="学生番号", allow_empty=allow_empty)
+            if index == 2:
+                return None if (value or allow_empty) else "パスワードを入力してください。"
+        elif self.modal == "rename":
+            current = users[self.user_index]
+            return _validate_username_field(
+                value, users, current_student_id=current["student_id"],
+                label="新しいユーザーネーム", allow_empty=allow_empty,
+            )
+        elif self.modal == "student_id":
+            current = users[self.user_index]
+            return _validate_student_id_field(
+                value, users, current_user=current, label="学籍番号", allow_empty=allow_empty,
+            )
         elif self.modal == "password":
             password, confirmation = self.form_values
-            if not password:
-                self.form_error = "新しいパスワードを入力してください。"
-                return
-            if password != confirmation:
-                self.form_error = "確認用のパスワードが一致しません。"
-                return
+            if index == 0:
+                if not password:
+                    return None if allow_empty else "新しいパスワードを入力してください。"
+                # 確認欄が入力済みで異なる場合だけ移動時にも不一致を案内する。
+                if allow_empty and confirmation and password != confirmation:
+                    return "確認用のパスワードが一致しません。"
+                return None
+            if index == 1:
+                if not confirmation:
+                    return None if allow_empty else "確認用のパスワードを入力してください。"
+                if password != confirmation:
+                    return "確認用のパスワードが一致しません。"
+        return None
+
+    def first_invalid_account_field(self):
+        """項目順に入力を検証し、最初の (項目番号, エラー文) を返す。"""
+        for index in range(len(self.form_values)):
+            error = self.validate_account_field(index, allow_empty=False)
+            if error:
+                return index, error
+        return None
+
+    def submit_account_form(self):
+        invalid = self.first_invalid_account_field()
+        if invalid is not None:
+            self.form_index, self.form_error = invalid
+            self.back_after_save = False
+            return
+        if self.modal == "add":
+            name, student_id, password = self.form_values
+            self.account_action("add", name, student_id=student_id, password=password)
+        elif self.modal == "password":
+            password, _ = self.form_values
             users = get_users(self.config)
             self.account_action("password", users[self.user_index]["username"], password=password)
         elif self.modal == "student_id":
             users = get_users(self.config)
-            new_id = self.form_values[0].strip()
-            if not new_id or not new_id.isascii() or not new_id.isalnum():
-                self.form_error = "学籍番号は半角英数字で入力してください。"
-                return
-            if new_id == users[self.user_index]["student_id"]:
-                self.form_error = "現在と異なる学籍番号を入力してください。"
-                return
-            if any(user["student_id"] == new_id for user in users):
-                self.form_error = "その学籍番号は登録済みです。"
-                return
-            self.account_action("student_id", users[self.user_index]["username"], student_id=new_id)
+            self.account_action("student_id", users[self.user_index]["username"], student_id=self.form_values[0])
         else:
             users = get_users(self.config)
-            new_name = self.form_values[0].strip()
-            if not valid_username(new_name):
-                self.form_error = "新しいユーザーネームを1～60文字で入力してください。"
-                return
-            if any(u["username"] == new_name and u["student_id"] != users[self.user_index]["student_id"] for u in users):
-                self.form_error = "そのユーザーネームは登録済みです。"
-                return
-            self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0].strip())
+            self.account_action("rename", users[self.user_index]["username"], new_name=self.form_values[0])
 
     def handle_modal(self, key):
         if self.save_prompt.active:
@@ -608,7 +673,9 @@ class AttendanceScreen:
             elif enter and self.form_index == len(self.form_values) - 1:
                 self.submit_account_form()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
+                leaving = self.form_index
                 self.form_index = (self.form_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.form_values)
+                self.form_error = self.validate_account_field(leaving, allow_empty=True) or ""
             else:
                 if len(self.form_editors) != len(self.form_values):
                     self.form_editors = [TextCursor(value) for value in self.form_values]
@@ -810,8 +877,11 @@ class AttendanceScreen:
             guide = "最後の項目でEnter: 保存"
             if self.modal in ("add", "password"):
                 guide += "  F2: " + ("隠す" if self.password_visible else "パスワード表示")
-            canvas.put(top + height - 4, left + 3, guide, color(1), width - 6)
-            canvas.put(top + height - 3, left + 3, self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。"), color(3) if self.form_error else curses.A_DIM, width - 6)
+            canvas.put(top + height - 5, left + 3, guide, color(1), width - 6)
+            footer_text = self.form_error or ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。")
+            footer_attr = color(3) if self.form_error else curses.A_DIM
+            for offset, line in enumerate(wrap_text(footer_text, width - 6)[:2]):
+                canvas.put(top + height - 4 + offset, left + 3, line, footer_attr, width - 6)
         elif self.modal == "default":
             users = get_users(self.config)
             name = users[self.user_index]["username"]

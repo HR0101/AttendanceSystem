@@ -7,9 +7,10 @@ import threading
 from datetime import date
 
 from .config import load_config
+from .room import RoomError, parse_room
 from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
-    load_schedule, registration_time, remove_agent, save_schedule, schedule_data, validate_schedule,
+    load_schedule, registration_time, remove_agent, save_schedule, schedule_data, valid_time, validate_schedule,
 )
 from .terminal_layout import color
 from .text_input import TextCursor
@@ -17,6 +18,29 @@ from .users import select_user
 
 
 DAYS = dict(zip(WEEKDAYS, "月火水木金土日"))
+
+
+def _parse_iso_date(value: str) -> date | None:
+    """厳密な YYYY-MM-DD 形式の日付を検証して返す。"""
+    if len(value) != 10 or value[4] != "-" or value[7] != "-":
+        return None
+    if not (value[:4].isascii() and value[:4].isdecimal()
+            and value[5:7].isascii() and value[5:7].isdecimal()
+            and value[8:10].isascii() and value[8:10].isdecimal()):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _normalize_weekday(value: str) -> str | None:
+    """曜日入力（mon～sun または 月～日）を内部キーへ正規化する。"""
+    day = value.strip()
+    if not day:
+        return None
+    normalized = next((key for key, label in DAYS.items() if day in (label, label + "曜", label + "曜日")), day.lower())
+    return normalized if normalized in WEEKDAYS else None
 
 
 class SchedulePanel:
@@ -160,14 +184,114 @@ class SchedulePanel:
         else:
             self.discard_form()
 
+    def _validate_period_field(self, index, *, allow_empty=False):
+        raw = self.fields[index]
+        stripped = raw.strip()
+        if index == 0:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "開始日は半角の YYYY-MM-DD 形式で入力してください（例: 2026-09-18）。"
+            if _parse_iso_date(stripped) is None:
+                return "開始日は半角の YYYY-MM-DD 形式で入力してください（例: 2026-09-18）。"
+            return None
+        if index == 1:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "終了日は半角の YYYY-MM-DD 形式で入力してください（例: 2026-12-21）。"
+            end_date = _parse_iso_date(stripped)
+            if end_date is None:
+                return "終了日は半角の YYYY-MM-DD 形式で入力してください（例: 2026-12-21）。"
+            start_date = _parse_iso_date(self.fields[0].strip())
+            if start_date is not None and start_date > end_date:
+                return "終了日は開始日以降の日付（YYYY-MM-DD）にしてください。"
+            return None
+        if index == 2:
+            tokens = [s.strip() for s in raw.replace("、", ",").split(",") if s.strip()]
+            if any(_parse_iso_date(token) is None for token in tokens):
+                return "休講日は半角の YYYY-MM-DD 形式で入力してください（複数はカンマ区切り）。"
+        return None
+
+    def _validate_course_field(self, index, *, allow_empty=False):
+        raw = self.fields[index]
+        stripped = raw.strip()
+        if index == 0:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "出席画面と一致する授業名を入力してください。"
+            return None
+        if index == 1:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "曜日は mon～sun または 月～日 で入力してください。"
+            if _normalize_weekday(stripped) is None:
+                return "曜日は半角の mon～sun または 月～日 で入力してください。"
+            return None
+        if index == 2:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "授業開始時刻は HH:MM 形式で入力してください（例: 14:00）。"
+            if not valid_time(stripped):
+                return "授業開始時刻は半角の HH:MM 形式で入力してください（例: 14:00）。"
+            day = _normalize_weekday(self.fields[1])
+            courses = (self.data or {}).get("courses", [])
+            enabled = True if self.mode == "add" else courses[self.index].get("enabled", True)
+            if day and enabled:
+                for i, course in enumerate(courses):
+                    if self.mode == "edit" and i == self.index:
+                        continue
+                    if course.get("enabled", True) and course.get("weekday") == day and course.get("start_time") == stripped:
+                        return "同じ曜日・開始時刻に複数の授業は設定できません。"
+            return None
+        if index == 3:
+            if not stripped:
+                return None if (allow_empty and raw == "") else "QR番号は半角数字3桁で入力してください（例: 642、731）。"
+            try:
+                parse_room(stripped)
+            except RoomError:
+                return "QR番号は半角数字3桁で入力してください（例: 642、731）。"
+            return None
+        if index == 4:
+            if stripped:
+                if not valid_time(stripped):
+                    return "登録時刻/範囲開始は半角の HH:MM 形式で入力してください（空欄可）。"
+                return None
+            # 範囲終了だけが正しいHH:MMで入っている場合は、保存時に開始時刻欄へ案内する。
+            if not allow_empty and valid_time(self.fields[5].strip()):
+                return "範囲終了を指定する場合は、登録時刻/範囲開始（HH:MM）も入力してください。"
+            return None
+        if index == 5 and stripped:
+            if not valid_time(stripped):
+                return "範囲終了は登録時刻以降の半角 HH:MM 形式で入力してください（日付またぎ不可）。"
+            reg_time = self.fields[4].strip()
+            if not reg_time:
+                return "範囲終了を指定する場合は、登録時刻/範囲開始（HH:MM）も入力してください。"
+            if valid_time(reg_time) and stripped < reg_time:
+                return "範囲終了は登録時刻以降の半角 HH:MM を指定してください（日付またぎ不可）。"
+        return None
+
+    def validate_field(self, index, *, allow_empty=False):
+        """現在の予定フォームで指定項目の入力を検証し、エラー文を返す。"""
+        if self.mode == "period":
+            return self._validate_period_field(index, allow_empty=allow_empty)
+        if self.mode in ("add", "edit"):
+            return self._validate_course_field(index, allow_empty=allow_empty)
+        return None
+
+    def first_invalid_field(self):
+        """項目順に入力を検証し、最初の (項目番号, エラー文) を返す。"""
+        for index in range(len(self.fields)):
+            error = self.validate_field(index, allow_empty=False)
+            if error:
+                return index, error
+        return None
+
     def submit(self):
+        invalid = self.first_invalid_field()
+        if invalid is not None:
+            self.field_index, self.message = invalid
+            return
         candidate = copy.deepcopy(self.data)
         values = [value.strip() for value in self.fields]
         if self.mode == "period":
             candidate.update(active_from=values[0], active_until=values[1], blackout_dates=[s.strip() for s in values[2].replace("、", ",").split(",") if s.strip()])
         else:
             name, day, start, room, register, until = values
-            day = next((key for key, label in DAYS.items() if day in (label, label + "曜", label + "曜日")), day.lower())
+            day = _normalize_weekday(day)
             course = {"course_name": name, "weekday": day, "start_time": start, "room": room, "enabled": True, "register_time": register, "register_until": until}
             if self.mode == "edit":
                 course["enabled"] = candidate["courses"][self.index].get("enabled", True)
@@ -199,7 +323,9 @@ class SchedulePanel:
             if enter and self.field_index == len(self.fields) - 1:
                 self.submit()
             elif enter or key in ("\t", curses.KEY_DOWN, curses.KEY_UP, curses.KEY_BTAB):
+                leaving = self.field_index
                 self.field_index = (self.field_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.fields)
+                self.message = self.validate_field(leaving, allow_empty=True) or ""
             else:
                 if len(self.editors) != len(self.fields):
                     self.editors = [TextCursor(value) for value in self.fields]
