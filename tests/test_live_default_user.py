@@ -50,6 +50,9 @@ class LiveDefaultUserTests(unittest.TestCase):
         ui.handle_modal(curses.KEY_DOWN)
         ui.handle_modal("d")
         self.assertEqual(ui.modal, "default")
+        self.assertEqual(ui.confirm_selection, 0)
+        ui.handle_modal("\t")
+        self.assertEqual(ui.confirm_selection, 1)
         ui.handle_modal("\n")
         ui.poll()
 
@@ -166,7 +169,8 @@ class LiveDefaultUserTests(unittest.TestCase):
 
     def test_demo_switches_immediately_but_never_saves_or_reads_keychain(self):
         ui = self.screen(demo=True)
-        with patch("src.user_commands._save_private_json", side_effect=AssertionError("config touched")):
+        with patch("src.user_commands._save_private_json", side_effect=AssertionError("config touched")), \
+                patch("src.terminal_ui.agent_installed", side_effect=AssertionError("LaunchAgent touched")):
             self.choose_second_as_default(ui)
         self.assertEqual((ui.student_id, ui.password), ("NEW002", ""))
         self.assertEqual(ui.config["default_user"], "two")
@@ -183,10 +187,19 @@ class LiveDefaultUserTests(unittest.TestCase):
                 ui.open_users()
                 ui.handle_modal(curses.KEY_DOWN)
                 ui.handle_modal("d")
+                self.assertEqual(ui.confirm_selection, 0)
                 screen = Mock(getmaxyx=Mock(return_value=(24, width)))
                 ui.draw(screen)
                 shown = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
-                self.assertIn("Enter: 既定と出席対象を切替", shown)
+                flat = shown.replace("\n", "")
+                self.assertIn("one (OLD001) → two (NEW002)", flat)
+                self.assertIn("現在の出席対象（1人選択中）", flat)
+                self.assertIn("1人のみに切り替わります", flat)
+                self.assertIn("自動実行（停止中）も今後は two (NEW002)", flat)
+                self.assertIn("[ キャンセル ]", shown)
+                self.assertIn("[ 切り替える ]", shown)
+                ui.handle_modal("\t")
+                self.assertEqual(ui.confirm_selection, 1)
                 ui.handle_modal("\n")
                 ui.poll()
                 screen.reset_mock()
@@ -197,6 +210,106 @@ class LiveDefaultUserTests(unittest.TestCase):
                 self.assertNotIn("旧ユーザーの授業", shown)
                 self.assertNotIn("new-secret", shown)
                 self.assertNotIn("old-secret", shown)
+
+    def test_initial_cancel_enter_returns_to_users_without_changing_anything(self):
+        ui = self.screen()
+        ui.open_users()
+        ui.handle_modal(curses.KEY_DOWN)
+        ui.handle_modal("d")
+        self.assertEqual(ui.modal, "default")
+        self.assertEqual(ui.confirm_selection, 0)
+        ui.handle_modal("\n")
+        self.assertEqual(ui.modal, "users")
+        self.assert_previous_state(ui)
+        self.backend.get_password.assert_not_called()
+
+    def test_toggle_keys_and_impact_states_cover_active_unknown_and_unset_default(self):
+        config = dict(self.config, default_user="", ui_selected_users=["OLD001", "NEW002", "THIRD003"])
+        self.path.write_text(json.dumps(config))
+        ui = self.screen()
+        self.assertEqual(len(ui.selected_user_ids), 3)
+        ui.open_users()
+        ui.handle_modal(curses.KEY_DOWN)
+        with patch("src.terminal_ui.agent_installed", return_value=True):
+            ui.handle_modal("d")
+        for key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+            before = ui.confirm_selection
+            ui.handle_modal(key)
+            self.assertEqual(ui.confirm_selection, 1 - before)
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        ui.draw(screen)
+        flat = "".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("既定ユーザー: 未設定 → two (NEW002)", flat)
+        self.assertIn("現在の出席対象（3人選択中）", flat)
+        self.assertIn("自動実行（有効中）も今後は two (NEW002) で実行されます。", flat)
+
+        with patch("src.terminal_ui.agent_installed", side_effect=OSError("launchctl missing")):
+            lines = ui.default_switch_impact({"username": "two", "student_id": "NEW002"})
+        self.assertIn("自動実行（状態未確認）", lines[2])
+
+        self.path.write_bytes(self.before)
+        same_ui = self.screen()
+        same_lines = same_ui.default_switch_impact({"username": "one", "student_id": "OLD001"}, agent_active=False)
+        self.assertIn("one (OLD001)（変更なし）", same_lines[0])
+        self.assertIn("one (OLD001) のままです", same_lines[1])
+        self.assertIn("自動実行（停止中）は引き続き one (OLD001)", same_lines[2])
+
+    def test_save_prompt_shows_same_impact_and_handles_discard_and_failures(self):
+        config = dict(self.config, ui_selected_users=["OLD001", "NEW002", "THIRD003"])
+        self.path.write_text(json.dumps(config))
+        before = self.path.read_bytes()
+        ui = self.screen()
+        ui.open_users()
+        ui.handle_modal(curses.KEY_DOWN)
+        with patch("src.terminal_ui.agent_installed", return_value=True) as probe:
+            ui.handle_modal("d")
+            ui.handle_modal("q")
+        probe.assert_called_once_with(self.base)
+        self.assertTrue(ui.save_prompt.active)
+        for width in (62, 80, 120):
+            with self.subTest(width=width):
+                screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+                ui.draw(screen)
+                shown = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+                flat = shown.replace("\n", "")
+                self.assertIn("one (OLD001) → two (NEW002)", flat)
+                self.assertIn("現在の出席対象（3人選択中）", flat)
+                self.assertIn("自動実行（有効中）も今後は two (NEW002)", flat)
+                self.assertIn("[ 保存して戻る ]", shown)
+                self.assertIn("[ 保存せず戻る ]", shown)
+                self.assertIn("[ 編集を続ける ]", shown)
+
+        # 保存せず戻るを選んでも状態は変わらない
+        ui.handle_modal(curses.KEY_UP)
+        ui.handle_modal("\n")
+        self.assertFalse(ui.save_prompt.active)
+        self.assertEqual(ui.modal, "users")
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(ui.selected_user_ids, {"OLD001", "NEW002", "THIRD003"})
+
+        # 保存確認経由での保存失敗・Keychain失敗時も従来の状態を保つ
+        for failure in ("save", "keychain"):
+            with self.subTest(failure=failure):
+                self.path.write_bytes(self.before)
+                ui = self.screen()
+                ui.open_users()
+                ui.handle_modal(curses.KEY_DOWN)
+                ui.handle_modal("d")
+                ui.handle_modal("\x1b")
+                ui.handle_modal(curses.KEY_DOWN)
+                if failure == "save":
+                    with patch("src.user_commands._save_private_json", side_effect=PermissionError("保存不可")):
+                        ui.handle_modal("\n")
+                        ui.poll()
+                    self.assertIn("保存不可", ui.form_error)
+                else:
+                    with patch.object(self.backend, "get_password", side_effect=RuntimeError("secret-detail")):
+                        ui.handle_modal("\n")
+                        ui.poll()
+                    self.assertIn("Keychain", ui.form_error)
+                    self.assertNotIn("secret-detail", ui.form_error)
+                self.assert_previous_state(ui)
+                self.assertEqual(ui.modal, "users")
 
 
 if __name__ == "__main__":
