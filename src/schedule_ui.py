@@ -11,7 +11,7 @@ from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
     load_schedule, registration_time, remove_agent, save_schedule, schedule_data, validate_schedule,
 )
-from .terminal_layout import color
+from .terminal_layout import prefix_text, wrap_text
 from .text_input import TextCursor
 from .users import select_user
 
@@ -31,11 +31,13 @@ class SchedulePanel:
         self.editors = []
         self.field_index = 0
         self.message = ""
+        self.message_level = "info"
         self.events = queue.Queue()
 
     def work(self, operation):
         self.owner.busy = True
         self.message = "処理中…"
+        self.message_level = "info"
 
         def run():
             try:
@@ -56,8 +58,10 @@ class SchedulePanel:
         self.owner.busy = False
         if error:
             self.message = error
+            self.message_level = "error"
         else:
             self.data, self.active, self.message = result
+            self.message_level = "warning" if "反映に失敗" in self.message else "info"
             self.mode = "list"
             self.fields = []
             self.initial_fields = ()
@@ -94,6 +98,7 @@ class SchedulePanel:
             candidate = schedule_data(validate_schedule(candidate))
         except ScheduleError as exc:
             self.message = str(exc)
+            self.message_level = "error"
             return
         active = self.active
 
@@ -137,7 +142,7 @@ class SchedulePanel:
         self.work(toggle)
 
     def form(self, mode):
-        self.mode, self.field_index, self.message = mode, 0, ""
+        self.mode, self.field_index, self.message, self.message_level = mode, 0, "", "info"
         if mode == "period":
             self.fields = [self.data["active_from"], self.data["active_until"], ",".join(self.data["blackout_dates"])]
         elif mode == "edit":
@@ -149,7 +154,7 @@ class SchedulePanel:
         self.initial_fields = tuple(self.fields)
 
     def discard_form(self):
-        self.mode, self.fields, self.editors, self.message = "list", [], [], ""
+        self.mode, self.fields, self.editors, self.message, self.message_level = "list", [], [], "", "info"
         self.initial_fields = ()
 
     def request_back(self):
@@ -212,7 +217,7 @@ class SchedulePanel:
         elif (enter or key in ("e", "E")) and courses:
             self.form("edit")
         elif key in ("d", "D") and courses:
-            self.mode, self.message = "delete", ""
+            self.mode, self.message, self.message_level = "delete", "", "info"
         elif key in ("t", "T") and courses:
             candidate = copy.deepcopy(self.data)
             course = candidate["courses"][self.index]
@@ -228,13 +233,16 @@ class SchedulePanel:
     def draw(self, canvas):
         width, height = min(canvas.width - 6, 88), min(canvas.height - 2, 26)
         left, top = (canvas.width - width) // 2, (canvas.height - height) // 2
-        canvas.box(top, left, width, height, "自動出席の予定", color(1))
+        canvas.box(top, left, width, height, "自動出席の予定", canvas.color(1))
 
         def put(row, text, attr=0):
             canvas.put(top + row, left + 3, text, attr, width - 6)
 
         if self.data is None:
-            put(3, "予定を読み込んでいます…" if self.owner.busy else "予定を読み込めませんでした。Rで再試行。")
+            if self.owner.busy:
+                put(3, "予定を読み込んでいます…")
+            else:
+                put(3, prefix_text("error", "予定を読み込めませんでした。Rで再試行。"), canvas.color(3) | curses.A_BOLD)
         elif self.mode == "list":
             default = select_user(self.owner.config)
             put(1, f"自動実行: {'有効' if self.active else '停止中'} / ユーザー: {default['username'] if default else '未設定'}", curses.A_BOLD)
@@ -248,12 +256,12 @@ class SchedulePanel:
                 timing = registration_time(course) + (f"～{course['register_until']}" if course.get("register_until") else "")
                 text = f"{'●' if course.get('enabled', True) else '－'} {DAYS[course['weekday']]} {course['start_time']}→{timing} QR{course['room']} {course['course_name']}"
                 put(5 + i - first, text, curses.A_REVERSE if i == self.index else 0)
-            put(height - 6, "A 追加  Enter 編集  D 削除  T 有効/無効", color(1))
-            put(height - 5, "P 期間・休講日  I 自動実行の開始/停止", color(1))
+            put(height - 6, "A 追加  Enter 編集  D 削除  T 有効/無効", canvas.color(1))
+            put(height - 5, "P 期間・休講日  I 自動実行の開始/停止", canvas.color(1))
         elif self.mode == "delete":
             put(3, self.data["courses"][self.index]["course_name"], curses.A_BOLD)
             put(6, "この授業の自動出席予定を削除します。")
-            put(8, "Enter: 削除する / Esc: 戻る", color(4))
+            put(8, prefix_text("warning", "Enter: 削除する / Esc: 戻る"), canvas.color(4) | curses.A_BOLD)
         else:
             labels = ("開始日 YYYY-MM-DD", "終了日 YYYY-MM-DD", "休講日 YYYY-MM-DD（複数はカンマ区切り）") if self.mode == "period" else ("授業名（出席画面と一致）", "曜日 mon～sun または 月～日", "授業開始時刻 HH:MM", "QR番号（例: 642、731）", "登録時刻/範囲開始 HH:MM（空欄:開始5分後）", "範囲終了 HH:MM（空欄:固定時刻）")
             for i, label in enumerate(labels):
@@ -262,9 +270,14 @@ class SchedulePanel:
                 if len(self.editors) != len(self.fields):
                     self.editors = [TextCursor(value) for value in self.fields]
                 self.editors[i].draw(canvas, top + row + 1, left + 3, self.fields[i], width - 6, active=i == self.field_index)
-            put(height - 5, "Tab/↑↓:項目 ←→:編集 最後でEnter:保存", color(1))
-        # 長いエラーでも2行で読み取れるようにする。
-        from .terminal_layout import wrap_text
-        for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
-            put(height - 4 + offset, line, color(4))
+            put(height - 5, "Tab/↑↓:項目 ←→:編集 最後でEnter:保存", canvas.color(1))
+        # 長いエラーでも2行で読み取れるようにする。色だけに頼らない接頭辞も付与する。
+        display_message = prefix_text(self.message_level, self.message)
+        message_attr = (
+            canvas.color(3) | curses.A_BOLD if self.message_level == "error"
+            else canvas.color(4) | curses.A_BOLD if self.message_level == "warning"
+            else canvas.color(1)
+        )
+        for offset, line in enumerate(wrap_text(display_message, width - 6)[:2]):
+            put(height - 4 + offset, line, message_attr)
         put(height - 2, "Esc/Q: 戻る  R: 再読込" if self.mode == "list" else "Esc: 戻る・保存確認  Ctrl+U: 全消去", curses.A_DIM)

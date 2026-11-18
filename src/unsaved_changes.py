@@ -2,7 +2,7 @@
 
 import curses
 
-from .terminal_layout import color
+from .terminal_layout import prefix_text
 
 
 class SavePrompt:
@@ -36,7 +36,7 @@ class SavePrompt:
     def draw(self, canvas):
         width, height = min(canvas.width - 4, 64), min(canvas.height - 2, 15)
         left, top = (canvas.width - width) // 2, (canvas.height - height) // 2
-        canvas.box(top, left, width, height, "未保存の変更", color(4))
+        canvas.box(top, left, width, height, prefix_text("warning", "未保存の変更"), canvas.color(4))
         canvas.put(top + 2, left + 3, self.title, curses.A_BOLD, width - 6)
         canvas.put(top + 3, left + 3, "変更を保存してから戻りますか？", width=width - 6)
         for index, label in enumerate(("[ 保存して戻る ]", "[ 保存せず戻る ]", "[ 編集を続ける ]")):
