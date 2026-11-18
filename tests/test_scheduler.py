@@ -1,7 +1,12 @@
+import tempfile
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 
-from src.scheduler import ScheduleError, calendar_intervals, due_course, registration_time, validate_schedule, schedule_data
+from src.scheduler import (
+    ScheduleError, calendar_intervals, due_course, registration_time,
+    save_schedule, schedule_data, schedule_digest, schedule_lock, validate_schedule,
+)
 
 
 COURSE = {
@@ -91,6 +96,32 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(due_course(schedule, datetime(2026, 10, 5, 0, 3)), course)
         schedule["blackout_dates"] = frozenset({date(2026, 10, 4)})
         self.assertIsNone(due_course(schedule, datetime(2026, 10, 5, 0, 3)))
+
+    def test_schedule_lock_and_digest_check_permissions_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = base / "schedule.json"
+            self.assertIsNone(schedule_digest(path))
+            save_schedule(path, schedule_data(SCHEDULE))
+            digest = schedule_digest(path)
+            self.assertEqual(len(digest), 64)
+            with schedule_lock(path, exclusive=True):
+                lock_path = base / ".schedule.json.lock"
+                self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+                with self.assertRaises(BlockingIOError):
+                    with schedule_lock(path, exclusive=True, blocking=False):
+                        pass
+            target = base / "other.json"
+            target.write_text("{}", encoding="utf-8")
+            path.unlink()
+            path.symlink_to(target)
+            with self.assertRaises(ScheduleError):
+                schedule_digest(path)
+            lock_path.unlink()
+            lock_path.symlink_to(target)
+            with self.assertRaises(ScheduleError):
+                with schedule_lock(path, exclusive=True):
+                    pass
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 """授業予定の検証と macOS LaunchAgent の管理。"""
 
+import contextlib
+import fcntl
 import json
 import hashlib
 import os
@@ -113,6 +115,34 @@ def save_schedule(path: Path, raw: dict) -> dict:
         if os.path.exists(temporary):
             os.unlink(temporary)
     return schedule
+
+
+@contextlib.contextmanager
+def schedule_lock(path: Path, *, exclusive: bool = True, blocking: bool = True):
+    """schedule.json の読み書き競合を防ぐ専用ロックファイルで排他制御する。"""
+    lock_path = path.with_name(f".{path.name}.lock")
+    if lock_path.is_symlink():
+        raise ScheduleError("予定のロックファイルがシンボリックリンクです。")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a+", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(stream.fileno(), mode | (0 if blocking else fcntl.LOCK_NB))
+        try:
+            yield stream
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def schedule_digest(path: Path) -> str | None:
+    """schedule.json のSHA-256ハッシュを返す。ファイルがない場合は None。"""
+    if path.is_symlink():
+        raise ScheduleError("schedule.json がシンボリックリンクのため処理できません。")
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
 
 
 def _start_week_minute(course: dict) -> int:
