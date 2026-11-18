@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import http.client
 import importlib
+import io
 import json
 import os
 import platform
@@ -363,16 +364,21 @@ def validate_manifest(manifest):
     return manifest
 
 
+def _public_key_active(key_pem):
+    return not isinstance(key_pem, str) or bool(key_pem.strip())
+
+
 def _configured_public_key(base, public_key_pem=None):
     if public_key_pem is not None:
         return public_key_pem
-    if PUBLIC_KEY_PEM:
+    if _public_key_active(PUBLIC_KEY_PEM):
         return PUBLIC_KEY_PEM
-    config = read_json(base / "config.json", {})
-    if isinstance(config, dict):
-        configured = config.get("update_public_key")
-        if isinstance(configured, str) and configured.strip():
-            return configured
+    if base is not None:
+        config = read_json(Path(base) / "config.json", {})
+        if isinstance(config, dict):
+            configured = config.get("update_public_key")
+            if configured is not None and (not isinstance(configured, str) or configured.strip()):
+                return configured
     return ""
 
 
@@ -402,17 +408,15 @@ def verify_manifest_signature(manifest, archive_data=None, *, public_key_pem=Non
     return has_key
 
 
-def _module_public_key_active():
-    return not isinstance(PUBLIC_KEY_PEM, str) or bool(PUBLIC_KEY_PEM.strip())
-
-
-def fetch_manifest(state, deadline):
+def fetch_manifest(state, deadline, *, public_key_pem=None, require_signature=False):
     """検証済みJSONとETagを保存し、304ではそのJSONを再利用する。"""
+    key_pem = PUBLIC_KEY_PEM if public_key_pem is None else public_key_pem
+    require_check = _public_key_active(key_pem) or require_signature
     cached = state.get("manifest")
     try:
         validate_manifest(cached)
-        if _module_public_key_active():
-            verify_manifest_signature(cached)
+        if require_check:
+            verify_manifest_signature(cached, public_key_pem=key_pem, require_signature=require_signature)
     except (UpdateError, ValueError, TypeError):
         cached = None
     etag = state.get("etag")
@@ -434,8 +438,8 @@ def fetch_manifest(state, deadline):
                 continue
             raise UpdateError("更新情報JSONが304を返しましたが、再利用できるキャッシュがありません。") from exc
         manifest = validate_manifest(json.loads(data))
-        if _module_public_key_active():
-            verify_manifest_signature(manifest)
+        if require_check:
+            verify_manifest_signature(manifest, public_key_pem=key_pem, require_signature=require_signature)
         state["manifest"] = manifest
         value = header_value(received, "ETag")
         state.pop("etag", None)
@@ -463,6 +467,9 @@ def pending_metadata(base):
         return None
     if not pending.is_dir():
         raise UpdateError("更新の一時領域が通常のフォルダではありません。インストール先を確認してください。")
+    if (pending / "metadata.json").is_symlink():
+        shutil.rmtree(pending)
+        return None
     metadata = read_json(pending / "metadata.json")
     try:
         if not isinstance(metadata, dict):
@@ -484,7 +491,8 @@ def pending_metadata(base):
     return metadata
 
 
-def validate_payload(archive, destination, tag):
+def _iter_archive_entries(archive):
+    """更新用ZIPの構成と各エントリの妥当性を検証し、(filename, data) を返す。"""
     with zipfile.ZipFile(archive) as package:
         entries = package.infolist()
         names = [entry.filename for entry in entries]
@@ -496,18 +504,74 @@ def validate_payload(archive, destination, tag):
             mode = entry.external_attr >> 16
             if not allowed(entry.filename) or stat.S_ISLNK(mode) or entry.is_dir():
                 raise UpdateError("更新対象外のファイルが含まれています。")
-            data = package.read(entry)
-            if entry.filename.endswith(".py"):
-                compile(data, entry.filename, "exec")
-            atomic_write(destination / entry.filename, data, 0o755 if entry.filename in {
-                "att", "attendance", "start.command", "install.command", "install.sh"} else 0o644)
+        for entry in entries:
+            yield entry.filename, package.read(entry)
+
+
+def _pending_requires_verification(pending, metadata, signature_required):
+    archive_path = pending / ASSET_NAME
+    return signature_required or "manifest" in metadata or archive_path.exists() or archive_path.is_symlink()
+
+
+def _verify_pending(base, pending, metadata, *, public_key_pem=None, require_signature=False):
+    """準備済み更新データの署名・アーカイブ整合性・展開済みファイルを検証する。"""
+    effective_key = _configured_public_key(base, public_key_pem)
+    signature_required = _public_key_active(effective_key) or require_signature
+    manifest = metadata.get("manifest")
+    if not isinstance(manifest, dict):
+        if signature_required:
+            verify_manifest_signature({}, public_key_pem=effective_key, require_signature=True)
+        raise UpdateError("準備済み更新に更新情報JSONが含まれていません。")
+    archive_path = pending / ASSET_NAME
+    try:
+        st = archive_path.lstat()
+    except FileNotFoundError as exc:
+        if signature_required:
+            verify_manifest_signature(manifest, public_key_pem=effective_key, require_signature=True)
+        raise UpdateError("準備済み更新のアーカイブが見つかりません。") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size > MAX_ARCHIVE:
+        if signature_required:
+            verify_manifest_signature(manifest, public_key_pem=effective_key, require_signature=True)
+        raise UpdateError("準備済み更新のアーカイブが不正です。")
+    archive_bytes = archive_path.read_bytes()
+    verify_manifest_signature(
+        manifest,
+        archive_bytes,
+        public_key_pem=effective_key,
+        require_signature=signature_required,
+    )
+    if version_tuple(manifest["version"]) != version_tuple(metadata["version"]):
+        raise UpdateError("準備済み更新のバージョンが更新情報JSONと一致しません。")
+    archive_digests = {
+        filename: hashlib.sha256(data).hexdigest()
+        for filename, data in _iter_archive_entries(io.BytesIO(archive_bytes))
+    }
+    if archive_digests != metadata["files"] or fingerprint(pending) != metadata["files"]:
+        raise UpdateError("準備済み更新のファイルがアーカイブと一致しません。")
+
+
+def validate_payload(archive, destination, tag):
+    for filename, data in _iter_archive_entries(archive):
+        if filename.endswith(".py"):
+            compile(data, filename, "exec")
+        atomic_write(destination / filename, data, 0o755 if filename in {
+            "att", "attendance", "start.command", "install.command", "install.sh"} else 0o644)
     source = (destination / "src/version.py").read_text()
     match = re.search(r'^VERSION = "([0-9.]+)"$', source, re.MULTILINE)
     if not match or version_tuple(match[1]) != version_tuple(tag):
         raise UpdateError("リリースタグとアプリのバージョンが一致しません。")
 
 
-def refresh_manifest(base, force=False, *, every_start=False):
+def _clear_cached_manifest(updates):
+    check_path = updates / "check.json"
+    state = read_json(check_path)
+    if isinstance(state, dict) and ("manifest" in state or "etag" in state):
+        state.pop("manifest", None)
+        state.pop("etag", None)
+        write_json(check_path, state)
+
+
+def refresh_manifest(base, force=False, *, every_start=False, public_key_pem=None, require_signature=False):
     """呼出側がdownload.lockを保持する。更新情報だけを取得し、失敗時は再試行を抑止する。"""
     updates = base / ".updates"
     state = read_json(updates / "check.json", {})
@@ -525,11 +589,30 @@ def refresh_manifest(base, force=False, *, every_start=False):
                    and type(interval) in (int, float) and 0 < interval <= 86400)
     if not force and valid_clock and now - checked_at < interval:
         return None
+    effective_key = _configured_public_key(base, public_key_pem)
+    require_check = _public_key_active(effective_key) or require_signature
+    if "manifest" in state:
+        try:
+            validate_manifest(state["manifest"])
+            if require_check:
+                verify_manifest_signature(
+                    state["manifest"],
+                    public_key_pem=effective_key,
+                    require_signature=require_signature,
+                )
+        except (UpdateError, ValueError, TypeError):
+            state.pop("manifest", None)
+            state.pop("etag", None)
     state["check_failed"] = True
     write_json(updates / "check.json", {**state, "checked_at": now, "interval": 3600})
     deadline = time.monotonic() + (5 if every_start else 25)
     try:
-        manifest = fetch_manifest(state, deadline)
+        manifest = fetch_manifest(
+            state,
+            deadline,
+            public_key_pem=effective_key,
+            require_signature=require_signature,
+        )
     except HTTPError as exc:
         record_rate_limit(updates, state, exc)
         if exc.code == 404:
@@ -552,8 +635,9 @@ def cached_manifest(base):
     state = read_json(base / ".updates/check.json", {})
     try:
         manifest = validate_manifest(state.get("manifest"))
-        if _module_public_key_active():
-            verify_manifest_signature(manifest)
+        effective_key = _configured_public_key(base)
+        if _public_key_active(effective_key):
+            verify_manifest_signature(manifest, public_key_pem=effective_key)
         return manifest
     except (AttributeError, UpdateError, ValueError, TypeError):
         return None
@@ -628,15 +712,38 @@ def prepare_update(base, force=False, *, public_key_pem=None, require_signature=
     """att updateで通信と検証を行う。起動中のコードは変更しない。"""
     updates = base / ".updates"
     with file_lock(updates / "download.lock", exclusive=True, blocking=False):
-        had_pending = (updates / "pending").exists()
-        if pending_metadata(base) is not None:
-            return "更新の準備ができています。終了時に適用します。"
-        result = refresh_manifest(base, force=force or had_pending)
+        pending = updates / "pending"
+        had_pending = pending.exists() or pending.is_symlink()
+        effective_key = _configured_public_key(base, public_key_pem)
+        signature_required = _public_key_active(effective_key) or require_signature
+        metadata = pending_metadata(base)
+        if metadata is not None:
+            if _pending_requires_verification(pending, metadata, signature_required):
+                try:
+                    _verify_pending(
+                        base,
+                        pending,
+                        metadata,
+                        public_key_pem=effective_key,
+                        require_signature=signature_required,
+                    )
+                except (UpdateError, ValueError, zipfile.BadZipFile, OSError):
+                    shutil.rmtree(pending)
+                    _clear_cached_manifest(updates)
+                    had_pending = True
+                    metadata = None
+            if metadata is not None:
+                return "更新の準備ができています。終了時に適用します。"
+        result = refresh_manifest(
+            base,
+            force=force or had_pending,
+            public_key_pem=effective_key,
+            require_signature=require_signature,
+        )
         if result is None:
             return None
         manifest, state, deadline = result
-        effective_key = _configured_public_key(base, public_key_pem)
-        if not isinstance(effective_key, str) or effective_key.strip() or require_signature:
+        if signature_required:
             verify_manifest_signature(
                 manifest,
                 public_key_pem=effective_key,
@@ -689,8 +796,17 @@ def prepare_update(base, force=False, *, public_key_pem=None, require_signature=
             # 起動確認で作成されたキャッシュは配布対象にしない。
             for cache in payload.rglob("__pycache__"):
                 shutil.rmtree(cache)
-            write_json(payload / "metadata.json", {"version": tag, "before": fingerprint(base),
-                                                    "files": fingerprint(payload), "runtime": target_runtime})
+            atomic_write(payload / ASSET_NAME, data, 0o600)
+            write_json(
+                payload / "metadata.json",
+                {
+                    "version": tag,
+                    "before": fingerprint(base),
+                    "files": fingerprint(payload),
+                    "runtime": target_runtime,
+                    "manifest": manifest,
+                },
+            )
             os.replace(payload, updates / "pending")
         state.pop("skip_version", None)
         write_json(updates / "check.json", {**state, "checked_at": time.time(), "interval": 86400})
@@ -737,7 +853,7 @@ def clear_caches(base):
     shutil.rmtree(base / "__pycache__", ignore_errors=True)
 
 
-def apply_pending(base):
+def apply_pending(base, *, public_key_pem=None, require_signature=False):
     """呼出側が実行ロックを排他的に保持している時だけ呼ぶ。"""
     updates = base / ".updates"
     pending = updates / "pending"
@@ -748,6 +864,22 @@ def apply_pending(base):
     if version_tuple(metadata["version"]) <= version_tuple(VERSION):
         shutil.rmtree(pending)
         return None
+    effective_key = _configured_public_key(base, public_key_pem)
+    signature_required = _public_key_active(effective_key) or require_signature
+    if _pending_requires_verification(pending, metadata, signature_required):
+        try:
+            _verify_pending(
+                base,
+                pending,
+                metadata,
+                public_key_pem=effective_key,
+                require_signature=signature_required,
+            )
+        except (UpdateError, ValueError, zipfile.BadZipFile, OSError) as exc:
+            shutil.rmtree(pending)
+            if isinstance(exc, UpdateError):
+                raise
+            raise UpdateError("準備済み更新の検証に失敗しました。att update で再取得してください。") from exc
     if fingerprint(base) != metadata["before"] or fingerprint(pending) != metadata["files"]:
         shutil.rmtree(pending)
         raise UpdateError("準備後にファイルが変更されたため更新を見送りました。att update で再取得してください。")

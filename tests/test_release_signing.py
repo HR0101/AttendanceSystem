@@ -1,17 +1,21 @@
 """リリース署名 (ECDSA P-256) の生成・検証およびマニフェスト/ZIP改ざん拒否を検証する。"""
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import test_updater as fixtures
 from scripts import build_release
@@ -344,6 +348,245 @@ class ReleaseSigningTests(unittest.TestCase):
         self.assertIn("dist/attendance-update.zip.sig", workflow)
         self.assertIn("RELEASE_SIGNING_KEY", workflow)
         self.assertIn("trap cleanup EXIT", workflow)
+
+    def _configure_key(self, mode):
+        if mode == "config":
+            config_path = self.fixture.base / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["update_public_key"] = self.pub_pem
+            encoded = json.dumps(config).encode("utf-8")
+            config_path.write_bytes(encoded)
+            self.fixture.private["config.json"] = encoded
+            return contextlib.nullcontext()
+        return patch.object(u, "PUBLIC_KEY_PEM", self.pub_pem)
+
+    def _prepare_unsigned_pending(self, data):
+        unsigned = fixtures.manifest_for(data)
+        with patch.object(u, "fetch", side_effect=[json.dumps(unsigned).encode(), data]), \
+                patch.object(u.subprocess, "run", return_value=Mock(returncode=0)):
+            u.prepare_update(self.fixture.base, force=True)
+        pending = self.fixture.base / ".updates/pending"
+        self.assertTrue((pending / u.ASSET_NAME).is_file())
+        self.assertEqual(stat.S_IMODE((pending / u.ASSET_NAME).stat().st_mode), 0o600)
+        self.assertEqual(u.read_json(pending / "metadata.json")["manifest"], unsigned)
+        return pending, unsigned
+
+    def test_unsigned_pending_is_rejected_and_discarded_when_signing_key_is_configured_later(self):
+        for mode in ("config", "module"):
+            with self.subTest(mode=mode, action="run_application_rejects_unsigned"):
+                self.setUp()
+                data = self.fixture.archive()
+                pending, unsigned = self._prepare_unsigned_pending(data)
+                with self._configure_key(mode), \
+                        patch.object(u, "fetch", return_value=json.dumps(unsigned).encode()), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = u.run_application(self.fixture.base, ["update"])
+                self.assertEqual(code, 1)
+                self.assertFalse(pending.exists())
+                self.assertEqual(u.fingerprint(self.fixture.base), self.fixture.original)
+                self.fixture.assert_private_preserved()
+
+            with self.subTest(mode=mode, action="prepare_update_replaces_with_signed"):
+                self.setUp()
+                data = self.fixture.archive()
+                pending, _ = self._prepare_unsigned_pending(data)
+                signed = self.signed_manifest(data)
+                with self._configure_key(mode), \
+                        patch.object(u, "fetch", side_effect=[json.dumps(signed).encode(), data]) as fetch:
+                    message = u.prepare_update(self.fixture.base, force=True)
+                self.assertIn("ダウンロード", message)
+                self.assertEqual(fetch.call_count, 2)
+                self.assertIn(fixtures.NEXT, u.apply_pending(self.fixture.base))
+                self.fixture.assert_private_preserved()
+
+            with self.subTest(mode=mode, action="apply_pending_rejects_and_deletes"):
+                self.setUp()
+                data = self.fixture.archive()
+                pending, _ = self._prepare_unsigned_pending(data)
+                with self._configure_key(mode), self.assertRaisesRegex(u.UpdateError, "署名"):
+                    u.apply_pending(self.fixture.base)
+                self.assertFalse(pending.exists())
+                self.assertEqual(u.fingerprint(self.fixture.base), self.fixture.original)
+                self.fixture.assert_private_preserved()
+
+            with self.subTest(mode=mode, action="legacy_pending_without_manifest_or_archive"):
+                self.setUp()
+                data = self.fixture.archive()
+                pending, unsigned = self._prepare_unsigned_pending(data)
+                metadata = u.read_json(pending / "metadata.json")
+                metadata.pop("manifest")
+                u.write_json(pending / "metadata.json", metadata)
+                (pending / u.ASSET_NAME).unlink()
+                with self._configure_key(mode):
+                    with self.assertRaises(u.UpdateError):
+                        u.apply_pending(self.fixture.base)
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(u.fingerprint(self.fixture.base), self.fixture.original)
+
+                self.setUp()
+                data = self.fixture.archive()
+                pending, unsigned = self._prepare_unsigned_pending(data)
+                metadata = u.read_json(pending / "metadata.json")
+                metadata.pop("manifest")
+                u.write_json(pending / "metadata.json", metadata)
+                (pending / u.ASSET_NAME).unlink()
+                with self._configure_key(mode), patch.object(u, "fetch", return_value=json.dumps(unsigned).encode()):
+                    with self.assertRaisesRegex(u.UpdateError, "署名"):
+                        u.prepare_update(self.fixture.base, force=True)
+                    self.assertFalse(pending.exists())
+
+    def test_signed_pending_is_reused_without_network_and_tampered_pending_is_rejected(self):
+        for mode in ("config", "module"):
+            with self.subTest(mode=mode, case="reuse_and_apply"):
+                self.setUp()
+                data = self.fixture.archive()
+                signed = self.signed_manifest(data)
+                with self._configure_key(mode):
+                    with patch.object(u, "fetch", side_effect=[json.dumps(signed).encode(), data]):
+                        self.assertIn("ダウンロード", u.prepare_update(self.fixture.base, force=True))
+                    pending = self.fixture.base / ".updates/pending"
+                    self.assertEqual(stat.S_IMODE((pending / u.ASSET_NAME).stat().st_mode), 0o600)
+                    self.assertEqual(u.read_json(pending / "metadata.json")["manifest"], signed)
+                    with patch.object(u, "fetch") as fetch:
+                        self.assertIn("準備", u.prepare_update(self.fixture.base, force=True))
+                        fetch.assert_not_called()
+                    self.assertIn(fixtures.NEXT, u.apply_pending(self.fixture.base))
+                    self.fixture.assert_private_preserved()
+
+        def apply_tampering(kind, data):
+            pending = self.fixture.base / ".updates/pending"
+            metadata_path = pending / "metadata.json"
+            metadata = u.read_json(metadata_path)
+            if kind == "tampered_file_and_digest":
+                tampered = b"# tampered main\n"
+                (pending / "main.py").write_bytes(tampered)
+                metadata["files"]["main.py"] = hashlib.sha256(tampered).hexdigest()
+                u.write_json(metadata_path, metadata)
+            elif kind == "extra_file":
+                (pending / "src/injected.py").write_text("# injected\n", encoding="utf-8")
+            elif kind == "metadata_version":
+                metadata["version"] = "v100.0.0"
+                u.write_json(metadata_path, metadata)
+            elif kind == "stripped_signature":
+                metadata["manifest"].pop("signature", None)
+                u.write_json(metadata_path, metadata)
+            elif kind == "tampered_archive_zip":
+                (pending / u.ASSET_NAME).write_bytes(self.fixture.archive({"src/injected.py": b"# evil\n"}))
+            elif kind == "corrupt_archive_bytes":
+                (pending / u.ASSET_NAME).write_bytes(b"not-a-zip")
+            elif kind == "archive_symlink":
+                outside = Path(self.fixture.temp.name) / "outside.zip"
+                outside.write_bytes(data)
+                (pending / u.ASSET_NAME).unlink()
+                (pending / u.ASSET_NAME).symlink_to(outside)
+            return pending
+
+        kinds = (
+            "tampered_file_and_digest",
+            "extra_file",
+            "metadata_version",
+            "stripped_signature",
+            "tampered_archive_zip",
+            "corrupt_archive_bytes",
+            "archive_symlink",
+        )
+        for kind in kinds:
+            with self.subTest(tampering=kind, operation="apply_pending"):
+                self.setUp()
+                data = self.fixture.archive()
+                signed = self.signed_manifest(data)
+                with self._configure_key("config"):
+                    with patch.object(u, "fetch", side_effect=[json.dumps(signed).encode(), data]):
+                        u.prepare_update(self.fixture.base, force=True)
+                    pending = apply_tampering(kind, data)
+                    with self.assertRaises(u.UpdateError):
+                        u.apply_pending(self.fixture.base)
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(u.fingerprint(self.fixture.base), self.fixture.original)
+                    self.fixture.assert_private_preserved()
+
+            with self.subTest(tampering=kind, operation="prepare_update_recovers"):
+                self.setUp()
+                data = self.fixture.archive()
+                signed = self.signed_manifest(data)
+                with self._configure_key("config"):
+                    with patch.object(u, "fetch", side_effect=[json.dumps(signed).encode(), data]):
+                        u.prepare_update(self.fixture.base, force=True)
+                    apply_tampering(kind, data)
+                    with patch.object(u, "fetch", side_effect=[json.dumps(signed).encode(), data]) as fetch:
+                        self.assertIn("ダウンロード", u.prepare_update(self.fixture.base, force=True))
+                        self.assertEqual(fetch.call_count, 2)
+                    self.assertIn(fixtures.NEXT, u.apply_pending(self.fixture.base))
+                    self.fixture.assert_private_preserved()
+
+    def test_config_update_public_key_enforced_for_cached_manifest_304_check_update_and_notes(self):
+        class _Response(io.BytesIO):
+            def __init__(self, body, headers=None):
+                super().__init__(body)
+                self.headers = headers or {}
+
+        data = self.fixture.archive()
+        notes = f"# v{fixtures.NEXT}\n\n## 変更内容\n\n- 署名付きテスト。\n\n## 利用者の操作\n\n- att update で更新してください。\n"
+        unsigned = {**fixtures.manifest_for(data), "release_notes": notes}
+        signed = {**unsigned, "signature": signing.sign_manifest(unsigned, self.priv_pem)}
+
+        u.write_json(
+            self.fixture.base / ".updates/check.json",
+            {"checked_at": time.time(), "interval": 86400, "etag": '"unsigned"', "manifest": unsigned},
+        )
+        with self._configure_key("config"):
+            self.assertIsNone(u.cached_manifest(self.fixture.base))
+            self.assertIsNone(u.cached_update_message(self.fixture.base))
+            with patch.object(u, "fetch") as fetch:
+                self.assertIsNone(u.check_update(self.fixture.base))
+                fetch.assert_not_called()
+
+            # 304 応答でも config.json の公開鍵に適合しない未署名キャッシュは再利用しない。
+            def reject_304(request, timeout):
+                self.assertIsNone(request.get_header("If-none-match"))
+                raise HTTPError(request.full_url, 304, "Not Modified", {}, io.BytesIO())
+
+            with patch.object(u, "urlopen", side_effect=reject_304):
+                with self.assertRaisesRegex(u.UpdateError, "キャッシュがありません"):
+                    u.show_update_notes(self.fixture.base)
+                with self.assertRaisesRegex(u.UpdateError, "キャッシュがありません"):
+                    u.prepare_update(self.fixture.base, force=True)
+
+            # 期限切れの check_update も同様に未署名キャッシュでの 304 再利用・200 受入を拒否する。
+            u.write_json(
+                self.fixture.base / ".updates/check.json",
+                {"checked_at": 0, "interval": 86400, "etag": '"unsigned"', "manifest": unsigned},
+            )
+            with patch.object(u, "urlopen", side_effect=reject_304):
+                with self.assertRaisesRegex(u.UpdateError, "キャッシュがありません"):
+                    u.check_update(self.fixture.base)
+            self.assertNotIn("manifest", u.read_json(self.fixture.base / ".updates/check.json"))
+            u.write_json(self.fixture.base / ".updates/check.json", {"checked_at": 0, "interval": 86400})
+            with patch.object(
+                u,
+                "urlopen",
+                side_effect=lambda *args, **kwargs: _Response(json.dumps(unsigned).encode(), {"ETag": '"unsigned-2"'}),
+            ):
+                with self.assertRaisesRegex(u.UpdateError, "署名"):
+                    u.check_update(self.fixture.base)
+                with self.assertRaisesRegex(u.UpdateError, "署名"):
+                    u.show_update_notes(self.fixture.base)
+            self.assertIsNone(u.cached_manifest(self.fixture.base))
+
+            # 署名済みマニフェスト保存後は ETag による 304 再利用が成立する。
+            u.write_json(self.fixture.base / ".updates/check.json", {"checked_at": 0, "interval": 86400})
+            with patch.object(u, "urlopen", return_value=_Response(json.dumps(signed).encode(), {"ETag": '"signed-v1"'})):
+                self.assertIn(fixtures.NEXT, u.check_update(self.fixture.base))
+            self.assertEqual(u.cached_manifest(self.fixture.base), signed)
+
+            def reuse_304(request, timeout):
+                self.assertEqual(request.get_header("If-none-match"), '"signed-v1"')
+                raise HTTPError(request.full_url, 304, "Not Modified", {}, io.BytesIO())
+
+            notes_output = io.StringIO()
+            with patch.object(u, "urlopen", side_effect=reuse_304), contextlib.redirect_stdout(notes_output):
+                u.show_update_notes(self.fixture.base)
+            self.assertIn("署名付きテスト", notes_output.getvalue())
 
 
 if __name__ == "__main__":
