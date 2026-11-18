@@ -261,68 +261,74 @@ class ScheduledExecutionAndLaunchAgentTests(unittest.TestCase):
             attend.assert_called_once()
 
     def test_pre_startup_errors_under_scheduled_write_safe_launchagent_log(self):
-        # 1. activate_runtime 時の UpdateError
-        with patch.object(u, "activate_runtime", side_effect=u.UpdateError("依存パッケージの環境が不正\nSECRET_PATH")), \
-                redirect_stderr(io.StringIO()) as err:
-            code = u.run_application(self.base, ["--scheduled"], use_runtime=True)
-        self.assertEqual(code, 1)
-        self.assertIn("更新失敗:", err.getvalue())
-        log_path = self.base / "logs" / "launchagent.log"
-        self.assertEqual((self.base / "logs").stat().st_mode & 0o777, 0o700)
-        self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
-        content = log_path.read_text(encoding="utf-8")
-        self.assertIn("UpdateError:", content)
-        self.assertIn("依存パッケージの環境が不正", content)
-        self.assertEqual(len(content.splitlines()), 1)
+        with patch.object(u, "start_update_check") as start_check:
+            # 1. activate_runtime 時の UpdateError
+            with patch.object(u, "activate_runtime", side_effect=u.UpdateError("依存パッケージの環境が不正\nSECRET_PATH")), \
+                    redirect_stderr(io.StringIO()) as err:
+                code = u.run_application(self.base, ["--scheduled"], use_runtime=True)
+            self.assertEqual(code, 1)
+            self.assertIn("更新失敗:", err.getvalue())
+            log_path = self.base / "logs" / "launchagent.log"
+            self.assertEqual((self.base / "logs").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("UpdateError:", content)
+            self.assertIn("依存パッケージの環境が不正", content)
+            self.assertEqual(len(content.splitlines()), 1)
 
-        # 2. import_module 時の ModuleNotFoundError
-        with patch.object(u.importlib, "import_module", side_effect=ModuleNotFoundError("No module named 'keyring'", name="keyring")), \
-                redirect_stderr(io.StringIO()) as err:
-            code = u.run_application(self.base, ["--scheduled"])
-        self.assertEqual(code, 1)
-        self.assertIn("keyring", err.getvalue())
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 2)
-        self.assertIn("ModuleNotFoundError:", lines[1])
-        self.assertIn("keyring", lines[1])
+            # 2. import_module 時の ModuleNotFoundError
+            with patch.object(u.importlib, "import_module", side_effect=ModuleNotFoundError("No module named 'keyring'", name="keyring")), \
+                    redirect_stderr(io.StringIO()) as err:
+                code = u.run_application(self.base, ["--scheduled"])
+            self.assertEqual(code, 1)
+            self.assertIn("keyring", err.getvalue())
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn("ModuleNotFoundError:", lines[1])
+            self.assertIn("keyring", lines[1])
 
-        # 3. 破損した runtime.json（実 activate_runtime 経路）での UpdateError
-        runtime_base = self.root / "runtime-bad"
-        (runtime_base / ".updates").mkdir(parents=True)
-        (runtime_base / ".updates" / "runtime.json").write_text('{"id": "bad"}', encoding="utf-8")
-        with redirect_stderr(io.StringIO()) as err:
-            code = u.run_application(runtime_base, ["--scheduled"], use_runtime=True)
-        self.assertEqual(code, 1)
-        self.assertIn("更新失敗:", err.getvalue())
-        self.assertIn("UpdateError:", (runtime_base / "logs" / "launchagent.log").read_text(encoding="utf-8"))
+            # 3. 破損した runtime.json（実 activate_runtime 経路）での UpdateError
+            runtime_base = self.root / "runtime-bad"
+            (runtime_base / ".updates").mkdir(parents=True)
+            (runtime_base / ".updates" / "runtime.json").write_text('{"id": "bad"}', encoding="utf-8")
+            with redirect_stderr(io.StringIO()) as err:
+                code = u.run_application(runtime_base, ["--scheduled"], use_runtime=True)
+            self.assertEqual(code, 1)
+            self.assertIn("更新失敗:", err.getvalue())
+            self.assertIn("UpdateError:", (runtime_base / "logs" / "launchagent.log").read_text(encoding="utf-8"))
 
-        # 4. 予期しない例外でも生の秘匿情報やスタックトレースは書かない。
-        with patch.object(u.importlib, "import_module", side_effect=RuntimeError("sensitive-token-value")), \
-                redirect_stderr(io.StringIO()) as err:
-            code = u.run_application(self.base, ["--scheduled"])
-        self.assertEqual(code, 1)
-        self.assertNotIn("sensitive-token-value", err.getvalue())
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertIn("RuntimeError", lines[2])
-        self.assertNotIn("sensitive-token-value", lines[2])
-        self.assertNotIn("Traceback", lines[2])
+            # 4. 予期しない例外でも生の秘匿情報やスタックトレースは書かない。
+            with patch.object(u.importlib, "import_module", side_effect=RuntimeError("sensitive-token-value")), \
+                    redirect_stderr(io.StringIO()) as err:
+                code = u.run_application(self.base, ["--scheduled"])
+            self.assertEqual(code, 1)
+            self.assertNotIn("sensitive-token-value", err.getvalue())
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertIn("RuntimeError", lines[2])
+            self.assertNotIn("sensitive-token-value", lines[2])
+            self.assertNotIn("Traceback", lines[2])
+            start_check.assert_not_called()
 
     def test_pre_startup_log_refuses_symlink_and_non_scheduled_does_not_create_it(self):
         non_scheduled = self.root / "non-scheduled"
         non_scheduled.mkdir()
-        with patch.object(u.importlib, "import_module", side_effect=ModuleNotFoundError("missing", name="keyring")), \
+        with patch.object(u, "start_update_check") as start_check, \
+                patch.object(u.importlib, "import_module", side_effect=ModuleNotFoundError("missing", name="keyring")), \
                 redirect_stderr(io.StringIO()):
             self.assertEqual(u.run_application(non_scheduled, ["--check", "731"]), 1)
+        start_check.assert_called_once_with(non_scheduled)
         self.assertFalse((non_scheduled / "logs" / "launchagent.log").exists())
 
         (self.base / "logs").mkdir(mode=0o700)
         outside = self.root / "outside.log"
         outside.write_text("keep", encoding="utf-8")
         (self.base / "logs" / "launchagent.log").symlink_to(outside)
-        with patch.object(u.importlib, "import_module", side_effect=u.UpdateError("bad runtime")), \
+        with patch.object(u, "start_update_check") as start_check, \
+                patch.object(u.importlib, "import_module", side_effect=u.UpdateError("bad runtime")), \
                 redirect_stderr(io.StringIO()):
             self.assertEqual(u.run_application(self.base, ["--scheduled"]), 1)
+        start_check.assert_not_called()
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
     def test_install_agent_configures_launchagent_log_paths_and_permissions(self):
