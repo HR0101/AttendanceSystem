@@ -55,7 +55,8 @@ jobs:
       - name: Verify dependency lock sync
         run: python -c "from pathlib import Path; from src.dependencies import read_spec; spec = read_spec(Path('.')); assert spec['text'] == Path('requirements.lock').read_text(encoding='utf-8')"
       # ロックファイルのハッシュと一致するパッケージだけを導入する。
-      - run: python -m pip install --no-input --require-hashes --only-binary=:all: -r requirements.lock
+      - run: |
+          python -m pip install --no-input --require-hashes --only-binary=:all: -r requirements.lock
       - run: python -m playwright install chromium
       - run: python -m unittest discover -s tests
 
