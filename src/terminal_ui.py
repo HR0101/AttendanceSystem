@@ -9,6 +9,7 @@ import time
 import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -279,8 +280,13 @@ class AttendanceScreen:
             if len(targets) == 1:
                 work_user(1, targets[0])
             else:
-                # Playwrightは各スレッドで起動し、ユーザー間でセッションを共有しない。
-                with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
+                if self.demo:
+                    pool_cm = nullcontext()
+                else:
+                    from .browser import browser_pool
+                    pool_cm = browser_pool()
+                # 単一 Chromium サーバーだけを共有し、各スレッドで独立した BrowserContext を使う。
+                with pool_cm, ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
                     list(executor.map(work_user, range(1, len(targets) + 1), targets))
             self.events.put(("complete", register))
 
