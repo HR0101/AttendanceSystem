@@ -265,6 +265,31 @@ class SnapshotTests(unittest.TestCase):
                 logged_stages = [call.args[0] for call in logger.info.call_args_list]
                 self.assertIn("段階=教室画面を再表示", logged_stages)
 
+    def test_cancel_event_stops_before_clicking_attend(self):
+        import threading
+        from src.attendance import AttendanceCancelled
+
+        html = attendance_html()
+        values = require_target(self.page_for(html))
+        cancel = threading.Event()
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        posts = []
+        page.route("**/*", lambda route: posts.append(route.request.url) or route.abort() if route.request.method != "GET" else route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8"))
+        with self.assertRaises(AttendanceCancelled):
+            run_attendance(
+                page, CONFIG, "TEST001", "dummy", "731", "7301", Mock(),
+                on_snapshot=lambda *_: cancel.set(),
+                expected_values=values,
+                cancel_event=cancel,
+            )
+        self.assertEqual(posts, [])
+        # 開始時点で中断済みならページ遷移も行わない。
+        page2 = Mock()
+        with self.assertRaises(AttendanceCancelled):
+            run_attendance(page2, CONFIG, "TEST001", "dummy", "731", "7301", Mock(), cancel_event=cancel)
+        page2.goto.assert_not_called()
+
     def test_wrong_url_stops(self):
         from src.attendance import _require_known_page
         page = Mock(url=CONFIG["top_url"].replace("/top", "/class_room/432"))
