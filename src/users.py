@@ -49,7 +49,8 @@ def get_users(config):
 def select_user(config, username=None):
     users = get_users(config)
     selected = username if username is not None else config.get("default_user")
-    if selected:
+    # 明示指定が空文字のとき既定ユーザーへ誤ってフォールバックしないようにする。
+    if username is not None or selected:
         for user in users:
             if user["username"] == selected:
                 return user
@@ -87,7 +88,7 @@ def change_student_id_config(config, name, student_id):
     users = get_users(config)
     if not isinstance(student_id, str) or not student_id or not student_id.isascii() or not student_id.isalnum():
         raise ConfigurationError("学籍番号は半角英数字で入力してください。")
-    if any(entry["student_id"] == student_id and entry["username"] != name for entry in users):
+    if any(entry["student_id"] == student_id and entry["username"] != user["username"] for entry in users):
         raise ConfigurationError("その学籍番号は登録済みです。")
     for entry in users:
         if entry["username"] == user["username"]:
