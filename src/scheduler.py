@@ -7,6 +7,7 @@ import os
 import plistlib
 import re
 import stat
+import shlex
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -14,7 +15,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .config import private_file_lock, read_private_text
+from .config import ConfigurationError, load_config
+from .credentials import CredentialError, has_stored_password
 from .room import RoomError, parse_room
+from .users import select_user
 
 
 LABEL = "local.attendance.tool"
@@ -656,12 +660,95 @@ def _target() -> str:
     return f"gui/{os.getuid()}/{LABEL}"
 
 
-def _owned_agent(path: Path, executable: Path) -> bool:
+def _today() -> date:
+    return date.today()
+
+
+def _as_date(value) -> date | None:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _read_plist(path: Path) -> dict | None:
     try:
         plist = plistlib.loads(path.read_bytes())
     except (OSError, ValueError, TypeError):
+        return None
+    return plist if isinstance(plist, dict) else None
+
+
+def _plist_registered_path(plist: dict) -> str | None:
+    args = plist.get("ProgramArguments")
+    if isinstance(args, list) and args and isinstance(args[0], str):
+        return args[0]
+    working_dir = plist.get("WorkingDirectory")
+    return working_dir if isinstance(working_dir, str) else None
+
+
+def _owned_agent(path: Path, executable: Path) -> bool:
+    plist = _read_plist(path)
+    return plist is not None and plist.get("Label") == LABEL and plist.get("ProgramArguments") == [str(executable), "--scheduled"]
+
+
+def _normalize_intervals(raw) -> list[tuple[int, int, int]] | None:
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else None
+    if items is None:
+        return None
+    result = []
+    for item in items:
+        if not isinstance(item, dict) or set(item.keys()) != {"Weekday", "Hour", "Minute"}:
+            return None
+        values = (item["Weekday"], item["Hour"], item["Minute"])
+        if any(type(v) is not int for v in values):
+            return None
+        result.append(values)
+    return sorted(result)
+
+
+def _launchctl_loaded() -> bool:
+    try:
+        result = subprocess.run(["launchctl", "print", _target()], capture_output=True, check=False)
+    except OSError:
         return False
-    return plist.get("Label") == LABEL and plist.get("ProgramArguments") == [str(executable), "--scheduled"]
+    return result.returncode == 0
+
+
+def _repair_command(path: Path, *, include_install: bool) -> str:
+    quoted = shlex.quote(str(path))
+    cmd = f"launchctl bootout {_target()} と rm {quoted}"
+    return f"{cmd} を実行してから att schedule install を実行してください。" if include_install else f"{cmd} を実行してください。"
+
+
+def _agent_conflict_message(path: Path, executable: Path, *, action: str) -> str:
+    """_owned_agent 不一致時に、Label 一致・パス相違を区別した修復案内を返す。"""
+    plist = _read_plist(path)
+    target = _target()
+    quoted = shlex.quote(str(path))
+    verb = "上書き" if action == "install" else "削除"
+    if plist is None:
+        return f"同名のLaunchAgent（{path}）を読み込めないため{verb}しません。確認: plutil -p {quoted}"
+    label = plist.get("Label")
+    registered = _plist_registered_path(plist) or "不明"
+    if label == LABEL:
+        step = "修復" if action == "install" else "解除"
+        return (
+            f"別の場所のフォルダで登録された LaunchAgent が残っているため{verb}しません"
+            f"（Label: {LABEL}、登録先: {registered}、現在: {executable}）。"
+            f"確認: launchctl print {target} ／ {step}: {_repair_command(path, include_install=action == 'install')}"
+        )
+    found_label = label if isinstance(label, str) and label else "不明"
+    return (
+        f"同名のLaunchAgentはこのツールのものではありません（Label: {found_label}、登録先: {registered}）。"
+        f"{verb}しません。確認: plutil -p {quoted}"
+    )
 
 
 def _sanitize_launchctl_stderr(stderr) -> str:
@@ -699,13 +786,13 @@ def _rollback_agent(path: Path, previous_data: bytes | None) -> str:
 def install_agent(base: Path, schedule: dict) -> Path:
     if not calendar_intervals(schedule["courses"]):
         raise ScheduleError("有効な授業を設定してから自動実行を開始してください。")
-    if date.today() > schedule["active_until"]:
+    if _today() > schedule["active_until"]:
         raise ScheduleError("設定した授業期間は終了しています。")
     executable = base / "att"
     path = agent_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or (path.exists() and not _owned_agent(path, executable)):
-        raise ScheduleError("同名のLaunchAgentが存在します。上書きしません。")
+        raise ScheduleError(_agent_conflict_message(path, executable, action="install"))
     log_dir = _ensure_log_dir(base)
     launchagent_log = _ensure_launchagent_log(log_dir)
     plist = {
@@ -749,8 +836,9 @@ def remove_agent(base: Path) -> bool:
     path = agent_path()
     if not path.exists():
         return False
-    if not _owned_agent(path, base / "att"):
-        raise ScheduleError("同名のLaunchAgentはこのツールのものではありません。削除しません。")
+    executable = base / "att"
+    if not _owned_agent(path, executable):
+        raise ScheduleError(_agent_conflict_message(path, executable, action="remove"))
     subprocess.run(["launchctl", "bootout", _target()], capture_output=True, check=False)
     path.unlink()
     return True
@@ -760,5 +848,207 @@ def agent_installed(base: Path) -> bool:
     path = agent_path()
     if not path.exists() or not _owned_agent(path, base / "att"):
         return False
-    result = subprocess.run(["launchctl", "print", _target()], capture_output=True, check=False)
-    return result.returncode == 0
+    return _launchctl_loaded()
+
+
+def agent_status(base: Path, *, installed: bool | None = None) -> dict:
+    """LaunchAgent plist と登録パス・読み込み状態・起動時刻を調べる。"""
+    path = agent_path()
+    executable = base / "att"
+    target = _target()
+    quoted = shlex.quote(str(path))
+    status = {
+        "path": path,
+        "target": target,
+        "expected_path": str(executable),
+        "exists": path.exists(),
+        "readable": False,
+        "owned": False,
+        "loaded": bool(installed) if installed is not None else False,
+        "label": None,
+        "registered_path": None,
+        "intervals": None,
+        "state": "uninstalled",
+        "guidance": None,
+    }
+    if not status["exists"]:
+        if installed:
+            status["state"] = "installed"
+        return status
+    plist = _read_plist(path)
+    if plist is None:
+        status["state"] = "unreadable"
+        status["guidance"] = f"plutil -p {quoted} で内容を確認してください。"
+        return status
+    status["readable"] = True
+    label = plist.get("Label")
+    status["label"] = label if isinstance(label, str) else None
+    status["registered_path"] = _plist_registered_path(plist)
+    status["owned"] = label == LABEL and plist.get("ProgramArguments") == [str(executable), "--scheduled"]
+    if not status["owned"]:
+        if label == LABEL:
+            status["state"] = "path_mismatch"
+            status["guidance"] = _repair_command(path, include_install=True)
+        else:
+            status["state"] = "foreign"
+            status["guidance"] = f"plutil -p {quoted} で内容を確認してください。"
+        return status
+    loaded = _launchctl_loaded() if installed is None else bool(installed)
+    status["loaded"] = loaded
+    status["state"] = "installed" if loaded else "unloaded"
+    status["intervals"] = _normalize_intervals(plist.get("StartCalendarInterval"))
+    if not loaded:
+        status["guidance"] = "att schedule install を実行して LaunchAgent を開始してください。"
+    return status
+
+
+def schedule_diagnostics(
+    base: Path,
+    schedule: dict | None,
+    *,
+    installed: bool | None = None,
+    schedule_error: str | None = None,
+    today: date | None = None,
+) -> dict:
+    """LaunchAgent との同期状態および自動実行の前提条件を診断する。"""
+    today = today or _today()
+    agent = agent_status(base, installed=installed)
+    in_sync = None
+    enabled_courses = 0
+    total_courses = 0
+    active_from = None
+    active_until = None
+    period_valid = None
+    if schedule is not None:
+        courses = schedule.get("courses", [])
+        total_courses = len(courses)
+        enabled_courses = sum(1 for c in courses if c.get("enabled", True))
+        active_from = _as_date(schedule.get("active_from"))
+        active_until = _as_date(schedule.get("active_until"))
+        if active_until is not None:
+            period_valid = today <= active_until
+        try:
+            expected_intervals = _normalize_intervals(calendar_intervals(courses))
+        except (ScheduleError, KeyError, TypeError, ValueError):
+            expected_intervals = None
+        if agent["owned"] and expected_intervals is not None:
+            in_sync = agent["intervals"] == expected_intervals
+
+    config = None
+    config_error = None
+    try:
+        config = load_config(base / "config.json")
+    except (ConfigurationError, OSError) as exc:
+        config_error = str(exc)
+
+    headless = config["browser"]["headless"] if config is not None else None
+    user = None
+    user_error = None
+    if config is not None:
+        try:
+            user = select_user(config)
+        except ConfigurationError as exc:
+            user_error = str(exc)
+
+    keychain_ok = None
+    keychain_error = None
+    if user is not None:
+        try:
+            keychain_ok = has_stored_password(user["student_id"])
+        except CredentialError as exc:
+            keychain_ok = False
+            keychain_error = str(exc)
+
+    return {
+        "today": today,
+        "agent": agent,
+        "schedule_error": schedule_error,
+        "total_courses": total_courses,
+        "enabled_courses": enabled_courses,
+        "active_from": active_from if active_from is not None else (schedule.get("active_from") if schedule else None),
+        "active_until": active_until if active_until is not None else (schedule.get("active_until") if schedule else None),
+        "period_valid": period_valid,
+        "in_sync": in_sync,
+        "config_ok": config is not None,
+        "config_error": config_error,
+        "headless": headless,
+        "user": user,
+        "user_error": user_error,
+        "keychain_ok": keychain_ok,
+        "keychain_error": keychain_error,
+    }
+
+
+def format_schedule_diagnostics(diag: dict) -> list[str]:
+    """schedule_diagnostics の結果を人間が読める行一覧に整形する。"""
+    agent = diag["agent"]
+    state_labels = {
+        "installed": "有効",
+        "unloaded": "停止中（LaunchAgent 未読み込み）",
+        "uninstalled": "未登録",
+        "path_mismatch": f"パス不一致（別フォルダで登録済み / Label: {agent['label']}）",
+        "foreign": f"競合（別の LaunchAgent が存在 / Label: {agent['label'] or '不明'}）",
+        "unreadable": f"エラー（plist を読み込めません: {agent['path']}）",
+    }
+    lines = [f"自動実行: {state_labels[agent['state']]}"]
+    if agent["state"] == "path_mismatch":
+        lines.append(f"  登録先パス: {agent['registered_path'] or '不明'}（現在: {agent['expected_path']}）")
+    elif agent["state"] == "foreign":
+        lines.append(f"  登録先パス: {agent['registered_path'] or '不明'}")
+    if agent["guidance"]:
+        lines.append(f"  修復・確認: {agent['guidance']}")
+
+    if diag["schedule_error"]:
+        lines.append(f"予定ファイル: NG（{diag['schedule_error']}）")
+    else:
+        lines.append(
+            f"予定: 有効 {diag['enabled_courses']} 件 / 全 {diag['total_courses']} 件、"
+            f"期間: {diag['active_from']}～{diag['active_until']}"
+        )
+        if agent["owned"]:
+            if diag["in_sync"]:
+                lines.append("LaunchAgent 同期: 一致（schedule.json と同じ起動時刻です）")
+            else:
+                lines.append("LaunchAgent 同期: 設定ずれ: att schedule install を実行してください（plist と schedule.json が一致しません）")
+
+    lines.append("前提条件:")
+    if not diag["config_ok"]:
+        lines.append(f"  config.json: NG（{diag['config_error']}）")
+        lines.append("  browser.headless: 未確認（config.json を確認してください）")
+        lines.append("  既定ユーザー: 未確認（config.json を確認してください）")
+        lines.append("  Keychain パスワード: 未確認（config.json を確認してください）")
+    else:
+        lines.append("  config.json: OK")
+        lines.append(
+            "  browser.headless: OK（true）"
+            if diag["headless"]
+            else "  browser.headless: NG（false: 自動実行には true にしてください）"
+        )
+        if diag["user_error"]:
+            lines.append(f"  既定ユーザー: NG（{diag['user_error']}）")
+            lines.append("  Keychain パスワード: 未確認（既定ユーザーを確認してください）")
+        elif diag["user"] is None:
+            lines.append("  既定ユーザー: NG（未設定: att user add または手動ログインで登録してください）")
+            lines.append("  Keychain パスワード: 未確認（既定ユーザーが未設定です）")
+        else:
+            user = diag["user"]
+            lines.append(f"  既定ユーザー: OK（{user['username']} / {user['student_id']}）")
+            if diag["keychain_error"]:
+                lines.append(f"  Keychain パスワード: NG（{diag['keychain_error']}）")
+            elif diag["keychain_ok"]:
+                lines.append("  Keychain パスワード: OK（保存済み）")
+            else:
+                lines.append("  Keychain パスワード: NG（未保存: 手動で一度ログインするか att user password で設定してください）")
+
+    if diag["schedule_error"] is None:
+        if diag["period_valid"] is True:
+            note = "（開始前）" if isinstance(diag["active_from"], date) and diag["today"] < diag["active_from"] else ""
+            lines.append(f"  授業期間（終了日 {diag['active_until']}）: OK{note}")
+        elif diag["period_valid"] is False:
+            lines.append(f"  授業期間（終了日 {diag['active_until']}）: NG（期限切れです。期間を更新してください）")
+        lines.append(
+            f"  有効な授業数: OK（{diag['enabled_courses']}件）"
+            if diag["enabled_courses"] > 0
+            else "  有効な授業数: NG（0件: 有効な授業を設定してください）"
+        )
+    return lines

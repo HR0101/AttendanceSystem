@@ -71,10 +71,13 @@ v0.2.3以降は、依存パッケージとChromiumも別環境へ自動で準備
 | R | 授業情報を更新 |
 | U | 出席するユーザーの選択・管理・個別結果 |
 | S | 自動出席の予定 |
+| L | 実行ログ・自動実行ログ・更新ログを表示 |
 | H / ? | ヘルプ |
 | Q | 終了 |
 | Tab / ←→ → Enter | 出席登録の確認画面で選択・決定（↑↓ / PgUp / PgDn で一覧をスクロール） |
 | Esc | 確認・入力をキャンセル |
+
+ログ画面（`L`）では、`Tab` / `←→` / `1`～`3` で `logs/attendance-*.log`（実行ログ）・`logs/launchagent.log`（自動実行ログ）・`.updates/updater.log`（更新ログ）を切り替え、`↑↓` / `PgUp` / `PgDn` / `Home` / `End` でスクロール、`R` で再読込、`Esc` / `Q` で戻ります。デモモードでは実ファイルのログを読み込まず案内を表示します。
 
 デモではQR番号の入力欄以外を選んだ状態で、1:未出席、2:出席済み、3:受付対象なし、4:履修未登録、5:通信エラーを試せます。デモ中の変更は保存されません。
 
@@ -143,10 +146,12 @@ GUIでDを押すと、変更前後の既定ユーザー（名前・学生番号�
 
 ```sh
 ./att --ui                # 「スケジュール登録」を選択してEnter（Sでも開く）
-./att schedule status     # 自動実行の状態を確認
+./att schedule status     # 自動実行の状態・設定ずれ・前提条件を確認
 ./att schedule install    # 自動実行を開始・設定を反映
 ./att schedule remove     # 自動実行を停止
 ```
+
+`att schedule status` は LaunchAgent と `schedule.json` の起動時刻が一致しているか（設定ずれ時は `att schedule install` を案内）、別フォルダ移動などで旧 LaunchAgent が残っていないか、および自動実行の前提条件（`config.json`・`browser.headless == true`・既定ユーザー・Keychain パスワード・授業期間・有効な授業数）を表示します。フォルダ移動後に `install` / `remove` が拒否された場合は、表示される登録先パスと `launchctl bootout` / `rm` コマンドで旧設定を解除してから `att schedule install` を再実行してください。
 
 ### GUIの予定管理（S）
 
@@ -158,6 +163,7 @@ GUIでDを押すと、変更前後の既定ユーザー（名前・学生番号�
 | D → Enter | 選んだ授業を削除 |
 | P | 授業期間・休講日を設定 |
 | I | 自動実行全体を開始（確認画面あり） / 停止 |
+| L | ログを表示 |
 | R | 予定を再読込 |
 | Esc | 戻る・キャンセル |
 | Tab / ↑↓ | 入力項目を移動 |

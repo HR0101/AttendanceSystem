@@ -350,6 +350,8 @@ class SchedulePanel:
         if self.data is None:
             if key in ("r", "R"):
                 self.open()
+            elif key in ("l", "L"):
+                self.owner.open_logs(parent="schedule")
             return
         courses = self.data["courses"]
         if self.mode == "confirm_start":
@@ -410,6 +412,8 @@ class SchedulePanel:
             self.form("period")
         elif key in ("i", "I"):
             self.toggle_agent()
+        elif key in ("l", "L"):
+            self.owner.open_logs(parent="schedule")
         elif key in ("r", "R"):
             self.open()
 
@@ -470,7 +474,7 @@ class SchedulePanel:
                 text = f"{'●' if course.get('enabled', True) else '－'} {DAYS[course['weekday']]} {course['start_time']}→{timing} QR{course['room']} {course['course_name']}"
                 put(5 + i - first, text, curses.A_REVERSE if i == self.index else 0)
             put(height - 6, "A 追加  Enter 編集  D 削除  T 有効/無効", color(1))
-            put(height - 5, "P 期間・休講日  I 自動実行の開始/停止", color(1))
+            put(height - 5, "P 期間・休講日  I 自動実行の開始/停止  L ログ", color(1))
         elif self.mode == "confirm_start" and self.start_preview:
             self._draw_confirm_start(canvas, top, left, width, height)
         elif self.mode == "delete":
@@ -490,7 +494,7 @@ class SchedulePanel:
         for offset, line in enumerate(wrap_text(self.message, width - 6)[:2]):
             put(height - 4 + offset, line, color(4))
         footer = (
-            "Esc/Q: 戻る  R: 再読込" if self.mode == "list"
+            "Esc/Q: 戻る  R: 再読込  L: ログ" if self.mode == "list"
             else "Tab/←→: 選択  Enter: 決定  Esc/Q: キャンセル" if self.mode == "confirm_start"
             else "Esc: 戻る・保存確認  Ctrl+U: 全消去"
         )

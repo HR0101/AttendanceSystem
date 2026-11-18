@@ -66,6 +66,99 @@ class _WorkerLogger:
 PASSWORD_TTL_SECONDS = 300
 
 
+LOG_TABS = (
+    ("attendance", "1:実行ログ"),
+    ("launchagent", "2:自動実行"),
+    ("updater", "3:更新"),
+)
+MAX_LOG_BYTES = 64 * 1024
+MAX_LOG_LINES = 200
+
+
+def _read_log_tail(path: Path, *, max_bytes: int = MAX_LOG_BYTES, max_lines: int = MAX_LOG_LINES) -> list[str]:
+    """ログファイルの末尾だけを安全に読み込む。"""
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        offset = max(0, size - max_bytes)
+        stream.seek(offset)
+        raw = stream.read(max_bytes)
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if offset > 0 and len(lines) > 1:
+        # 途中バイトから読んだ先頭の不完全な行を除外する。
+        lines = lines[1:]
+    return list(deque(lines, maxlen=max_lines))
+
+
+def _load_log_tab(base: Path | None, demo: bool, tab_index: int) -> tuple[str, list[str], str]:
+    """指定タブのログ末尾を読み込む。デモ時は実ファイルに触れない。"""
+    kind = LOG_TABS[tab_index][0]
+    if demo:
+        if kind == "attendance":
+            return (
+                "logs/attendance-demo.log (デモ)",
+                [
+                    "2026-11-19 10:05:00,000 INFO 起動 version=0.2.8 (デモ)",
+                    "2026-11-19 10:05:01,200 INFO 段階=ブラウザ起動",
+                    "2026-11-19 10:05:03,400 INFO 結果=デモ: 未出席 所要時間=3.4秒",
+                    "※ デモモードでは実ファイルのログを読み込みません。",
+                ],
+                "",
+            )
+        if kind == "launchagent":
+            return (
+                "logs/launchagent.log (デモ)",
+                [
+                    "デモモードでは自動実行ログ（logs/launchagent.log）を読み込みません。",
+                    "通常起動では LaunchAgent 実行時の出力を確認できます。",
+                ],
+                "",
+            )
+        return (
+            ".updates/updater.log (デモ)",
+            [
+                "デモモードでは更新ログ（.updates/updater.log）を読み込みません。",
+                "通常起動では更新確認の失敗履歴を確認できます。",
+            ],
+            "",
+        )
+    if base is None:
+        return "ログ", [], "設定フォルダを確認できないため、ログを読み込めません。"
+
+    fixed = {
+        "launchagent": (base / "logs" / "launchagent.log", "logs/launchagent.log", "自動実行ログ"),
+        "updater": (base / ".updates" / "updater.log", ".updates/updater.log", "更新ログ"),
+    }
+    try:
+        if kind == "attendance":
+            log_dir = base / "logs"
+            if log_dir.is_symlink() or not log_dir.is_dir():
+                return "logs/attendance-*.log", [], "実行ログ（logs/attendance-*.log）はまだありません。"
+            candidates = [
+                entry for entry in log_dir.iterdir()
+                if entry.name.startswith("attendance-") and entry.name.endswith(".log")
+                and not entry.is_symlink() and entry.is_file()
+            ]
+            if not candidates:
+                return "logs/attendance-*.log", [], "実行ログ（logs/attendance-*.log）はまだありません。"
+            target = max(candidates, key=lambda entry: entry.name)
+            source = f"logs/{target.name}"
+        else:
+            target, source, label = fixed[kind]
+            if target.parent.is_symlink() or target.is_symlink() or not target.exists():
+                return source, [], f"{label}（{source}）はまだありません。"
+            if not target.is_file():
+                return source, [], f"{source} は通常のファイルではありません。"
+        lines = _read_log_tail(target)
+    except OSError:
+        fallback = "logs/attendance-*.log" if kind == "attendance" else fixed[kind][1]
+        return fallback, [], f"{fallback} を読み込めませんでした（アクセス権限を確認してください）。"
+
+    if not any(line.strip() for line in lines):
+        return source, [], f"{source} にログの記録はまだありません。"
+    return source, lines, ""
+
+
 class AttendanceScreen:
     def __init__(self, config, student_id, password, logger, room="", demo=False, base=None, *, restore_selection=True, password_ttl=PASSWORD_TTL_SECONDS):
         self.password_ttl = password_ttl
@@ -112,6 +205,14 @@ class AttendanceScreen:
         self.demo_state = "unattended"
         self.demo_attended = set()
         self.schedule_panel = SchedulePanel(self)
+        self.log_tab = 0
+        self.log_offset = 0
+        self.log_max_offset = None
+        self.log_page_rows = 10
+        self.log_parent = None
+        self.log_source = ""
+        self.log_lines = []
+        self.log_empty_message = ""
 
     @property
     def password(self):
@@ -650,7 +751,22 @@ class AttendanceScreen:
         self._default_agent_active = _UNSET
         self.account_action("default", username)
 
+    def open_logs(self, parent=None):
+        self.modal = "logs"
+        self.log_parent = parent
+        self.log_tab = 0
+        self.reload_logs()
+
+    def reload_logs(self):
+        self.log_source, self.log_lines, self.log_empty_message = _load_log_tab(self.base, self.demo, self.log_tab)
+        self.log_offset = 0
+        self.log_max_offset = None
+
     def discard_modal(self):
+        if self.modal == "logs":
+            self.modal = self.log_parent
+            self.log_parent = None
+            return
         parent = self.modal in ("user_result", "delete", "default") or (
             self.modal in ("add", "rename", "password", "student_id") and self.form_parent_users)
         self._wipe_form_data(self.form_values, self.form_editors)
@@ -761,6 +877,33 @@ class AttendanceScreen:
             if enter or key in ("h", "H", "?"):
                 self.modal = None
             return
+        if self.modal == "logs":
+            if key in ("\t", curses.KEY_RIGHT):
+                self.log_tab = (self.log_tab + 1) % len(LOG_TABS)
+                self.reload_logs()
+            elif key in (curses.KEY_BTAB, curses.KEY_LEFT):
+                self.log_tab = (self.log_tab - 1) % len(LOG_TABS)
+                self.reload_logs()
+            elif key in ("1", "2", "3"):
+                self.log_tab = int(key) - 1
+                self.reload_logs()
+            elif key in ("r", "R"):
+                self.reload_logs()
+            elif key == curses.KEY_UP:
+                self.log_offset = self.log_offset + 1 if self.log_max_offset is None else min(self.log_max_offset, self.log_offset + 1)
+            elif key == curses.KEY_DOWN:
+                self.log_offset = max(0, self.log_offset - 1)
+            elif key == curses.KEY_PPAGE:
+                step = max(1, self.log_page_rows - 1)
+                self.log_offset = self.log_offset + step if self.log_max_offset is None else min(self.log_max_offset, self.log_offset + step)
+            elif key == curses.KEY_NPAGE:
+                step = max(1, self.log_page_rows - 1)
+                self.log_offset = max(0, self.log_offset - step)
+            elif key == curses.KEY_HOME:
+                self.log_offset = self.log_max_offset if self.log_max_offset is not None else 10**9
+            elif key == curses.KEY_END:
+                self.log_offset = 0
+            return
         if self.modal == "users":
             users = get_users(self.config)
             if key in (curses.KEY_UP, curses.KEY_DOWN) and users:
@@ -858,10 +1001,10 @@ class AttendanceScreen:
         if len(self.selected_user_ids) > 1:
             names = "、".join(user["username"] for user in self.selected_users())
             canvas.put(2, left, f"選択中 {len(self.selected_user_ids)}人: {names}", curses.A_BOLD, main_width - 1)
-            canvas.put(3, left, "U: ユーザー選択・個別結果  S: 予定", curses.A_DIM, main_width - 1)
+            canvas.put(3, left, "U: ユーザー選択・個別結果  S: 予定  L: ログ", curses.A_DIM, main_width - 1)
         else:
             canvas.put(2, left, f"{name}  {'[既定]' if is_default else '[今回のユーザー]'}", curses.A_BOLD, main_width - 1)
-            canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー選択  S: 予定", curses.A_DIM, main_width - 1)
+            canvas.put(3, left, f"学生番号 {self.student_id}  U: ユーザー  S: 予定  L: ログ", curses.A_DIM, main_width - 1)
         canvas.button(5, left, f"QR番号 [ {self.room or '___'} ]", self.selected == 0)
         if self.selected == 0:
             cursor = self.room_editor.sync(self.room)
@@ -896,7 +1039,7 @@ class AttendanceScreen:
         if wide:
             side = left + main_width + 2
             canvas.box(5, side, 30, 7, "操作ガイド", color(1))
-            for row, text in enumerate(("Enter  選択項目を実行", "R      授業を更新", "U      ユーザー管理", "S      自動出席の予定", "H ヘルプ / Q 終了"), 6):
+            for row, text in enumerate(("Enter  選択項目を実行", "R 更新 / U ユーザー", "S      自動出席の予定", "L      ログを表示", "H ヘルプ / Q 終了"), 6):
                 canvas.put(row, side + 2, text, width=26)
             canvas.box(13, side, 30, min(height - 17, 14), "今回の操作履歴", color(1))
             if not self.history:
@@ -909,7 +1052,8 @@ class AttendanceScreen:
             canvas.box(23, left, main_width, height - 26, "今回の操作履歴", color(1))
             for index, (stamp, qr, message) in enumerate(list(self.history)[:height - 28]):
                 canvas.put(24 + index, left + 2, f"{stamp}  QR {qr}  {message}", width=main_width - 4)
-        footer = "Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 H ヘルプ Q 終了"
+        footer = ("Tab 選択 Enter 実行 R 更新 U ユーザー S 予定 L ログ H ヘルプ Q 終了" if total >= 68
+                  else "Tab選択 Enter実行 R更新 U管理 S予定 Lログ Hヘルプ Q終了")
         if self.save_prompt.active:
             footer = "↑↓/Tab: 選択 Enter: 決定 Esc/Q: 編集に戻る"
         elif self.modal:
@@ -1101,9 +1245,45 @@ class AttendanceScreen:
         canvas.button(top + height - 3, left + 20, "[ 出席登録 ]", focus_register, enabled=can_reg)
         canvas.put(top + height - 2, left + 3, "Tab/←→ 選択  Enter 決定  Esc 戻る", curses.A_DIM, inner)
 
+    def draw_logs(self, canvas):
+        width = min(canvas.width - 6, 108)
+        height = min(canvas.height - 4, 22)
+        left = (canvas.width - width) // 2
+        top = (canvas.height - height) // 2
+        inner_width = max(10, width - 6)
+        canvas.box(top, left, width, height, "ログ確認", color(1))
+        x = left + 3
+        for index, (_, label) in enumerate(LOG_TABS):
+            tab = f" {label} "
+            attr = (color(1) | curses.A_REVERSE | curses.A_BOLD) if index == self.log_tab else curses.A_DIM
+            canvas.put(top + 1, x, tab, attr, left + width - 3 - x)
+            x += text_width(tab) + 1
+        wrapped = [part for line in self.log_lines for part in wrap_text(line, inner_width)] if self.log_lines else []
+        body_rows = max(1, height - 6)
+        max_offset = max(0, len(wrapped) - body_rows)
+        self.log_max_offset = max_offset
+        self.log_page_rows = body_rows
+        self.log_offset = min(self.log_offset, max_offset)
+        if wrapped:
+            start = max_offset - self.log_offset
+            end = min(len(wrapped), start + body_rows)
+            pos = f"{'末尾 ' if self.log_offset == 0 else ''}{start + 1}-{end}/{len(wrapped)}行"
+            canvas.put(top + 2, left + 3, f"{self.log_source} ({pos})", curses.A_DIM, inner_width)
+            for row, line in enumerate(wrapped[start:end], top + 3):
+                attr = color(3) if " ERROR " in line or "失敗" in line else 0
+                canvas.put(row, left + 3, line, attr, inner_width)
+        else:
+            canvas.put(top + 2, left + 3, self.log_source, curses.A_DIM, inner_width)
+            for row, line in enumerate(wrap_text(self.log_empty_message, inner_width)[:body_rows], top + 4):
+                canvas.put(row, left + 3, line, curses.A_DIM, inner_width)
+        canvas.put(top + height - 2, left + 3, "Tab/1-3:切替 ↑↓/PgUpDn:移動 R:更新 Esc/Q:戻る", curses.A_DIM, inner_width)
+
     def draw_modal(self, canvas):
         if self.modal == "schedule":
             self.schedule_panel.draw(canvas)
+            return
+        if self.modal == "logs":
+            self.draw_logs(canvas)
             return
         width = min(canvas.width - 6, 72)
         left = (canvas.width - width) // 2
@@ -1197,7 +1377,7 @@ class AttendanceScreen:
             canvas.button(top + height - 5, left + 25, "[ 切り替える ]", self.confirm_selection == 1)
             canvas.put(top + height - 3, left + 3, "Tab/←→で選択し、Enterで決定します。", curses.A_DIM, width - 6)
         else:
-            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択、↑↓/PgUp/PgDn一覧", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
+            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 予定 L: ログ", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択、↑↓/PgUp/PgDn一覧", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。ログは L。")
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
@@ -1274,6 +1454,8 @@ class AttendanceScreen:
                     self.open_users()
                 elif key in ("s", "S"):
                     self.schedule_panel.open()
+                elif key in ("l", "L"):
+                    self.open_logs()
                 elif key in ("h", "H", "?"):
                     self.modal = "help"
                 elif self.demo and self.selected != 0 and key in ("1", "2", "3", "4", "5"):

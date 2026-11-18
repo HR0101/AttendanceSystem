@@ -655,6 +655,32 @@ class SchedulePanelTests(unittest.TestCase):
         self.assertIn("近接固定", self.panel.message)
         self.assertEqual(self.path.read_bytes(), before_exact)
 
+    def test_schedule_screen_L_opens_log_viewer_and_returns_to_schedule(self):
+        (self.base / "logs").mkdir()
+        (self.base / "logs" / "attendance-2026-11-19.log").write_text("2026-11-19 10:05:00 INFO 予定画面からログ確認\n", encoding="utf-8")
+        screen = Mock(getmaxyx=Mock(return_value=(24, 62)))
+        self.ui.draw(screen)
+        drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("L ログ", drawn)
+
+        # 一覧で L を押すとログビューアが開き、Esc で予定画面に戻る
+        self.ui.handle_modal("l")
+        self.assertEqual(self.ui.modal, "logs")
+        screen.addstr.reset_mock()
+        self.ui.draw(screen)
+        drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+        self.assertIn("予定画面からログ確認", drawn)
+        self.ui.handle_modal("\x1b")
+        self.assertEqual(self.ui.modal, "schedule")
+
+        # フォーム入力中は l が文字として入力され、ログビューアは開かない
+        self.panel.form("add")
+        self.panel.fields[0] = ""
+        self.panel.editors[0].sync("")
+        self.ui.handle_modal("l")
+        self.assertEqual(self.ui.modal, "schedule")
+        self.assertEqual(self.panel.fields[0], "l")
+
 
 if __name__ == "__main__":
     unittest.main()
