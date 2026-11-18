@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -192,6 +193,34 @@ class DependencyUpdateTests(unittest.TestCase):
             d.prepare_environment(self.base, spec("different lock"))
         self.assertNotIn("private-token", str(caught.exception))
         self.fixture.assert_private_preserved()
+
+    def test_dependencies_log_rotates_and_refuses_symlinks(self):
+        updates = self.base / ".updates"
+        updates.mkdir(parents=True, exist_ok=True)
+        log_path = updates / "dependencies.log"
+        backup_path = updates / "dependencies.log.1"
+        oversized = b"previous-dependency-log\n" + b"z" * u.MAX_LOG_BYTES
+        log_path.write_bytes(oversized)
+        os.chmod(log_path, 0o644)
+
+        _, run = self.fake_install()
+        with patch.object(d, "run_command", side_effect=run):
+            state = d.prepare_environment(self.base, spec("rotated lock"))
+        self.assertTrue((updates / "environments" / state["id"]).is_dir())
+        self.assertEqual(backup_path.read_bytes(), oversized)
+        self.assertEqual(stat.S_IMODE(backup_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.assertIn("段階=起動確認", log_path.read_text(encoding="utf-8"))
+
+        outside = self.base / "outside.txt"
+        outside.write_text("untouched", encoding="utf-8")
+        log_path.unlink()
+        log_path.symlink_to(outside)
+        with patch.object(d, "run_command") as command, self.assertRaises(u.UpdateError):
+            d.prepare_environment(self.base, spec("symlinked log"))
+        command.assert_not_called()
+        self.assertEqual(outside.read_text(encoding="utf-8"), "untouched")
+        self.assertEqual([path.name for path in (updates / "environments").iterdir()], [state["id"]])
 
     def test_timeout_and_interruption_stop_child_processes_before_cleanup(self):
         for error in (subprocess.TimeoutExpired(["install"], 1), KeyboardInterrupt()):

@@ -65,6 +65,8 @@ class SchedulePanel:
             self.index = min(self.index, max(0, len(self.data["courses"]) - 1))
 
     def open(self):
+        if hasattr(self.owner, "expire_password"):
+            self.owner.expire_password()
         self.owner.modal = "schedule"
         self.mode = "list"
         self.fields = []
