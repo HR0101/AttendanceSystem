@@ -3,115 +3,125 @@
 import argparse
 import getpass
 
-from .config import ConfigurationError, load_config
+from .config import ConfigurationError, load_config, private_file_lock
 from .credentials import CredentialError, SERVICE, _save_private_json, keychain_backend
-from .users import change_student_id_config, get_users, remove_user_config, select_user, valid_username
+from .users import (
+    change_student_id_config, get_users, remove_user_config, select_user,
+    valid_student_id, valid_username,
+)
 
 
 def add_user(base, name, student_id, password):
     path = base / "config.json"
-    config = load_config(path)
-    users = get_users(config)
-    default = select_user(config)
-    if not valid_username(name):
-        raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
-    if not student_id or not student_id.isascii() or not student_id.isalnum():
-        raise CredentialError("学生番号は半角英数字で入力してください。")
-    if any(u["username"] == name or u["student_id"] == student_id for u in users):
-        raise CredentialError("そのユーザーネームまたは学生番号は登録済みです。")
-    if not password:
-        raise CredentialError("パスワードが入力されていません。")
-    backend = keychain_backend()
-    try:
-        backend.set_password(SERVICE, student_id, password)
-        if backend.get_password(SERVICE, student_id) != password:
-            raise CredentialError("Keychain への保存を確認できません。")
-    except CredentialError:
-        raise
-    except Exception as exc:
-        raise CredentialError("Keychain の操作に失敗しました。") from exc
-    config["users"] = users + [{"username": name, "student_id": student_id}]
-    config["default_user"] = default["username"] if default else name
-    _save_private_json(path, config)
-    return config
+    with private_file_lock(path):
+        config = load_config(path)
+        users = get_users(config)
+        default = select_user(config)
+        if not valid_username(name):
+            raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
+        if not valid_student_id(student_id):
+            raise CredentialError("学生番号は半角英数字で入力してください。")
+        if any(u["username"] == name or u["student_id"] == student_id for u in users):
+            raise CredentialError("そのユーザーネームまたは学生番号は登録済みです。")
+        if not password:
+            raise CredentialError("パスワードが入力されていません。")
+        backend = keychain_backend()
+        try:
+            backend.set_password(SERVICE, student_id, password)
+            if backend.get_password(SERVICE, student_id) != password:
+                raise CredentialError("Keychain への保存を確認できません。")
+        except CredentialError:
+            raise
+        except Exception as exc:
+            raise CredentialError("Keychain の操作に失敗しました。") from exc
+        config["users"] = users + [{"username": name, "student_id": student_id}]
+        config["default_user"] = default["username"] if default else name
+        _save_private_json(path, config)
+        return config
 
 
 def use_user(base, name):
     path = base / "config.json"
-    config = load_config(path)
-    user = select_user(config, name)
-    config["users"] = get_users(config)
-    config["default_user"] = user["username"]
-    _save_private_json(path, config)
-    return config
+    with private_file_lock(path):
+        config = load_config(path)
+        user = select_user(config, name)
+        config["users"] = get_users(config)
+        config["default_user"] = user["username"]
+        _save_private_json(path, config)
+        return config
 
 
 def activate_default_user(base, name):
     """GUIの既定と出席対象を一緒に変更する。認証失敗なら設定を保存しない。"""
     path = base / "config.json"
-    config = load_config(path)
-    user = select_user(config, name)
-    student_id = user["student_id"]
-    password = _saved_password(keychain_backend(), student_id)
-    if not password:
-        raise CredentialError("保存パスワードがありません。ユーザー管理のPで設定してから、もう一度Dで切り替えてください。")
-    config["users"] = get_users(config)
-    config["default_user"] = user["username"]
-    config["ui_selected_users"] = [student_id]
-    _save_private_json(path, config)
-    return config, student_id, password
+    with private_file_lock(path):
+        config = load_config(path)
+        user = select_user(config, name)
+        student_id = user["student_id"]
+        password = _saved_password(keychain_backend(), student_id)
+        if not password:
+            raise CredentialError("保存パスワードがありません。ユーザー管理のPで設定してから、もう一度Dで切り替えてください。")
+        config["users"] = get_users(config)
+        config["default_user"] = user["username"]
+        config["ui_selected_users"] = [student_id]
+        _save_private_json(path, config)
+        return config, student_id, password
 
 
 def save_ui_selection(base, student_ids):
     path = base / "config.json"
-    config = load_config(path)
-    users = get_users(config)
-    requested = set(student_ids)
-    if not requested or not requested.issubset({user["student_id"] for user in users}):
-        raise CredentialError("ユーザー一覧が変更されています。画面を開き直して選択してください。")
-    config["ui_selected_users"] = [user["student_id"] for user in users if user["student_id"] in requested]
-    _save_private_json(path, config)
-    return config
+    with private_file_lock(path):
+        config = load_config(path)
+        users = get_users(config)
+        requested = set(student_ids)
+        if not requested or not requested.issubset({user["student_id"] for user in users}):
+            raise CredentialError("ユーザー一覧が変更されています。画面を開き直して選択してください。")
+        config["ui_selected_users"] = [user["student_id"] for user in users if user["student_id"] in requested]
+        _save_private_json(path, config)
+        return config
 
 
 def rename_user(base, name, new_name):
     path = base / "config.json"
-    config = load_config(path)
-    user = select_user(config, name)
-    default = select_user(config)
-    users = get_users(config)
-    if not valid_username(new_name):
-        raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
-    if any(u["username"] == new_name and u["student_id"] != user["student_id"] for u in users):
-        raise CredentialError("そのユーザーネームは登録済みです。")
-    for entry in users:
-        if entry["student_id"] == user["student_id"]:
-            entry["username"] = new_name
-    if default == user:
-        config["default_user"] = new_name
-    config["users"] = users
-    _save_private_json(path, config)
-    return config
+    with private_file_lock(path):
+        config = load_config(path)
+        user = select_user(config, name)
+        default = select_user(config)
+        users = get_users(config)
+        if not valid_username(new_name):
+            raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
+        if any(u["username"] == new_name and u["student_id"] != user["student_id"] for u in users):
+            raise CredentialError("そのユーザーネームは登録済みです。")
+        for entry in users:
+            if entry["student_id"] == user["student_id"]:
+                entry["username"] = new_name
+        if default == user:
+            config["default_user"] = new_name
+        config["users"] = users
+        _save_private_json(path, config)
+        return config
 
 
 def change_password(base, name, password):
     """大学側で変更済みのパスワードをKeychainへ保存する。"""
-    config = load_config(base / "config.json")
-    user = select_user(config, name)
-    if user is None:
-        raise CredentialError("登録ユーザーがありません。att user add で登録してください。")
-    if not password:
-        raise CredentialError("新しいパスワードが入力されていません。")
-    backend = keychain_backend()
-    try:
-        backend.set_password(SERVICE, user["student_id"], password)
-        if backend.get_password(SERVICE, user["student_id"]) != password:
-            raise CredentialError("Keychain への保存を確認できません。")
-    except CredentialError:
-        raise
-    except Exception as exc:
-        raise CredentialError("Keychain の操作に失敗しました。") from exc
-    return config
+    path = base / "config.json"
+    with private_file_lock(path):
+        config = load_config(path)
+        user = select_user(config, name)
+        if user is None:
+            raise CredentialError("登録ユーザーがありません。att user add で登録してください。")
+        if not password:
+            raise CredentialError("新しいパスワードが入力されていません。")
+        backend = keychain_backend()
+        try:
+            backend.set_password(SERVICE, user["student_id"], password)
+            if backend.get_password(SERVICE, user["student_id"]) != password:
+                raise CredentialError("Keychain への保存を確認できません。")
+        except CredentialError:
+            raise
+        except Exception as exc:
+            raise CredentialError("Keychain の操作に失敗しました。") from exc
+        return config
 
 
 def _set_saved_password(backend, student_id, password):
@@ -154,28 +164,30 @@ def _saved_password(backend, student_id):
 
 def remove_user(base, name):
     path = base / "config.json"
-    original = load_config(path)
-    user = select_user(original, name)
-    config = remove_user_config(original, name)
-    backend = keychain_backend()
-    password = _saved_password(backend, user["student_id"])
-    return _save_account_change(path, config, backend, {user["student_id"]: password}, {user["student_id"]: None})
+    with private_file_lock(path):
+        original = load_config(path)
+        user = select_user(original, name)
+        config = remove_user_config(original, name)
+        backend = keychain_backend()
+        password = _saved_password(backend, user["student_id"])
+        return _save_account_change(path, config, backend, {user["student_id"]: password}, {user["student_id"]: None})
 
 
 def change_student_id(base, name, student_id):
     path = base / "config.json"
-    original = load_config(path)
-    user = select_user(original, name)
-    config = change_student_id_config(original, name, student_id)
-    if user["student_id"] == student_id:
-        return original
-    backend = keychain_backend()
-    password = _saved_password(backend, user["student_id"])
-    if _saved_password(backend, student_id) is not None:
-        raise CredentialError("その学籍番号の認証情報がKeychainにあります。上書きせずに変更を中止しました。")
-    return _save_account_change(path, config, backend,
-                                {user["student_id"]: password, student_id: None},
-                                {student_id: password, user["student_id"]: None})
+    with private_file_lock(path):
+        original = load_config(path)
+        user = select_user(original, name)
+        config = change_student_id_config(original, name, student_id)
+        if user["student_id"] == student_id:
+            return original
+        backend = keychain_backend()
+        password = _saved_password(backend, user["student_id"])
+        if _saved_password(backend, student_id) is not None:
+            raise CredentialError("その学籍番号の認証情報がKeychainにあります。上書きせずに変更を中止しました。")
+        return _save_account_change(path, config, backend,
+                                    {user["student_id"]: password, student_id: None},
+                                    {student_id: password, user["student_id"]: None})
 
 
 def _confirm_user_removal(user, users, default):
@@ -230,7 +242,7 @@ def user_command(base, argv):
             student_id = (args.student_id if args.student_id is not None else input("学生番号: ")).strip()
             if not valid_username(name):
                 raise CredentialError("ユーザーネームは制御文字を含まない1～60文字にしてください。")
-            if not student_id or not student_id.isascii() or not student_id.isalnum():
+            if not valid_student_id(student_id):
                 raise CredentialError("学生番号は半角英数字で入力してください。")
             if any(u["username"] == name or u["student_id"] == student_id for u in users):
                 raise CredentialError("そのユーザーネームまたは学生番号は登録済みです。表示名の変更には att user rename を使ってください。")

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.scheduler import ScheduleError, load_schedule, save_schedule
+from src.scheduler import ScheduleError, load_schedule, save_schedule, update_schedule
 from src.terminal_ui import AttendanceScreen
 
 
@@ -156,6 +156,38 @@ class SchedulePanelTests(unittest.TestCase):
             self.assertIn("Esc", drawn)
             self.panel.handle("\x1b")
         self.assertEqual(self.path.read_bytes(), original)
+
+    def test_panel_save_preserves_concurrent_disk_additions_and_detects_missing_target(self):
+        # 画面を開いた後に別処理で授業が追加されても、追加・期間更新で上書き消失しない。
+        def add_external(cur):
+            cur["courses"].append({
+                "weekday": "wed", "start_time": "09:00", "room": "642",
+                "course_name": "並行追加授業", "enabled": True,
+            })
+            return cur
+
+        update_schedule(self.path, add_external)
+
+        with patch("src.schedule_ui.agent_installed", return_value=False):
+            self.panel.handle("a")
+            self.panel.fields = ["画面追加授業", "fri", "13:00", "731", "", ""]
+            self.panel.field_index = 5
+            self.ui.handle_modal("\n")
+            self.ui.poll()
+            courses = load_schedule(self.path)["courses"]
+            self.assertEqual([c["course_name"] for c in courses], ["授業", "並行追加授業", "画面追加授業"])
+
+            # 既に別処理で削除済みの授業を編集しようとした場合はエラー表示して他授業を守る。
+            def drop_external(cur):
+                cur["courses"] = [c for c in cur["courses"] if c["course_name"] != "並行追加授業"]
+                return cur
+
+            update_schedule(self.path, drop_external)
+            self.panel.index = 1  # self.panel.data 上では "並行追加授業"
+            self.panel.handle("t")
+            self.ui.poll()
+            self.assertIn("再読込", self.panel.message)
+            self.assertEqual([c["course_name"] for c in load_schedule(self.path)["courses"]], ["授業", "画面追加授業"])
 
 
 if __name__ == "__main__":

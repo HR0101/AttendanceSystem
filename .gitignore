@@ -6,7 +6,9 @@ __pycache__/
 
 # Environment & Local settings
 config.json
+config.json.lock
 schedule.json
+schedule.json.lock
 browser_data/
 logs/
 .updates/

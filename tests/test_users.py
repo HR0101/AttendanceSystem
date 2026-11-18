@@ -4,16 +4,20 @@ import copy
 import io
 import json
 import logging
+
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import main
-from src.config import ConfigurationError, load_config
-from src.credentials import SERVICE, get_credentials
-from src.user_commands import user_command
+from src.config import ConfigurationError, load_config, private_file_lock
+from src.credentials import CredentialError, SERVICE, get_credentials
+from src.user_commands import add_user, rename_user, user_command
 from src.users import get_users, select_user
 
 
@@ -434,6 +438,127 @@ class UserTests(unittest.TestCase):
                 self.assertEqual(code, expected_code)
                 self.assertIn("中断", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_rejects_invalid_legacy_student_id(self):
+        for bad in ("BAD ID", "１２３", "../x", " OLD001", "OLD001 ", 123):
+            with self.subTest(bad=bad):
+                self.path.write_text(json.dumps(dict(CONFIG, student_id=bad)))
+                with self.assertRaises(ConfigurationError):
+                    load_config(self.path)
+
+    def test_first_registration_interrupt_empty_or_keychain_error_leaves_config_untouched(self):
+        empty_cfg = dict(CONFIG, student_id="")
+        self.path.write_text(json.dumps(empty_cfg))
+        before = self.path.read_bytes()
+
+        # パスワード入力中に Ctrl+C / EOF で中断しても config.json を書き換えない。
+        for interrupt in (KeyboardInterrupt(), EOFError()):
+            with self.subTest(interrupt=type(interrupt).__name__):
+                backend = Mock(get_password=Mock(return_value=None))
+                with patch("src.credentials.keychain_backend", return_value=backend), \
+                        patch("builtins.input", side_effect=["FIRST001", "最初のユーザー"]), \
+                        patch("src.credentials.getpass.getpass", side_effect=interrupt):
+                    with self.assertRaises(type(interrupt)):
+                        get_credentials(dict(empty_cfg), self.path)
+                self.assertEqual(self.path.read_bytes(), before)
+                backend.set_password.assert_not_called()
+
+        # 空パスワード、set_password 例外、保存確認不一致でも config.json を書き換えない。
+        cases = [
+            (Mock(get_password=Mock(return_value=None)), "", CredentialError),
+            (Mock(get_password=Mock(return_value=None), set_password=Mock(side_effect=RuntimeError("boom"))), "secret", CredentialError),
+            (Mock(get_password=Mock(side_effect=[None, "wrong-value"])), "secret", CredentialError),
+        ]
+        for idx, (backend, pw, expected_exc) in enumerate(cases):
+            with self.subTest(case=idx):
+                with patch("src.credentials.keychain_backend", return_value=backend), \
+                        patch("builtins.input", side_effect=["FIRST001", "最初のユーザー"]), \
+                        patch("src.credentials.getpass.getpass", return_value=pw):
+                    with self.assertRaises(expected_exc):
+                        get_credentials(dict(empty_cfg), self.path)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_first_registration_merges_concurrent_disk_addition(self):
+        empty_cfg = dict(CONFIG, student_id="")
+        self.path.write_text(json.dumps(empty_cfg))
+        backend = Mock(get_password=Mock(side_effect=[None, "first-secret"]))
+
+        def simulate_concurrent_add(_prompt):
+            other_backend = Mock(get_password=Mock(return_value="other-secret"))
+            with patch("src.user_commands.keychain_backend", return_value=other_backend):
+                add_user(self.base, "並行ユーザー", "OTHER002", "other-secret")
+            return "first-secret"
+
+        with patch("src.credentials.keychain_backend", return_value=backend), \
+                patch("builtins.input", side_effect=["FIRST001", "最初のユーザー"]), \
+                patch("src.credentials.getpass.getpass", side_effect=simulate_concurrent_add):
+            self.assertEqual(get_credentials(dict(empty_cfg), self.path), ("FIRST001", "first-secret"))
+
+        users = get_users(load_config(self.path))
+        self.assertEqual([u["student_id"] for u in users], ["OTHER002", "FIRST001"])
+
+    def test_concurrent_config_updates_are_serialized_without_lost_updates(self):
+        cfg = dict(CONFIG, student_id="", users=[{"username": "one", "student_id": "OLD001"}], default_user="one")
+        self.path.write_text(json.dumps(cfg))
+
+        # 別プロセスが config.json のロックを保持し変更する間、add_user が待機し両方の変更が残ることを確認する。
+        script = "\n".join([
+            "import sys",
+            "from pathlib import Path",
+            "from unittest.mock import Mock, patch",
+            "from src.config import private_file_lock",
+            "from src.user_commands import add_user",
+            "base = Path(sys.argv[1])",
+            "backend = Mock(get_password=Mock(return_value='p1'))",
+            "with private_file_lock(base / 'config.json'):",
+            "    print('LOCKED', flush=True)",
+            "    sys.stdin.read()",
+            "    with patch('src.user_commands.keychain_backend', return_value=backend):",
+            "        add_user(base, 'two', 'NEW002', 'p1')",
+        ])
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.base)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+        try:
+            line = proc.stdout.readline().strip()
+            if line != "LOCKED":
+                self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+            done = threading.Event()
+            errors = []
+
+            def run_add():
+                try:
+                    backend = Mock(get_password=Mock(return_value="p2"))
+                    with patch("src.user_commands.keychain_backend", return_value=backend):
+                        add_user(self.base, "three", "NEW003", "p2")
+                        rename_user(self.base, "one", "uno")
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=run_add)
+            thread.start()
+            self.assertFalse(done.wait(timeout=0.05))
+            proc.stdin.close()
+            thread.join(timeout=5)
+            self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+            self.assertEqual(errors, [])
+
+            stored = load_config(self.path)
+            self.assertEqual(
+                [(u["username"], u["student_id"]) for u in get_users(stored)],
+                [("uno", "OLD001"), ("two", "NEW002"), ("three", "NEW003")],
+            )
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream and not stream.closed:
+                    stream.close()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
