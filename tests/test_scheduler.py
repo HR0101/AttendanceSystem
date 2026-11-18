@@ -1,7 +1,19 @@
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 
-from src.scheduler import ScheduleError, calendar_intervals, due_course, registration_time, validate_schedule, schedule_data
+from src.config import private_file_lock
+from src.scheduler import (
+    ScheduleError, calendar_intervals, due_course, load_schedule,
+    registration_time, save_schedule, schedule_data, update_schedule, validate_schedule,
+)
 
 
 COURSE = {
@@ -106,6 +118,199 @@ class SchedulerTests(unittest.TestCase):
             with self.subTest(bad_room=bad_room), self.assertRaises(ScheduleError):
                 raw["courses"][0]["room"] = bad_room
                 validate_schedule(raw)
+
+    def test_load_schedule_tightens_permissions_and_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            path.write_text(json.dumps(schedule_data(SCHEDULE)), encoding="utf-8")
+            path.chmod(0o644)
+
+            loaded = load_schedule(path)
+            self.assertEqual(len(loaded["courses"]), 1)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+            sym = base / "sym-schedule.json"
+            sym.symlink_to(path)
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                load_schedule(sym)
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                save_schedule(sym, schedule_data(SCHEDULE))
+
+            broken = base / "broken-schedule.json"
+            broken.symlink_to(base / "missing.json")
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                load_schedule(broken)
+
+    def test_update_schedule_serializes_concurrent_threads_and_subprocesses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            save_schedule(path, schedule_data(SCHEDULE))
+
+            days = ("tue", "wed", "thu", "fri")
+
+            def append_course(day):
+                def mutator(current):
+                    current["courses"].append({
+                        "weekday": day, "start_time": "10:00", "room": "642",
+                        "course_name": f"授業-{day}", "enabled": True,
+                    })
+                    return current
+                update_schedule(path, mutator)
+
+            threads = [threading.Thread(target=append_course, args=(day,)) for day in days]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            self.assertEqual({c["weekday"] for c in load_schedule(path)["courses"]}, {"mon", *days})
+
+            # 別プロセスと update_schedule の排他ロック直列化を検証する。
+            script = "\n".join([
+                "import sys",
+                "from pathlib import Path",
+                "from src.config import private_file_lock",
+                "from src.scheduler import update_schedule",
+                "p = Path(sys.argv[1])",
+                "def add_sat(cur):",
+                "    cur['courses'].append({'weekday': 'sat', 'start_time': '09:00', 'room': '731', 'course_name': '土曜授業', 'enabled': True})",
+                "    return cur",
+                "with private_file_lock(p):",
+                "    print('LOCKED', flush=True)",
+                "    sys.stdin.read()",
+                "    update_schedule(p, add_sat)",
+            ])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script, str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                if line != "LOCKED":
+                    self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+                done = threading.Event()
+                errors = []
+
+                def add_sun():
+                    try:
+                        def mutator(cur):
+                            cur["courses"].append({
+                                "weekday": "sun", "start_time": "11:00", "room": "642",
+                                "course_name": "日曜授業", "enabled": True,
+                            })
+                            return cur
+                        update_schedule(path, mutator)
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        done.set()
+
+                thread = threading.Thread(target=add_sun)
+                thread.start()
+                self.assertFalse(done.wait(timeout=0.05))
+                proc.stdin.close()
+                thread.join(timeout=5)
+                self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+                self.assertEqual(errors, [])
+                self.assertEqual(
+                    {c["weekday"] for c in load_schedule(path)["courses"]},
+                    {"mon", *days, "sat", "sun"},
+                )
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+
+    def test_schedule_lock_file_conflicts_with_flock_and_allows_reentrant_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            lock_path = base / "schedule.json.lock"
+            save_schedule(path, schedule_data(SCHEDULE))
+
+            # 独立した flock 呼び出しが schedule.json.lock 上で非ブロッキング取得と競合することを確認する。
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                with private_file_lock(path, exclusive=False, blocking=False):
+                    pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+            # 同一スレッド内の再入（update_schedule -> save_schedule）は成功し、blocking=False は拒否される。
+            def add_course(day: str):
+                def mutator(current):
+                    current["courses"].append({
+                        "weekday": day, "start_time": "10:00", "room": "642",
+                        "course_name": f"授業-{day}", "enabled": True,
+                    })
+                    return current
+                return mutator
+
+            with private_file_lock(path):
+                update_schedule(path, add_course("tue"))
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+
+            # 共有ロックから update_schedule（排他ロック昇格）へのネストもデッドロックせず完了する。
+            with private_file_lock(path, exclusive=False):
+                self.assertEqual(len(load_schedule(path)["courses"]), 2)
+                update_schedule(path, add_course("wed"))
+            self.assertEqual({c["weekday"] for c in load_schedule(path)["courses"]}, {"mon", "tue", "wed"})
+
+            # 別プロセスが schedule.json.lock を保持している間、blocking=False は BlockingIOError を送出する。
+            script = "\n".join([
+                "import sys",
+                "from pathlib import Path",
+                "from src.config import private_file_lock",
+                "with private_file_lock(Path(sys.argv[1]), exclusive=True):",
+                "    print('LOCKED', flush=True)",
+                "    sys.stdin.read()",
+            ])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script, str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                if line != "LOCKED":
+                    self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=True, blocking=False):
+                        pass
+                with self.assertRaises(BlockingIOError):
+                    with private_file_lock(path, exclusive=False, blocking=False):
+                        pass
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
