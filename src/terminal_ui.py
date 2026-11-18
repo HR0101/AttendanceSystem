@@ -108,6 +108,7 @@ class AttendanceScreen:
         self.form_error = ""
         self.confirm_selection = 0
         self._default_agent_active = _UNSET
+        self.confirm_scroll = 0
         self.demo_state = "unattended"
         self.demo_attended = set()
         self.schedule_panel = SchedulePanel(self)
@@ -162,6 +163,7 @@ class AttendanceScreen:
         self.values = {}
         self.user_results = {}
         self.attended = self.unenrolled = self.checked = self.failed = self.confirm = False
+        self.confirm_scroll = 0
         self.updated = "未確認"
 
     def selected_users(self):
@@ -224,7 +226,7 @@ class AttendanceScreen:
                     if len(self.selected_user_ids) > 1 else self.values) for user in targets} if register else {}
         if not register:
             self.clear_target()
-        self.busy, self.confirm = True, False
+        self.busy, self.confirm, self.confirm_scroll = True, False, 0
         self.failed = False
         self.message = f"{len(targets)}人の出席登録中…" if register else f"{len(targets)}人の授業情報を取得中…"
         # 古い授業情報は、新しい取得に成功するまで登録に利用しない。
@@ -926,24 +928,178 @@ class AttendanceScreen:
             self.save_prompt.draw(canvas)
         screen.refresh()
 
+    def open_confirmation(self):
+        """出席登録の確認画面を初期状態（戻る選択・先頭スクロール）で開く。"""
+        self.confirm = True
+        self.confirm_selection = 0
+        self.confirm_scroll = 0
+
+    def confirmation_layout(self, canvas_height, canvas_width):
+        """確認画面の枠サイズと1ページあたりの表示人数を返す。"""
+        width = min(canvas_width - 6, 74)
+        height = min(canvas_height - 2, 24)
+        per_page = max(1, (height - 12) // 2)
+        return width, height, per_page
+
+    def _confirmation_status(self, user, single_user):
+        """確認画面に表示するユーザーごとの対象可否と理由を返す。"""
+        result = self.user_results.get(user["student_id"], {})
+        if single_user:
+            failed = self.failed
+            unenrolled = self.unenrolled
+            attended = self.attended
+            has_values = bool(self.values)
+            raw_result = result.get("result", "")
+            checked = self.checked or bool(result)
+        else:
+            failed = bool(result.get("failed"))
+            unenrolled = bool(result.get("unenrolled"))
+            attended = bool(result.get("attended"))
+            has_values = bool(result.get("values"))
+            raw_result = result.get("result", "")
+            checked = bool(result)
+        if failed:
+            reason = "授業情報不一致" if "授業情報が他のユーザーと異なります" in raw_result else "確認失敗"
+            return False, reason
+        if unenrolled:
+            return False, "未履修（履修登録なし）"
+        if attended:
+            return False, "出席済み"
+        if not has_values:
+            return False, "受付対象なし" if checked and raw_result != "処理中…" else "未確認"
+        if self.config.get("dry_run"):
+            return False, "確認のみモード"
+        return True, "登録対象"
+
+    def confirmation_entries(self):
+        """選択中全ユーザーの登録対象可否と理由の一覧を返す。"""
+        users = self.selected_users()
+        single_user = len(users) == 1
+        entries = []
+        for user in users:
+            eligible, reason = self._confirmation_status(user, single_user)
+            entries.append({
+                "user": user,
+                "username": user["username"],
+                "student_id": user["student_id"],
+                "eligible": eligible,
+                "reason": reason,
+            })
+        return entries
+
+    @staticmethod
+    def _format_confirmation_user(prefix, username, student_id, inner_width):
+        """学籍番号を欠落させずに長いユーザー名を枠内へ収める。"""
+        suffix = f" / {student_id}"
+        available_for_name = inner_width - text_width(prefix) - text_width(suffix)
+        if available_for_name < 4:
+            return fit_text(f"{prefix}{username}{suffix}", inner_width)
+        if text_width(username) > available_for_name:
+            # Ambiguous幅文字の「…」が端末設定により2桁表示されても枠を越えないよう2桁控える。
+            username = fit_text(username, max(1, available_for_name - 2)) + "…"
+        return fit_text(f"{prefix}{username}{suffix}", inner_width)
+
+    def handle_confirmation(self, key, height=24, width=80):
+        """確認画面の一覧スクロール・ボタン選択・決定・取消を処理する。"""
+        total = len(self.selected_users())
+        _, _, per_page = self.confirmation_layout(height, width)
+        max_scroll = max(0, total - per_page)
+        self.confirm_scroll = max(0, min(self.confirm_scroll, max_scroll))
+        can_reg = self.can_register()
+        if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
+            self.confirm_selection = (1 - self.confirm_selection) if can_reg else 0
+        elif key == curses.KEY_UP:
+            self.confirm_scroll = max(0, self.confirm_scroll - 1)
+        elif key == curses.KEY_DOWN:
+            self.confirm_scroll = min(max_scroll, self.confirm_scroll + 1)
+        elif key == curses.KEY_PPAGE:
+            self.confirm_scroll = max(0, self.confirm_scroll - per_page)
+        elif key == curses.KEY_NPAGE:
+            self.confirm_scroll = min(max_scroll, self.confirm_scroll + per_page)
+        elif key == curses.KEY_HOME:
+            self.confirm_scroll = 0
+        elif key == curses.KEY_END:
+            self.confirm_scroll = max_scroll
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            if self.confirm_selection == 1 and can_reg:
+                self.start(register=True)
+            else:
+                self.confirm = False
+                self.confirm_scroll = 0
+        elif key == "\x1b":
+            self.confirm = False
+            self.confirm_scroll = 0
+
     def draw_confirmation(self, canvas):
-        width = min(canvas.width - 6, 68)
-        left, top = (canvas.width - width) // 2, max(1, (canvas.height - 15) // 2)
-        canvas.box(top, left, width, 15, "出席登録の確認", color(4))
-        targets = self.registration_targets()
-        names = "、".join(user["username"] for user in targets)
-        lines = wrap_text(names, width - 6)
-        for index, line in enumerate(lines[:2]):
-            if index == 1 and len(lines) > 2:
-                line = fit_text(line, width - 8) + "…"
-            canvas.put(top + 2 + index, left + 3, line, curses.A_BOLD, width - 6)
-        for index, label in enumerate(("授業名", "教室名", "時限", "開始時刻", "終了時刻"), 4):
-            canvas.put(top + index, left + 3, label, curses.A_DIM)
-            canvas.put(top + index, left + 15, self.values.get(label, "--"), curses.A_BOLD, width - 18)
-        canvas.put(top + 10, left + 3, f"{len(targets)}人を登録します（対象外 {len(self.selected_user_ids) - len(targets)}人）。", width=width - 6)
-        canvas.button(top + 12, left + 3, "[ 戻る ]", self.confirm_selection == 0)
-        canvas.button(top + 12, left + 20, "[ 出席登録 ]", self.confirm_selection == 1)
-        canvas.put(top + 13, left + 3, "Tab/←→ 選択  Enter 決定  Esc 戻る", curses.A_DIM, width - 6)
+        width, height, per_page = self.confirmation_layout(canvas.height, canvas.width)
+        left = (canvas.width - width) // 2
+        top = max(1, (canvas.height - height) // 2)
+        inner = width - 6
+        canvas.box(top, left, width, height, "出席登録の確認", color(4))
+
+        entries = self.confirmation_entries()
+        eligible_entries = [entry for entry in entries if entry["eligible"]]
+        total = len(entries)
+        eligible_count = len(eligible_entries)
+        excluded_count = total - eligible_count
+
+        max_scroll = max(0, total - per_page)
+        self.confirm_scroll = max(0, min(self.confirm_scroll, max_scroll))
+        visible = entries[self.confirm_scroll:self.confirm_scroll + per_page]
+
+        count_text = f"登録対象 {eligible_count}人 / 対象外 {excluded_count}人"
+        start = self.confirm_scroll + 1 if visible else 0
+        end = self.confirm_scroll + len(visible)
+        page_text = f"表示 {start}-{end} / {total}人" if total else "表示 0 / 0人"
+        page_width = text_width(page_text)
+        canvas.put(top + 1, left + 3, count_text, curses.A_BOLD, max(1, inner - page_width - 2))
+        canvas.put(top + 1, left + 3 + inner - page_width, page_text, curses.A_DIM, page_width)
+
+        if eligible_entries:
+            names = "、".join(entry["username"] for entry in eligible_entries)
+            if text_width("対象: " + names) > inner:
+                preview = "対象: " + fit_text(names, max(1, inner - 8)) + "…"
+            else:
+                preview = "対象: " + names
+            canvas.put(top + 2, left + 3, preview, curses.A_BOLD, inner)
+        else:
+            canvas.put(top + 2, left + 3, "対象: なし（登録できるユーザーはいません）", color(3) | curses.A_BOLD, inner)
+
+        canvas.put(top + 3, left + 3, "授業名", curses.A_DIM, 6)
+        canvas.put(top + 3, left + 11, self.values.get("授業名", "--"), curses.A_BOLD, inner - 8)
+        half = inner // 2
+        canvas.put(top + 4, left + 3, "教室名", curses.A_DIM, 6)
+        canvas.put(top + 4, left + 11, self.values.get("教室名", "--"), curses.A_BOLD, max(1, half - 9))
+        canvas.put(top + 4, left + 3 + half, "時限", curses.A_DIM, 4)
+        canvas.put(top + 4, left + 3 + half + 6, self.values.get("時限", "--"), curses.A_BOLD, max(1, inner - half - 6))
+        canvas.put(top + 5, left + 3, "時間", curses.A_DIM, 4)
+        time_range = f"{self.values.get('開始時刻', '--:--')} ～ {self.values.get('終了時刻', '--:--')}"
+        canvas.put(top + 5, left + 11, time_range, curses.A_BOLD, inner - 8)
+
+        list_header = "選択ユーザー一覧（↑↓/PgUp/PgDnで移動）" if total > per_page else "選択ユーザー一覧"
+        canvas.put(top + 6, left + 3, list_header, color(1), inner)
+        for index, entry in enumerate(visible):
+            row = top + 7 + index * 2
+            prefix = "[+] " if entry["eligible"] else "[-] "
+            user_line = self._format_confirmation_user(prefix, entry["username"], entry["student_id"], inner)
+            user_attr = (color(2) | curses.A_BOLD) if entry["eligible"] else curses.A_BOLD
+            canvas.put(row, left + 3, user_line, user_attr, inner)
+            reason_line = "    登録対象" if entry["eligible"] else f"    対象外: {entry['reason']}"
+            reason_attr = color(2) if entry["eligible"] else color(3 if entry["reason"] in ("確認失敗", "授業情報不一致") else 4)
+            canvas.put(row + 1, left + 3, reason_line, reason_attr, inner)
+
+        canvas.put(top + height - 5, left + 3, f"{eligible_count}人を登録します（対象外 {excluded_count}人）。", width=inner)
+        can_reg = self.can_register()
+        if not can_reg:
+            note = "確認のみモードのため登録できません。" if self.config.get("dry_run") else "登録できる対象ユーザーがいません。"
+            canvas.put(top + height - 4, left + 3, note, color(3), inner)
+        elif total > per_page:
+            canvas.put(top + height - 4, left + 3, f"↑↓/PgUp/PgDn でスクロール（{start}-{end} / {total}人）", curses.A_DIM, inner)
+
+        focus_register = can_reg and self.confirm_selection == 1
+        canvas.button(top + height - 3, left + 3, "[ 戻る ]", not focus_register)
+        canvas.button(top + height - 3, left + 20, "[ 出席登録 ]", focus_register, enabled=can_reg)
+        canvas.put(top + height - 2, left + 3, "Tab/←→ 選択  Enter 決定  Esc 戻る", curses.A_DIM, inner)
 
     def draw_modal(self, canvas):
         if self.modal == "schedule":
@@ -1041,7 +1197,7 @@ class AttendanceScreen:
             canvas.button(top + height - 5, left + 25, "[ 切り替える ]", self.confirm_selection == 1)
             canvas.put(top + height - 3, left + 3, "Tab/←→で選択し、Enterで決定します。", curses.A_DIM, width - 6)
         else:
-            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択してEnter", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
+            guide = ("入力: ←→で移動 / Home・End / Delete", "Tab・↑↓: 項目を選択   Enter: 決定", "R: 更新 U: ユーザー S: 自動出席の予定", "ユーザー: Spaceで複数選択、Enterで保存", "登録確認: Tab・←→で選択、↑↓/PgUp/PgDn一覧", "パスワード入力: F2で表示/非表示", "GUIの選択を保存。既定の変更は U → D。", "ユーザーごとの結果は U → V で確認。")
             for index, line in enumerate(guide):
                 for offset, part in enumerate(wrap_text(line, width - 6)):
                     canvas.put(top + 2 + index * 2 + offset, left + 3, part, width=width - 6)
@@ -1087,24 +1243,23 @@ class AttendanceScreen:
                     if key in ("q", "Q", "\x03"):
                         if self.modal:
                             self.handle_modal("\x1b")
+                        elif self.confirm:
+                            self.confirm = False
+                            self.confirm_scroll = 0
                         else:
                             return 0
-                    elif key == "\x1b" and self.modal:
-                        self.handle_modal(key)
+                    elif key == "\x1b":
+                        if self.modal:
+                            self.handle_modal(key)
+                        elif self.confirm:
+                            self.confirm = False
+                            self.confirm_scroll = 0
                     continue
                 if self.save_prompt.active:
                     self.save_prompt.handle(key)
                     continue
                 if self.confirm:
-                    if key in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_BTAB):
-                        self.confirm_selection = 1 - self.confirm_selection
-                    if key in ("\n", "\r", curses.KEY_ENTER):
-                        if self.confirm_selection == 1:
-                            self.start(register=True)
-                        else:
-                            self.confirm = False
-                    elif key == "\x1b":
-                        self.confirm = False
+                    self.handle_confirmation(key, height, width)
                     continue
                 if self.modal:
                     self.handle_modal(key)
@@ -1131,8 +1286,7 @@ class AttendanceScreen:
                         self.schedule_panel.open()
                     elif self.selected == 2:
                         if self.can_register():
-                            self.confirm = True
-                            self.confirm_selection = 0
+                            self.open_confirmation()
                     else:
                         self.start()
                 elif self.selected == 0:
