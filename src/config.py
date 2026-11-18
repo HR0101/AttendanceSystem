@@ -1,6 +1,12 @@
 """利用者設定の読み込みと検証。"""
 
+import contextlib
+import errno
+import fcntl
 import json
+import os
+import stat
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -9,11 +15,96 @@ class ConfigurationError(Exception):
     pass
 
 
+_LOCK_STATE = threading.local()
+
+
+def _held_locks() -> dict[str, int]:
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    return held
+
+
+def tighten_fd_mode(fd: int, mode: int) -> None:
+    """グループ・他者のアクセス権が付いていれば指定モードへ制限する。"""
+    if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+        os.fchmod(fd, mode)
+
+
+def read_private_text(path: Path, error_cls: type[Exception], label: str) -> str:
+    """シンボリックリンクを拒否し、権限を 0o600 へ締めたうえで UTF-8 テキストを読む。"""
+    if not isinstance(path, Path):
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise error_cls(f"{label} がありません。") from exc
+    if path.is_symlink():
+        raise error_cls(f"{label} にシンボリックリンクは使用できません。")
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise error_cls(f"{label} は通常のファイルにしてください。")
+        tighten_fd_mode(fd, 0o600)
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = None
+            return stream.read()
+    except FileNotFoundError as exc:
+        raise error_cls(f"{label} がありません。") from exc
+    except UnicodeDecodeError as exc:
+        raise error_cls(f"{label} の文字コードを確認してください。") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise error_cls(f"{label} にシンボリックリンクは使用できません。") from exc
+        raise error_cls(f"{label} を読み込めません。") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def private_file_lock(path: Path):
+    """設定・予定ファイルの read-modify-write 全体を保護する排他ロック。"""
+    if not isinstance(path, (str, os.PathLike)):
+        yield
+        return
+    target = Path(path)
+    lock_path = target.with_name(f"{target.name}.lock")
+    if lock_path.is_symlink():
+        raise OSError(f"{lock_path.name} にシンボリックリンクは使用できません。")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = os.path.realpath(lock_path)
+    held = _held_locks()
+    # 同一スレッド内のネストしたロック取得による flock 自己デッドロックを防ぐ。
+    if held.get(key, 0) > 0:
+        held[key] += 1
+        try:
+            yield lock_path
+        finally:
+            held[key] -= 1
+            if held[key] == 0:
+                del held[key]
+        return
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{lock_path.name} は通常のファイルにしてください。")
+        tighten_fd_mode(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        held[key] = 1
+        try:
+            yield lock_path
+        finally:
+            held.pop(key, None)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def load_config(path: Path) -> dict:
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ConfigurationError("config.json がありません。") from exc
+        config = json.loads(read_private_text(path, ConfigurationError, "config.json"))
     except json.JSONDecodeError as exc:
         raise ConfigurationError(f"config.json の {exc.lineno} 行目を確認してください。") from exc
     if not isinstance(config, dict):

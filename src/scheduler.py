@@ -9,6 +9,7 @@ import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .config import private_file_lock, read_private_text
 from .room import RoomError, parse_room
 
 
@@ -32,9 +33,7 @@ def _valid_time(value) -> bool:
 
 def load_schedule(path: Path) -> dict:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ScheduleError("schedule.json がありません。") from exc
+        raw = json.loads(read_private_text(path, ScheduleError, "schedule.json"))
     except json.JSONDecodeError as exc:
         raise ScheduleError(f"schedule.json の {exc.lineno} 行目を確認してください。") from exc
     return validate_schedule(raw)
@@ -103,16 +102,33 @@ def schedule_data(schedule: dict) -> dict:
 def save_schedule(path: Path, raw: dict) -> dict:
     schedule = validate_schedule(raw)
     data = json.dumps(schedule_data(schedule), ensure_ascii=False, indent=2) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix=".schedule-", suffix=".json", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(data)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    with private_file_lock(path):
+        if isinstance(path, Path) and path.is_symlink():
+            raise ScheduleError("schedule.json にシンボリックリンクは使用できません。")
+        fd, temporary = tempfile.mkstemp(prefix=".schedule-", suffix=".json", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(data)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     return schedule
+
+
+def update_schedule(path: Path, mutator, default_raw: dict | None = None, *, writer=None) -> dict:
+    """排他ロック下で schedule.json を読み込み、mutator の変更を検証・保存する。"""
+    save = writer or save_schedule
+    with private_file_lock(path):
+        if isinstance(path, Path) and (path.is_symlink() or path.exists()):
+            current = schedule_data(load_schedule(path))
+        elif default_raw is not None:
+            current = schedule_data(validate_schedule(default_raw))
+        else:
+            raise ScheduleError("schedule.json がありません。")
+        updated = mutator(current)
+        return save(path, updated)
 
 
 def _start_week_minute(course: dict) -> int:

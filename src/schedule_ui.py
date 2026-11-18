@@ -9,7 +9,8 @@ from datetime import date
 from .config import load_config
 from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
-    load_schedule, registration_time, remove_agent, save_schedule, schedule_data, validate_schedule,
+    load_schedule, registration_time, remove_agent, save_schedule, schedule_data,
+    update_schedule, validate_schedule,
 )
 from .terminal_layout import color
 from .text_input import TextCursor
@@ -17,6 +18,28 @@ from .users import select_user
 
 
 DAYS = dict(zip(WEEKDAYS, "月火水木金土日"))
+
+
+def _course_snapshot(course: dict) -> tuple:
+    return (
+        course["weekday"],
+        course["start_time"],
+        course["room"],
+        course["course_name"].strip(),
+        course.get("enabled", True),
+        course.get("register_time", ""),
+        course.get("register_until", ""),
+    )
+
+
+def _find_course_index(courses: list[dict], target: dict, hint_index: int) -> int:
+    key = _course_snapshot(target)
+    if 0 <= hint_index < len(courses) and _course_snapshot(courses[hint_index]) == key:
+        return hint_index
+    for index, item in enumerate(courses):
+        if _course_snapshot(item) == key:
+            return index
+    raise ScheduleError("対象の授業は他の操作で変更または削除されています。Rで再読込してください。")
 
 
 class SchedulePanel:
@@ -74,12 +97,14 @@ class SchedulePanel:
 
         def read():
             base = self.owner.base
+            schedule_path = base / "schedule.json" if base is not None else None
+            has_file = schedule_path is not None and (schedule_path.is_symlink() or schedule_path.exists())
             if self.owner.demo:
-                data = schedule_data(load_schedule(base / "schedule.json")) if base and (base / "schedule.json").exists() else self.empty_data()
+                data = schedule_data(load_schedule(schedule_path)) if has_file else self.empty_data()
                 return data, False, "デモ: 変更は保存されません。"
             if base is None:
                 raise ScheduleError("設定ファイルの場所を確認できません。")
-            data = schedule_data(load_schedule(base / "schedule.json")) if (base / "schedule.json").exists() else self.empty_data()
+            data = schedule_data(load_schedule(schedule_path)) if has_file else self.empty_data()
             return data, agent_installed(base), "Aで授業を追加できます。"
         self.work(read)
 
@@ -88,7 +113,7 @@ class SchedulePanel:
         today = date.today()
         return {"active_from": today.isoformat(), "active_until": date(today.year, 12, 31).isoformat(), "blackout_dates": [], "courses": []}
 
-    def persist(self, candidate):
+    def persist(self, candidate, mutator=None, default_raw=None):
         # 入力エラーはフォームを閉じずに表示する。
         try:
             candidate = schedule_data(validate_schedule(candidate))
@@ -98,11 +123,15 @@ class SchedulePanel:
         active = self.active
 
         def save():
-            schedule = validate_schedule(candidate)
             if self.owner.demo:
                 return candidate, active, "デモ: 変更は保存されません。"
             base = self.owner.base
-            save_schedule(base / "schedule.json", candidate)
+            path = base / "schedule.json"
+            if mutator is None:
+                schedule = save_schedule(path, candidate)
+            else:
+                schedule = update_schedule(path, mutator, default_raw=default_raw, writer=save_schedule)
+            saved = schedule_data(schedule)
             if active:
                 try:
                     if calendar_intervals(schedule["courses"]):
@@ -110,8 +139,8 @@ class SchedulePanel:
                     else:
                         remove_agent(base)
                 except (ScheduleError, OSError):
-                    return candidate, agent_installed(base), "保存済み。自動実行への反映に失敗。Iで停止→再開してください。"
-            return candidate, agent_installed(base), "予定を保存し、自動実行に反映しました。" if active else "予定を保存しました。Iで自動実行を開始できます。"
+                    return saved, agent_installed(base), "保存済み。自動実行への反映に失敗。Iで停止→再開してください。"
+            return saved, agent_installed(base), "予定を保存し、自動実行に反映しました。" if active else "予定を保存しました。Iで自動実行を開始できます。"
         self.work(save)
 
     def toggle_agent(self):
@@ -129,11 +158,10 @@ class SchedulePanel:
                 raise ScheduleError("自動実行には browser.headless を true にしてください。")
             if select_user(config) is None:
                 raise ScheduleError("ユーザー管理で既定ユーザーを登録してください。")
-            schedule = validate_schedule(candidate)
-            # 予定ファイルが存在しない状態では開始しない。
-            save_schedule(base / "schedule.json", candidate)
+            # 予定ファイルが存在しない状態では開始しない。既存の更新も上書きしない。
+            schedule = update_schedule(base / "schedule.json", lambda current: current, default_raw=candidate, writer=save_schedule)
             install_agent(base, schedule)
-            return candidate, True, "自動実行を開始しました。GUIを閉じても動作します。"
+            return schedule_data(schedule), True, "自動実行を開始しました。GUIを閉じても動作します。"
         self.work(toggle)
 
     def form(self, mode):
@@ -161,20 +189,38 @@ class SchedulePanel:
             self.discard_form()
 
     def submit(self):
-        candidate = copy.deepcopy(self.data)
+        base_data = copy.deepcopy(self.data)
+        candidate = copy.deepcopy(base_data)
         values = [value.strip() for value in self.fields]
         if self.mode == "period":
-            candidate.update(active_from=values[0], active_until=values[1], blackout_dates=[s.strip() for s in values[2].replace("、", ",").split(",") if s.strip()])
+            blackouts = [s.strip() for s in values[2].replace("、", ",").split(",") if s.strip()]
+            candidate.update(active_from=values[0], active_until=values[1], blackout_dates=blackouts)
+
+            def mutator(current):
+                current.update(active_from=values[0], active_until=values[1], blackout_dates=list(blackouts))
+                return current
         else:
             name, day, start, room, register, until = values
             day = next((key for key, label in DAYS.items() if day in (label, label + "曜", label + "曜日")), day.lower())
             course = {"course_name": name, "weekday": day, "start_time": start, "room": room, "enabled": True, "register_time": register, "register_until": until}
             if self.mode == "edit":
-                course["enabled"] = candidate["courses"][self.index].get("enabled", True)
-                candidate["courses"][self.index] = course
+                index = self.index
+                before_course = copy.deepcopy(base_data["courses"][index])
+                course["enabled"] = before_course.get("enabled", True)
+                candidate["courses"][index] = course
+
+                def mutator(current):
+                    idx = _find_course_index(current["courses"], before_course, index)
+                    edited = dict(course, enabled=current["courses"][idx].get("enabled", True))
+                    current["courses"][idx] = edited
+                    return current
             else:
                 candidate["courses"].append(course)
-        self.persist(candidate)
+
+                def mutator(current):
+                    current["courses"].append(copy.deepcopy(course))
+                    return current
+        self.persist(candidate, mutator=mutator, default_raw=base_data)
 
     def handle(self, key):
         if self.owner.save_prompt.active:
@@ -191,9 +237,17 @@ class SchedulePanel:
         courses = self.data["courses"]
         if self.mode == "delete":
             if enter:
-                candidate = copy.deepcopy(self.data)
-                del candidate["courses"][self.index]
-                self.persist(candidate)
+                base_data = copy.deepcopy(self.data)
+                index = self.index
+                before_course = copy.deepcopy(base_data["courses"][index])
+                candidate = copy.deepcopy(base_data)
+                del candidate["courses"][index]
+
+                def mutator(current):
+                    idx = _find_course_index(current["courses"], before_course, index)
+                    del current["courses"][idx]
+                    return current
+                self.persist(candidate, mutator=mutator, default_raw=base_data)
             return
         if self.mode in ("add", "edit", "period"):
             if enter and self.field_index == len(self.fields) - 1:
@@ -214,10 +268,18 @@ class SchedulePanel:
         elif key in ("d", "D") and courses:
             self.mode, self.message = "delete", ""
         elif key in ("t", "T") and courses:
-            candidate = copy.deepcopy(self.data)
-            course = candidate["courses"][self.index]
+            base_data = copy.deepcopy(self.data)
+            index = self.index
+            before_course = copy.deepcopy(base_data["courses"][index])
+            candidate = copy.deepcopy(base_data)
+            course = candidate["courses"][index]
             course["enabled"] = not course.get("enabled", True)
-            self.persist(candidate)
+
+            def mutator(current):
+                idx = _find_course_index(current["courses"], before_course, index)
+                current["courses"][idx]["enabled"] = not current["courses"][idx].get("enabled", True)
+                return current
+            self.persist(candidate, mutator=mutator, default_raw=base_data)
         elif key in ("p", "P"):
             self.form("period")
         elif key in ("i", "I"):

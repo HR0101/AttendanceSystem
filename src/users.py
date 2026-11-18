@@ -5,7 +5,16 @@ import unicodedata
 from .config import ConfigurationError
 
 
+def valid_student_id(value):
+    return isinstance(value, str) and bool(value) and value.isascii() and value.isalnum()
+
+
 def validate_users(config):
+    legacy = config.get("student_id", "")
+    if not isinstance(legacy, str):
+        raise ConfigurationError("student_id は文字列にしてください。")
+    if legacy.strip() and (legacy != legacy.strip() or not valid_student_id(legacy)):
+        raise ConfigurationError("student_id は半角英数字にしてください。")
     users = config.get("users", [])
     if not isinstance(users, list):
         raise ConfigurationError("users は配列にしてください。")
@@ -16,7 +25,7 @@ def validate_users(config):
         name, student_id = user.get("username"), user.get("student_id")
         if not valid_username(name):
             raise ConfigurationError("ユーザーネームは空白だけや制御文字を含まない1～60文字にしてください。")
-        if not isinstance(student_id, str) or not student_id or not student_id.isascii() or not student_id.isalnum():
+        if not valid_student_id(student_id):
             raise ConfigurationError("ユーザーの student_id は半角英数字にしてください。")
         if name in names or student_id in ids:
             raise ConfigurationError("ユーザーネームと学生番号は重複できません。")
@@ -26,7 +35,7 @@ def validate_users(config):
     if not isinstance(default, str) or (default and default not in {u["username"] for u in get_users(config)}):
         raise ConfigurationError("default_user は登録済みのユーザーネームにしてください。")
     selection = config.get("ui_selected_users", [])
-    if (not isinstance(selection, list) or not all(isinstance(value, str) and value and value.isascii() and value.isalnum() for value in selection)
+    if (not isinstance(selection, list) or not all(valid_student_id(value) for value in selection)
             or len(selection) != len(set(selection))):
         raise ConfigurationError("ui_selected_users は重複のない学籍番号の配列にしてください。")
 
@@ -85,7 +94,7 @@ def remove_user_config(config, name):
 def change_student_id_config(config, name, student_id):
     user = select_user(config, name)
     users = get_users(config)
-    if not isinstance(student_id, str) or not student_id or not student_id.isascii() or not student_id.isalnum():
+    if not valid_student_id(student_id):
         raise ConfigurationError("学籍番号は半角英数字で入力してください。")
     if any(entry["student_id"] == student_id and entry["username"] != name for entry in users):
         raise ConfigurationError("その学籍番号は登録済みです。")

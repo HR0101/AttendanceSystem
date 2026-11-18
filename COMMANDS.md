@@ -177,6 +177,7 @@ GUIでD→Enterを実行すると、既定ユーザーだけでなく、現在�
 
 ```sh
 cp schedule.example.json schedule.json # 初めて予定ファイルを作る場合のみ
+chmod 600 schedule.json               # 本人だけが読み書きできるよう権限を設定
 # schedule.json に授業期間・休講日・授業を設定
 ./att schedule install                # 編集した起動時刻を反映
 ```

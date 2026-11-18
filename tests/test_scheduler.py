@@ -1,7 +1,16 @@
+import json
+import subprocess
+import sys
+import tempfile
+import threading
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 
-from src.scheduler import ScheduleError, calendar_intervals, due_course, registration_time, validate_schedule, schedule_data
+from src.scheduler import (
+    ScheduleError, calendar_intervals, due_course, load_schedule,
+    registration_time, save_schedule, schedule_data, update_schedule, validate_schedule,
+)
 
 
 COURSE = {
@@ -91,6 +100,113 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(due_course(schedule, datetime(2026, 10, 5, 0, 3)), course)
         schedule["blackout_dates"] = frozenset({date(2026, 10, 4)})
         self.assertIsNone(due_course(schedule, datetime(2026, 10, 5, 0, 3)))
+
+    def test_load_schedule_tightens_permissions_and_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            path.write_text(json.dumps(schedule_data(SCHEDULE)), encoding="utf-8")
+            path.chmod(0o644)
+
+            loaded = load_schedule(path)
+            self.assertEqual(len(loaded["courses"]), 1)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+            sym = base / "sym-schedule.json"
+            sym.symlink_to(path)
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                load_schedule(sym)
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                save_schedule(sym, schedule_data(SCHEDULE))
+
+            broken = base / "broken-schedule.json"
+            broken.symlink_to(base / "missing.json")
+            with self.assertRaisesRegex(ScheduleError, "シンボリックリンク"):
+                load_schedule(broken)
+
+    def test_update_schedule_serializes_concurrent_threads_and_subprocesses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "schedule.json"
+            save_schedule(path, schedule_data(SCHEDULE))
+
+            days = ("tue", "wed", "thu", "fri")
+
+            def append_course(day):
+                def mutator(current):
+                    current["courses"].append({
+                        "weekday": day, "start_time": "10:00", "room": "642",
+                        "course_name": f"授業-{day}", "enabled": True,
+                    })
+                    return current
+                update_schedule(path, mutator)
+
+            threads = [threading.Thread(target=append_course, args=(day,)) for day in days]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            self.assertEqual({c["weekday"] for c in load_schedule(path)["courses"]}, {"mon", *days})
+
+            # 別プロセスと update_schedule の排他ロック直列化を検証する。
+            script = "\n".join([
+                "import sys",
+                "from pathlib import Path",
+                "from src.config import private_file_lock",
+                "from src.scheduler import update_schedule",
+                "p = Path(sys.argv[1])",
+                "def add_sat(cur):",
+                "    cur['courses'].append({'weekday': 'sat', 'start_time': '09:00', 'room': '731', 'course_name': '土曜授業', 'enabled': True})",
+                "    return cur",
+                "with private_file_lock(p):",
+                "    print('LOCKED', flush=True)",
+                "    sys.stdin.read()",
+                "    update_schedule(p, add_sat)",
+            ])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script, str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+            try:
+                line = proc.stdout.readline().strip()
+                if line != "LOCKED":
+                    self.fail(f"unexpected lock output {line!r}: {proc.stderr.read()}")
+                done = threading.Event()
+                errors = []
+
+                def add_sun():
+                    try:
+                        def mutator(cur):
+                            cur["courses"].append({
+                                "weekday": "sun", "start_time": "11:00", "room": "642",
+                                "course_name": "日曜授業", "enabled": True,
+                            })
+                            return cur
+                        update_schedule(path, mutator)
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        done.set()
+
+                thread = threading.Thread(target=add_sun)
+                thread.start()
+                self.assertFalse(done.wait(timeout=0.05))
+                proc.stdin.close()
+                thread.join(timeout=5)
+                self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+                self.assertEqual(errors, [])
+                self.assertEqual(
+                    {c["weekday"] for c in load_schedule(path)["courses"]},
+                    {"mon", *days, "sat", "sun"},
+                )
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
