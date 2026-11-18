@@ -3,9 +3,10 @@
 import copy
 import io
 import json
+import logging
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -164,6 +165,61 @@ class UserTests(unittest.TestCase):
                 self.assertEqual(user_command(self.base, ["password"]), 1)
             self.assertNotIn("private-password", output.getvalue())
             self.assertEqual(self.path.read_bytes(), before)
+
+    def _memory_logger(self):
+        stream = io.StringIO()
+        logger = logging.getLogger("test_cli_interrupts")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        return logger, stream
+
+    def test_cli_handles_eof_and_keyboard_interrupt_cleanly(self):
+        for exc_type, expected_code in ((EOFError, 1), (KeyboardInterrupt, 130)):
+            for stage, argv in (("ask_room", []), ("get_credentials", ["642"]), ("run_attendance", ["642"])):
+                with self.subTest(exc=exc_type.__name__, stage=stage):
+                    logger, log_stream = self._memory_logger()
+                    stderr = io.StringIO()
+                    stdout = io.StringIO()
+                    config = copy.deepcopy(CONFIG)
+                    room_patch = patch("main.ask_room", side_effect=exc_type()) if stage == "ask_room" else patch("main.ask_room", return_value=("642", "642"))
+                    cred_patch = (
+                        patch("main.get_credentials", side_effect=exc_type())
+                        if stage == "get_credentials"
+                        else patch("main.get_credentials", side_effect=lambda cfg, *a, **kw: (cfg.__setitem__("_active_username", "太郎") or ("OLD001", "dummy")))
+                    )
+                    run_patch = (
+                        patch("src.attendance.run_attendance", side_effect=exc_type())
+                        if stage == "run_attendance"
+                        else patch("src.attendance.run_attendance", return_value="出席済み")
+                    )
+                    with patch("main.load_config", return_value=config), \
+                            patch("main.setup_logging", return_value=logger), \
+                            room_patch, cred_patch, \
+                            patch("src.browser.open_page", return_value=nullcontext(Mock())), \
+                            run_patch, \
+                            redirect_stdout(stdout), redirect_stderr(stderr):
+                        code = main.main(argv)
+                    self.assertEqual(code, expected_code)
+                    self.assertIn("中断", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    logs = log_stream.getvalue()
+                    self.assertIn(f"INFO 中断 種別={exc_type.__name__}", logs)
+                    self.assertNotIn("ERROR", logs)
+                    self.assertNotIn("失敗", logs)
+                    self.assertNotIn("異常終了", logs)
+
+    def test_schedule_command_handles_eof_and_keyboard_interrupt(self):
+        for exc_type, expected_code in ((EOFError, 1), (KeyboardInterrupt, 130)):
+            with self.subTest(exc=exc_type.__name__):
+                stderr = io.StringIO()
+                with patch("main.load_schedule", side_effect=exc_type()), redirect_stderr(stderr):
+                    code = main.main(["schedule", "status"])
+                self.assertEqual(code, expected_code)
+                self.assertIn("中断", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

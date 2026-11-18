@@ -1,12 +1,16 @@
 """画面で表示した授業の照合と登録可否を確認する。"""
 
-import unittest
 import curses
+import io
+import logging
+import unittest
 from pathlib import Path
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 from unittest.mock import Mock, patch
 
-from src.terminal_ui import AttendanceScreen, fit_text
+from src.config import ConfigurationError
+from src.room import RoomError
+from src.terminal_ui import AttendanceScreen, fit_text, launch_ui
 from src.verification import AttendanceError
 from src.credentials import CredentialError
 
@@ -237,6 +241,55 @@ class TerminalUITests(unittest.TestCase):
             save.assert_not_called()
         self.assertEqual(ui.password, "")
         self.assertEqual(ui.form_values, [])
+
+    @patch("src.terminal_ui.threading.Thread")
+    @patch("src.browser.open_page")
+    @patch("src.attendance.run_attendance")
+    def test_single_user_error_logging_records_safe_reason_only(self, run, open_page, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        open_page.return_value = nullcontext(Mock())
+        for exc, expected_reason in (
+            (AttendanceError("確認に失敗しました。"), "確認に失敗しました。"),
+            (CredentialError("Keychainにパスワードがありません。"), "Keychainにパスワードがありません。"),
+            (RoomError("教室番号を確認してください。"), "教室番号を確認してください。"),
+            (ConfigurationError("設定を確認してください。"), "設定を確認してください。"),
+            (RuntimeError("https://internal.invalid/secret-token"), None),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                stream = io.StringIO()
+                logger = logging.getLogger("test_single_ui_log")
+                logger.setLevel(logging.INFO)
+                logger.handlers.clear()
+                logger.addHandler(logging.StreamHandler(stream))
+                ui = AttendanceScreen({"dry_run": False, "_active_username": "taro"}, "TEST001", "secret-pass", logger, "731")
+                run.side_effect = exc
+                ui.start()
+                ui.poll()
+                text = stream.getvalue()
+                self.assertIn(f"画面操作停止 種別={type(exc).__name__}", text)
+                self.assertNotIn("対象=", text)
+                self.assertNotIn("TEST001", text)
+                self.assertNotIn("secret-pass", text)
+                self.assertNotIn("taro", text)
+                if expected_reason is not None:
+                    self.assertIn(f"理由={expected_reason}", text)
+                else:
+                    self.assertNotIn("secret-token", text)
+                    self.assertNotIn("理由=", text)
+
+    def test_launch_ui_handles_eof_and_keyboard_interrupt(self):
+        for exc_type, expected_code in ((EOFError, 1), (KeyboardInterrupt, 130)):
+            with self.subTest(exc=exc_type.__name__):
+                stderr = io.StringIO()
+                with patch("src.terminal_ui.sys.stdin.isatty", return_value=True), \
+                        patch("src.terminal_ui.sys.stdout.isatty", return_value=True), \
+                        patch("src.terminal_ui.setup_logging", return_value=Mock()), \
+                        patch("src.terminal_ui.load_config", return_value={"users": [], "browser": {"headless": True, "timeout_ms": 15000}}), \
+                        patch("src.terminal_ui.get_credentials", side_effect=exc_type()), \
+                        redirect_stderr(stderr):
+                    code = launch_ui(Path("/unused"))
+                self.assertEqual(code, expected_code)
+                self.assertIn("中断", stderr.getvalue())
 
 
 if __name__ == "__main__":

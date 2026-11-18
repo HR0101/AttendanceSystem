@@ -24,6 +24,41 @@ from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
 
 
+class _WorkerLogger:
+    """並列実行時のログに匿名ワーカー識別子を付与する。"""
+
+    def __init__(self, logger, label: str):
+        self._logger = logger
+        self._label = label
+
+    def _emit(self, method: str, msg, *args, **kwargs):
+        getattr(self._logger, method)(f"{self._label} {msg}", *args, **kwargs)
+
+    def debug(self, msg, *args, **kwargs):
+        self._emit("debug", msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        self._emit("info", msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self._emit("warning", msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self._emit("error", msg, *args, **kwargs)
+
+    def exception(self, msg, *args, **kwargs):
+        self._emit("exception", msg, *args, **kwargs)
+
+    def critical(self, msg, *args, **kwargs):
+        self._emit("critical", msg, *args, **kwargs)
+
+    def log(self, level, msg, *args, **kwargs):
+        self._logger.log(level, f"{self._label} {msg}", *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
 class AttendanceScreen:
     def __init__(self, config, student_id, password, logger, room="", demo=False, base=None, *, restore_selection=True):
         self.config, self.student_id, self.password = config, student_id, password
@@ -141,9 +176,11 @@ class AttendanceScreen:
             self.user_results[user["student_id"]] = {"values": {}, "attended": False, "unenrolled": False,
                                                     "failed": False, "result": "処理中…"}
 
-        def work_user(user):
+        def work_user(index, user):
             student_id = user["student_id"]
             values_expected = expected.get(student_id, {})
+            # 複数人並列処理時は PII を含まない番号でスレッドごとのログを追跡可能にする。
+            worker_logger = _WorkerLogger(self.logger, f"対象={index}/{len(targets)}") if len(targets) > 1 else self.logger
             try:
                 if self.demo:
                     if self.demo_state == "error":
@@ -167,28 +204,28 @@ class AttendanceScreen:
                         _, password = get_credentials(config, self.base / "config.json", interactive=False, username=user["username"])
                     with open_page(config) as page:
                         result = run_attendance(
-                            page, config, student_id, password, room, route, self.logger,
+                            page, config, student_id, password, room, route, worker_logger,
                             values_expected.get("授業名"), values_expected.get("開始時刻"),
                             on_snapshot=lambda values, attended, unenrolled: self.events.put(
                                 ("user_snapshot", (student_id, values, attended, unenrolled))),
                             expected_values=values_expected if register else None,
                         )
-                self.logger.info("画面操作 結果=%s", result)
+                worker_logger.info("画面操作 結果=%s", result)
                 self.events.put(("user_result", (student_id, result)))
             except (ConfigurationError, CredentialError, AttendanceError, RoomError) as exc:
-                self.logger.error("画面操作停止 種別=%s", type(exc).__name__)
+                worker_logger.error("画面操作停止 種別=%s 理由=%s", type(exc).__name__, exc)
                 self.events.put(("user_error", (student_id, str(exc))))
             except Exception as exc:
-                self.logger.error("画面操作停止 種別=%s", type(exc).__name__)
+                worker_logger.error("画面操作停止 種別=%s", type(exc).__name__)
                 self.events.put(("user_error", (student_id, "通信または画面状態を確認してください。詳細は logs を参照してください。")))
 
         def work():
             if len(targets) == 1:
-                work_user(targets[0])
+                work_user(1, targets[0])
             else:
                 # Playwrightは各スレッドで起動し、ユーザー間でセッションを共有しない。
                 with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
-                    list(executor.map(work_user, targets))
+                    list(executor.map(work_user, range(1, len(targets) + 1), targets))
             self.events.put(("complete", register))
 
         threading.Thread(target=work, daemon=True).start()
@@ -958,5 +995,9 @@ def launch_ui(base: Path, room=None, demo=False, check=False, username=None) -> 
     except (ConfigurationError, CredentialError, RoomError, curses.error) as exc:
         print(f"画面を起動できません: {exc}", file=sys.stderr)
         return 1
+    except EOFError:
+        print("入力を中断しました。", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
+        print("処理を中断しました。", file=sys.stderr)
         return 130
