@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.credentials import CredentialError
+from src.terminal_layout import Canvas, text_width
 from src.terminal_ui import AttendanceScreen
 from src.verification import AttendanceError
 
@@ -236,6 +237,206 @@ class MultiUserUITests(unittest.TestCase):
             self.assertIn("user1、user2", drawn)
             self.assertIn("2人を登録します（対象外 0人）", drawn)
             ui.confirm = False
+
+    def draw_confirmation_text(self, ui, width=80, height=24):
+        screen = Mock(getmaxyx=Mock(return_value=(height, width)))
+        ui.draw(screen)
+        return screen, "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+
+    def test_confirmation_shows_all_selected_users_and_exclusion_reasons(self):
+        ui = self.screen(count=6)
+        ui.values = dict(VALUES)
+        ui.user_results = {
+            "TEST001": {"values": VALUES, "attended": False, "unenrolled": False, "failed": False, "result": "未出席（確認のみ）"},
+            "TEST002": {"values": VALUES, "attended": True, "unenrolled": False, "failed": False, "result": "出席済み"},
+            "TEST003": {"values": VALUES, "attended": False, "unenrolled": True, "failed": False, "result": "履修登録なし（出席操作なし）"},
+            "TEST004": {"values": {}, "attended": False, "unenrolled": False, "failed": False, "result": "出席受付対象なし"},
+            "TEST005": {"values": {}, "attended": False, "unenrolled": False, "failed": True, "result": "確認に失敗しました。"},
+            "TEST006": {"values": {}, "attended": False, "unenrolled": False, "failed": True, "result": "授業情報が他のユーザーと異なります。Rで再確認してください。"},
+        }
+        ui.open_confirmation()
+        _, drawn = self.draw_confirmation_text(ui, width=80)
+        self.assertIn("登録対象 1人 / 対象外 5人", drawn)
+        self.assertIn("1人を登録します（対象外 5人）", drawn)
+        self.assertIn("表示 1-5 / 6人", drawn)
+        self.assertIn("user1 / TEST001", drawn)
+        self.assertIn("登録対象", drawn)
+        self.assertIn("user2 / TEST002", drawn)
+        self.assertIn("対象外: 出席済み", drawn)
+        self.assertIn("user3 / TEST003", drawn)
+        self.assertIn("対象外: 未履修（履修登録なし）", drawn)
+        self.assertIn("user4 / TEST004", drawn)
+        self.assertIn("対象外: 受付対象なし", drawn)
+        self.assertIn("user5 / TEST005", drawn)
+        self.assertIn("対象外: 確認失敗", drawn)
+        ui.handle_confirmation(curses.KEY_DOWN)
+        _, drawn_next = self.draw_confirmation_text(ui, width=80)
+        self.assertIn("表示 2-6 / 6人", drawn_next)
+        self.assertIn("user6 / TEST006", drawn_next)
+        self.assertIn("対象外: 授業情報不一致", drawn_next)
+
+        ui.config["dry_run"] = True
+        ui.confirm_scroll = 0
+        _, drawn_dry = self.draw_confirmation_text(ui, width=80)
+        self.assertIn("登録対象 0人 / 対象外 6人", drawn_dry)
+        self.assertIn("対象外: 確認のみモード", drawn_dry)
+
+    def test_confirmation_scrolls_many_users_and_truncates_long_names_within_borders(self):
+        long_prefix = "とても長い日本語ユーザーネームテスト" * 2
+        users = [{"username": f"{long_prefix}{i:02d}", "student_id": f"LONG{i:03d}"} for i in range(1, 13)]
+        config = {"users": users, "default_user": users[0]["username"], "_active_username": users[0]["username"], "dry_run": False}
+        ui = AttendanceScreen(config, "LONG001", "secret1", Mock(), "731", base=Path("/unused"))
+        ui.selected_user_ids = {user["student_id"] for user in users}
+        ui.values = dict(VALUES)
+        ui.user_results = {
+            user["student_id"]: {
+                "values": VALUES if idx % 3 else {},
+                "attended": idx % 4 == 1,
+                "unenrolled": idx % 4 == 2,
+                "failed": False,
+                "result": "出席受付対象なし" if idx % 3 == 0 else "確認結果",
+            }
+            for idx, user in enumerate(users)
+        }
+
+        for width in (62, 80, 120):
+            with self.subTest(width=width):
+                ui.open_confirmation()
+                box_width, _, per_page = ui.confirmation_layout(24, width)
+                box_left = (width - box_width) // 2
+                box_right = box_left + box_width - 1
+                seen = set()
+                for step in range(len(users)):
+                    screen = Mock(getmaxyx=Mock(return_value=(24, width)))
+                    ui.draw_confirmation(Canvas(screen))
+                    drawn = "\n".join(call.args[2] for call in screen.addstr.call_args_list)
+                    for user in users:
+                        if user["student_id"] in drawn:
+                            seen.add(user["student_id"])
+                    # 枠外への文字はみ出し（右罫線以降への描画）がないことを検証する。
+                    for call in screen.addstr.call_args_list:
+                        row, col, text = call.args[:3]
+                        if box_left < col < box_right and text.strip():
+                            self.assertLess(col + text_width(text), box_right)
+                    if step < len(users) - per_page:
+                        ui.handle_confirmation(curses.KEY_DOWN, 24, width)
+                self.assertEqual(seen, {user["student_id"] for user in users})
+
+                ui.handle_confirmation(curses.KEY_PPAGE, 24, width)
+                self.assertEqual(ui.confirm_scroll, len(users) - 2 * per_page)
+                ui.handle_confirmation(curses.KEY_NPAGE, 24, width)
+                self.assertEqual(ui.confirm_scroll, len(users) - per_page)
+                ui.handle_confirmation(curses.KEY_UP, 24, width)
+                self.assertEqual(ui.confirm_scroll, len(users) - per_page - 1)
+                ui.handle_confirmation(curses.KEY_PPAGE, 24, width)
+                ui.handle_confirmation(curses.KEY_PPAGE, 24, width)
+                ui.handle_confirmation(curses.KEY_PPAGE, 24, width)
+                self.assertEqual(ui.confirm_scroll, 0)
+
+    def test_confirmation_run_loop_supports_scrolling_and_single_user_reasons(self):
+        # run()経由で確認画面を開き、PgDn/↑でスクロールしEscで閉じられることを確認する。
+        ui = self.screen(count=8)
+        ui.values = dict(VALUES)
+        ui.user_results = {
+            f"TEST00{i}": {"values": VALUES, "attended": False, "unenrolled": False, "failed": False, "result": "未出席"}
+            for i in range(1, 9)
+        }
+        ui.room = ""
+        ui.selected = 2
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        screen.get_wch.side_effect = ["\n", curses.KEY_NPAGE, curses.KEY_UP, "\x1b", "q"]
+        with patch("src.terminal_ui.curses.has_colors", return_value=False):
+            self.assertEqual(ui.run(screen), 0)
+        self.assertFalse(ui.confirm)
+        self.assertEqual(ui.confirm_scroll, 0)
+
+        # 単一ユーザーでも状態に応じた対象可否と理由が表示される。
+        single = self.screen(count=1)
+        single.values = dict(VALUES)
+        self.assertEqual(single.confirmation_entries()[0]["reason"], "登録対象")
+        single.attended = True
+        self.assertEqual(single.confirmation_entries()[0]["reason"], "出席済み")
+        single.attended = False
+        single.unenrolled = True
+        self.assertEqual(single.confirmation_entries()[0]["reason"], "未履修（履修登録なし）")
+        single.unenrolled = False
+        single.failed = True
+        self.assertEqual(single.confirmation_entries()[0]["reason"], "確認失敗")
+        single.failed = False
+        single.values = {}
+        single.checked = True
+        self.assertEqual(single.confirmation_entries()[0]["reason"], "受付対象なし")
+
+    def test_confirmation_defaults_to_back_and_blocks_all_excluded_registration(self):
+        ui = self.screen(count=3)
+        ui.values = dict(VALUES)
+        ui.user_results = {
+            "TEST001": {"values": VALUES, "attended": False, "unenrolled": False, "failed": False, "result": "未出席（確認のみ）"},
+            "TEST002": {"values": VALUES, "attended": True, "unenrolled": False, "failed": False, "result": "出席済み"},
+            "TEST003": {"values": VALUES, "attended": False, "unenrolled": True, "failed": False, "result": "履修登録なし"},
+        }
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)))
+        screen.get_wch.side_effect = ["\n", "\n", "q"]
+        ui.selected = 2
+        with patch("src.terminal_ui.curses.has_colors", return_value=False), patch.object(ui, "start") as start:
+            self.assertEqual(ui.run(screen), 0)
+            # room設定済みの初期取得1回のみで、登録([ 戻る ]でEnter)は実行されない。
+            start.assert_called_once_with()
+        self.assertFalse(ui.confirm)
+        self.assertEqual(ui.confirm_selection, 0)
+
+        # EscやTab後の戻るでも登録は開始されない。
+        ui.open_confirmation()
+        self.assertEqual(ui.confirm_selection, 0)
+        ui.handle_confirmation("\t")
+        self.assertEqual(ui.confirm_selection, 1)
+        ui.handle_confirmation(curses.KEY_BTAB)
+        self.assertEqual(ui.confirm_selection, 0)
+        with patch.object(ui, "start") as start:
+            ui.handle_confirmation("\x1b")
+            start.assert_not_called()
+        self.assertFalse(ui.confirm)
+
+        # Tab -> Enter で対象者のみ・expected_values付きで登録を開始する。
+        ui.open_confirmation()
+        ui.handle_confirmation(curses.KEY_RIGHT)
+        self.assertEqual(ui.confirm_selection, 1)
+        registered = []
+
+        def run(page, config, student_id, password, room, route, logger, course, start, *, on_snapshot, expected_values):
+            registered.append((student_id, expected_values))
+            on_snapshot(VALUES, True, False)
+            return "出席登録成功"
+
+        with patch("src.terminal_ui.get_credentials", side_effect=self.credentials), \
+                patch("src.browser.open_page", side_effect=lambda config: nullcontext(Mock())), \
+                patch("src.attendance.run_attendance", side_effect=run):
+            ui.handle_confirmation("\n")
+            self.wait_for_operation(ui)
+        self.assertEqual(registered, [("TEST001", VALUES)])
+
+        # 全員対象外なら確認モーダルを開けず、確認画面を表示しても登録できない。
+        ui.user_results["TEST001"] = {"values": VALUES, "attended": True, "unenrolled": False, "failed": False, "result": "出席済み"}
+        ui.attended = True
+        self.assertFalse(ui.can_register())
+        screen.get_wch.side_effect = ["\n", "q"]
+        ui.selected = 2
+        with patch("src.terminal_ui.curses.has_colors", return_value=False), patch.object(ui, "start") as start:
+            self.assertEqual(ui.run(screen), 0)
+            start.assert_called_once_with()
+        self.assertFalse(ui.confirm)
+
+        ui.open_confirmation()
+        _, drawn = self.draw_confirmation_text(ui, width=80)
+        self.assertIn("登録対象 0人 / 対象外 3人", drawn)
+        self.assertIn("0人を登録します（対象外 3人）", drawn)
+        ui.handle_confirmation("\t")
+        self.assertEqual(ui.confirm_selection, 0)
+        with patch.object(ui, "start") as start:
+            ui.confirm_selection = 1
+            ui.handle_confirmation("\n")
+            start.assert_not_called()
+        self.assertFalse(ui.confirm)
 
 
 if __name__ == "__main__":
