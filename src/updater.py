@@ -229,6 +229,77 @@ def runtime_environment(base, state):
             "PYTHONNOUSERSITE": "1", "VIRTUAL_ENV": str(directory)}
 
 
+def _ensure_no_symlinks(base, path, message):
+    current = path
+    while current != base:
+        if current.is_symlink():
+            raise UpdateError(message)
+        current = current.parent
+
+
+def referenced_environment_ids(base):
+    """現在・待機中・バックアップ・復元記録が参照している環境IDを集める。"""
+    base = Path(base).resolve()
+    updates = base / ".updates"
+    records = (
+        (updates / "runtime.json", lambda data: data),
+        (updates / "pending/metadata.json", lambda data: data.get("runtime") if isinstance(data, dict) else "invalid"),
+        (updates / "backup/runtime.json", lambda data: data),
+        (updates / "transaction/runtime.json", lambda data: data),
+    )
+    referenced = set()
+    for path, select in records:
+        _ensure_no_symlinks(base, path, "依存パッケージの参照記録がシンボリックリンクです。")
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise UpdateError("依存パッケージの参照記録が通常のファイルではありません。")
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise UpdateError("依存パッケージの参照記録を読み取れません。") from exc
+        state = select(data)
+        if state is None:
+            continue
+        if not isinstance(state, dict) or not isinstance(state.get("id"), str) or not state["id"]:
+            raise UpdateError("依存パッケージの参照記録が不正です。")
+        referenced.add(state["id"])
+    return referenced
+
+
+def cleanup_environments(base):
+    """参照されていない専用仮想環境を排他ロック下で削除する。"""
+    base = Path(base).resolve()
+    updates = base / ".updates"
+    environments = updates / "environments"
+    _ensure_no_symlinks(base, environments, "依存パッケージの保存先がシンボリックリンクです。")
+    _ensure_no_symlinks(base, updates / "dependency.lock", "依存パッケージの保存先がシンボリックリンクです。")
+    if not updates.exists():
+        return []
+    if not updates.is_dir():
+        raise UpdateError("依存パッケージの保存先が通常のフォルダではありません。")
+    if not environments.exists():
+        return []
+    if not environments.is_dir():
+        raise UpdateError("依存パッケージの保存先が通常のフォルダではありません。")
+    # ロック順序を runtime.lock -> dependency.lock に統一し、準備処理と競合しないようにする。
+    with file_lock(updates / "dependency.lock", exclusive=True):
+        _ensure_no_symlinks(base, environments, "依存パッケージの保存先がシンボリックリンクです。")
+        if not environments.exists():
+            return []
+        if not environments.is_dir():
+            raise UpdateError("依存パッケージの保存先が通常のフォルダではありません。")
+        referenced = referenced_environment_ids(base)
+        removed = []
+        for entry in sorted(environments.iterdir()):
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.name not in referenced:
+                shutil.rmtree(entry)
+                removed.append(entry.name)
+        return removed
+
+
 def activate_runtime(base, argv, runtime):
     # ヘルプ・復元・デモはネットワークや依存パッケージの準備なしで利用できる。
     if any(flag in argv for flag in ("--help", "-h", "--version", "--demo", "--rollback", "--notes")):
@@ -400,7 +471,7 @@ def record_rate_limit(updates, state, exc):
 
 
 def pending_metadata(base):
-    """中断・破損した準備データは破棄し、次のダウンロードを妨げない。"""
+    """中断・破損・期限切れの準備データは破棄し、次のダウンロードを妨げない。"""
     pending = base / ".updates/pending"
     if pending.is_symlink():
         raise UpdateError("更新の一時領域が通常のフォルダではありません。インストール先を確認してください。")
@@ -409,10 +480,12 @@ def pending_metadata(base):
     if not pending.is_dir():
         raise UpdateError("更新の一時領域が通常のフォルダではありません。インストール先を確認してください。")
     metadata = read_json(pending / "metadata.json")
+    from .version import VERSION
     try:
         if not isinstance(metadata, dict):
             raise ValueError
-        version_tuple(metadata.get("version"))
+        if version_tuple(metadata.get("version")) <= version_tuple(VERSION):
+            raise ValueError
         for key in ("before", "files"):
             files = metadata.get(key)
             if not isinstance(files, dict) or not files or not all(
@@ -676,10 +749,7 @@ def apply_pending(base):
     pending = updates / "pending"
     metadata = pending_metadata(base)
     if not metadata:
-        return None
-    from .version import VERSION
-    if version_tuple(metadata["version"]) <= version_tuple(VERSION):
-        shutil.rmtree(pending)
+        cleanup_environments(base)
         return None
     if fingerprint(base) != metadata["before"] or fingerprint(pending) != metadata["files"]:
         shutil.rmtree(pending)
@@ -717,6 +787,7 @@ def apply_pending(base):
     shutil.rmtree(updates / "backup", ignore_errors=True)
     os.replace(transaction, updates / "backup")
     shutil.rmtree(pending)
+    cleanup_environments(base)
     return f"{metadata['version']} への更新が完了しました。次回起動から使用します。"
 
 
@@ -755,6 +826,7 @@ def finish_update(base):
         (updates / "rollback.json").unlink()
         # 復元直後に同じ更新を再適用しない。
         write_json(updates / "check.json", {"checked_at": time.time(), "interval": 86400, "skip_version": VERSION})
+        cleanup_environments(base)
         return "更新前の版に戻しました。次回起動から使用します。"
     return apply_pending(base)
 
