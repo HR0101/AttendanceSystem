@@ -37,6 +37,8 @@ att --ui                 # GUIを開く
 att --check 642          # 指定教室の出席状態を確認（登録しない）
 ```
 
+Finder からフォルダ内の [start.command](start.command) をダブルクリックして GUI（`--ui`）を起動することもできます。
+
 今のターミナルですぐ使いたい場合や `att: command not found` が出る場合は、セットアップ完了時に表示される `source` コマンドを実行してください。通常のzsh環境では `source ~/.zshrc`、bashでは `source ~/.bash_profile` です。
 
 セットアップは `~/.local/bin/att` にリンクを作り、zshでは `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashでは `~/.bash_profile` にPATH設定を追加します。ダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行してください。
@@ -124,7 +126,7 @@ GUIでは `U` で一覧を開き、↑↓とSpaceで出席するユーザーを�
 
 ### 教室番号
 
-入力番号はQRの出席URL用の番号です。`642` は `/attendance/class_room/642` に、7号館の `731` は `/attendance/class_room/7301` に変換します。QR番号と授業情報の教室名は異なる場合があります。例えばQRのURLが `/attendance/class_room/435`、授業教室が432の場合も `435` を指定してください。GUIでは入力値を「QR番号」、大学側の表示を「教室名」として表示します。
+入力番号はQRの出席URL用の番号です。`642` は `/attendance/class_room/642` に、7号館の `731` は `/attendance/class_room/7301` に変換します。全角数字（例: `６４２`、`７３１`）や、7号館の4桁番号（例: `7301` → 教室 `731` / URL `7301`）もそのまま入力できます。QR番号と授業情報の教室名は異なる場合があります。例えばQRのURLが `/attendance/class_room/435`、授業教室が432の場合も `435` を指定してください。GUIでは入力値を「QR番号」、大学側の表示を「教室名」として表示します。
 
 ### 自動実行の予定
 

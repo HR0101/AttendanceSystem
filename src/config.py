@@ -13,7 +13,10 @@ def load_config(path: Path) -> dict:
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ConfigurationError("config.json がありません。") from exc
+        raise ConfigurationError(
+            "config.json がありません。bash install.sh を実行するか、"
+            "cp config.example.json config.json && chmod 600 config.json で作成してください。"
+        ) from exc
     except json.JSONDecodeError as exc:
         raise ConfigurationError(f"config.json の {exc.lineno} 行目を確認してください。") from exc
     if not isinstance(config, dict):

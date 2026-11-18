@@ -1,6 +1,8 @@
 """設定 URL の検証。"""
 
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock
 
@@ -26,6 +28,16 @@ class ConfigTests(unittest.TestCase):
         path = self.config_path("https://attendance.is.it-chiba.ac.jp/attendance/top")
         with self.assertRaisesRegex(ConfigurationError, "ホスト名"):
             load_config(path)
+
+    def test_missing_config_includes_setup_recovery_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "config.json"
+            with self.assertRaises(ConfigurationError) as captured:
+                load_config(missing)
+        message = str(captured.exception)
+        self.assertIn("config.json がありません", message)
+        self.assertIn("bash install.sh", message)
+        self.assertIn("cp config.example.json config.json && chmod 600 config.json", message)
 
 
 if __name__ == "__main__":

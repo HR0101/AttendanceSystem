@@ -23,8 +23,17 @@ case "${SHELL##*/}" in
 esac
 
 if [ -e "$command_path" ] || [ -L "$command_path" ]; then
-    [ -L "$command_path" ] && [ "$(readlink "$command_path")" = "$tool_dir/att" ] \
-        || fail "$command_path が既に存在します。内容を確認してから再実行してください。"
+    if [ -L "$command_path" ]; then
+        link_target=$(readlink "$command_path" 2>/dev/null || true)
+        if [ "$link_target" != "$tool_dir/att" ]; then
+            if [ ! -e "$command_path" ]; then
+                fail "${command_path} はリンク先が見つからない壊れたシンボリックリンクです（リンク先: ${link_target}）。ls -l \"${command_path}\" で確認し、不要なら rm \"${command_path}\" を実行してから bash install.sh を再実行してください。"
+            fi
+            fail "${command_path} は別の場所（${link_target}）へのシンボリックリンクです。ls -l \"${command_path}\" で確認し、このフォルダへ切り替える場合は rm \"${command_path}\" を実行してから bash install.sh を再実行してください。"
+        fi
+    else
+        fail "${command_path} が既に存在します。別のコマンドでないか ls -l \"${command_path}\" で確認し、不要な場合のみ rm \"${command_path}\" を実行してから bash install.sh を再実行してください。"
+    fi
 fi
 lock_path="$tool_dir/requirements.lock"
 if [ -L "$lock_path" ] || { [ -e "$lock_path" ] && [ ! -f "$lock_path" ]; }; then
@@ -118,12 +127,15 @@ fi
     || fail "requirements.lock が見つからないか不正です。配布元から完全なファイルを取得して再実行してください。"
 
 echo "Python 環境とブラウザを準備しています…"
-if [ ! -d "$tool_dir/.venv" ]; then
+if [ ! -e "$tool_dir/.venv" ] && [ ! -L "$tool_dir/.venv" ]; then
     python3 -m venv "$tool_dir/.venv"
+elif [ ! -d "$tool_dir/.venv" ]; then
+    fail ".venv が正しいディレクトリではありません。rm -rf \"${tool_dir}/.venv\" を実行してから bash install.sh を再実行してください。"
 fi
-[ -x "$tool_dir/.venv/bin/python" ] || fail ".venv が不完全です。.venv を確認してください。"
+[ -x "$tool_dir/.venv/bin/python" ] \
+    || fail ".venv が不完全または破損しています。rm -rf \"${tool_dir}/.venv\" を実行してから bash install.sh を再実行してください。"
 "$tool_dir/.venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
-    || fail ".venv の Python は 3.10 以降である必要があります。"
+    || fail ".venv の Python は 3.10 以降である必要があります（または .venv が破損しています）。rm -rf \"${tool_dir}/.venv\" を実行してから bash install.sh を再実行してください。"
 # ロックファイルに記録したハッシュと一致する wheel だけを導入する。
 "$tool_dir/.venv/bin/python" -m pip install --no-input --require-hashes --only-binary=:all: -r "$tool_dir/requirements.lock"
 "$tool_dir/.venv/bin/python" -m playwright install chromium
