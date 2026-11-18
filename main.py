@@ -17,7 +17,7 @@ from src.credentials import CredentialError, get_credentials
 from src.logging_utils import setup_logging
 from src.verification import AttendanceError
 from src.room import RoomError, ask_room, parse_room
-from src.scheduler import ScheduleError, agent_installed, due_course, install_agent, load_schedule, remove_agent
+from src.scheduler import ScheduleError, agent_installed, due_scheduled_course, install_agent, load_schedule, remove_agent
 from src.users import select_user
 from src.version import VERSION
 
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.room is not None:
                 raise ScheduleError("自動実行では教室番号を直接指定できません。")
             schedule = load_schedule(base / "schedule.json")
-            course = due_course(schedule, datetime.now().astimezone())
+            course = due_scheduled_course(base, schedule, datetime.now().astimezone())
             if course is None:
                 result = "予定時間外（出席操作なし）"
                 logger.info("結果=%s", result)

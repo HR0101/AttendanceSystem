@@ -759,10 +759,54 @@ def finish_update(base):
     return apply_pending(base)
 
 
+MAX_LAUNCHAGENT_LOG_BYTES = 256 * 1024
+
+
+def sanitize_log_line(message, limit=240):
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(message))
+    text = re.sub(r"://[^/\s@]+@", "://***@", text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", text)
+    return " ".join(text.split())[:limit]
+
+
+def log_scheduled_failure(base, exc_type_name, message):
+    """アプリ読込前の失敗も追跡できるよう、標準ライブラリだけで安全に記録する。"""
+    try:
+        log_dir = base / "logs"
+        if log_dir.is_symlink() or (log_dir.exists() and not log_dir.is_dir()):
+            return
+        log_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(log_dir, 0o700)
+        log_path = log_dir / "launchagent.log"
+        if log_path.is_symlink() or (log_path.exists() and not log_path.is_file()):
+            return
+        if log_path.exists() and log_path.stat().st_size > MAX_LAUNCHAGENT_LOG_BYTES:
+            backup = log_dir / "launchagent.log.1"
+            if not backup.is_symlink() and (not backup.exists() or backup.is_file()):
+                os.replace(log_path, backup)
+                os.chmod(backup, 0o600)
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        entry = f"{timestamp} ERROR {sanitize_log_line(f'{exc_type_name}: {message}')}\n"
+        fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as log:
+            os.fchmod(log.fileno(), 0o600)
+            log.write(entry)
+    except OSError:
+        pass
+
+
+def scheduled_failure_message(exc):
+    if isinstance(exc, ModuleNotFoundError):
+        name = re.sub(r"[^A-Za-z0-9_.]", "", str(getattr(exc, "name", "") or ""))[:64] or "unknown"
+        return f"起動失敗: 依存パッケージが見つかりません（{name}）。README.md のセットアップを確認してください。"
+    return f"起動失敗: 予期しないエラーが発生しました（{type(exc).__name__}）。"
+
+
 def run_application(base, argv=None, *, use_runtime=False):
     argv = sys.argv[1:] if argv is None else argv
     updates = base / ".updates"
-    automatic = (not os.environ.get("ATTENDANCE_NO_UPDATE") and "--scheduled" not in argv
+    scheduled = "--scheduled" in argv
+    automatic = (not os.environ.get("ATTENDANCE_NO_UPDATE") and not scheduled
                  and "--demo" not in argv and "--help" not in argv and "-h" not in argv
                  and "--version" not in argv
                  and (not argv or argv[0] not in {"update", "user", "schedule"}))
@@ -818,7 +862,18 @@ def run_application(base, argv=None, *, use_runtime=False):
                                 code = 1
             return code
     except (UpdateError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
-        print(update_failure_message(exc), file=sys.stderr)
+        message = update_failure_message(exc)
+        print(message, file=sys.stderr)
+        if scheduled:
+            log_scheduled_failure(base, type(exc).__name__, message)
+        return 1
+    except Exception as exc:
+        if not scheduled and not isinstance(exc, ModuleNotFoundError):
+            raise
+        message = scheduled_failure_message(exc)
+        print(message, file=sys.stderr)
+        if scheduled:
+            log_scheduled_failure(base, type(exc).__name__, message)
         return 1
 
 
