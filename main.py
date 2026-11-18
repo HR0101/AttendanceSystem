@@ -9,6 +9,7 @@ if __name__ == "__main__":
 import argparse
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -17,7 +18,15 @@ from src.credentials import CredentialError, get_credentials
 from src.logging_utils import setup_logging
 from src.verification import AttendanceError
 from src.room import RoomError, ask_room, parse_room
-from src.scheduler import ScheduleError, agent_installed, due_course, install_agent, load_schedule, remove_agent
+from src.scheduler import (
+    ScheduleError,
+    agent_installed,
+    claim_scheduled_run,
+    due_scheduled_course,
+    install_agent,
+    load_schedule,
+    remove_agent,
+)
 from src.users import select_user
 from src.version import VERSION
 
@@ -29,6 +38,13 @@ def _handle_interrupt(exc: BaseException, logger=None, started: float | None = N
         logger.info("中断 種別=%s 所要時間=%.1f秒", type(exc).__name__, time.monotonic() - started)
     print("処理を中断しました。" if is_ctrl_c else "入力を中断しました。", file=sys.stderr)
     return 130 if is_ctrl_c else 1
+
+# 当日の実行枠を消費するのは出席完了を確認できた結果（出席登録成功・出席済み）のみ。
+# 履修登録なし・受付対象なし・確認のみ等の未完了結果では確定せず、修正後の同一枠内再試行を許す。
+_CONSUMING_RESULTS = frozenset({
+    "出席登録成功",
+    "出席済み",
+})
 
 
 def schedule_command(argv: list[str]) -> int:
@@ -58,6 +74,28 @@ def schedule_command(argv: list[str]) -> int:
     except (ScheduleError, ConfigurationError) as exc:
         print(f"自動実行を設定できません: {exc}", file=sys.stderr)
         return 1
+
+
+def _execute_attendance(
+    config: dict,
+    base: Path,
+    args,
+    room: str,
+    route: str,
+    logger,
+    expected_course: str | None = None,
+    expected_start: str | None = None,
+) -> str:
+    student_id, password = get_credentials(config, base / "config.json", interactive=not args.scheduled, username=args.user)
+    print(f"ユーザー: {config['_active_username']}（学生番号: {student_id}）")
+    try:
+        from src.browser import open_page
+        from src.attendance import run_attendance
+        logger.info("段階=ブラウザ起動")
+        with open_page(config) as page:
+            return run_attendance(page, config, student_id, password, room, route, logger, expected_course, expected_start)
+    finally:
+        del password
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,36 +130,35 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("起動 version=%s", VERSION)
     try:
         config = load_config(base / "config.json")
-        expected_course = None
-        expected_start = None
+        if args.check:
+            config["dry_run"] = True
+        dry_run = bool(config.get("dry_run", False))
         if args.scheduled:
             if args.room is not None:
                 raise ScheduleError("自動実行では教室番号を直接指定できません。")
             schedule = load_schedule(base / "schedule.json")
-            course = due_course(schedule, datetime.now().astimezone())
-            if course is None:
-                result = "予定時間外（出席操作なし）"
-                logger.info("結果=%s", result)
-                print(f"結果: {result}")
-                return 0
-            room, route = course["room"], course["route"]
-            expected_course = course["course_name"]
-            expected_start = course["start_time"]
-            logger.info("自動実行対象 開始=%s 教室=%s", expected_start, room)
+            now = datetime.now().astimezone()
+            claim_ctx = (
+                nullcontext((due_scheduled_course(base, schedule, now, record=False), None))
+                if dry_run
+                else claim_scheduled_run(base, schedule, now)
+            )
+            with claim_ctx as (course, commit):
+                if course is None:
+                    result = "予定時間外（出席操作なし）"
+                    logger.info("結果=%s", result)
+                    print(f"結果: {result}")
+                    return 0
+                room, route = course["room"], course["route"]
+                expected_course = course["course_name"]
+                expected_start = course["start_time"]
+                logger.info("自動実行対象 開始=%s 教室=%s", expected_start, room)
+                result = _execute_attendance(config, base, args, room, route, logger, expected_course, expected_start)
+                if commit is not None and not dry_run and result in _CONSUMING_RESULTS:
+                    commit()
         else:
             room, route = parse_room(args.room) if args.room is not None else ask_room()
-        student_id, password = get_credentials(config, base / "config.json", interactive=not args.scheduled, username=args.user)
-        print(f"ユーザー: {config['_active_username']}（学生番号: {student_id}）")
-        if args.check:
-            config["dry_run"] = True
-        try:
-            from src.browser import open_page
-            from src.attendance import run_attendance
-            logger.info("段階=ブラウザ起動")
-            with open_page(config) as page:
-                result = run_attendance(page, config, student_id, password, room, route, logger, expected_course, expected_start)
-        finally:
-            del password
+            result = _execute_attendance(config, base, args, room, route, logger)
         logger.info("結果=%s 所要時間=%.1f秒", result, time.monotonic() - started)
         print(f"結果: {result}")
         return 0
