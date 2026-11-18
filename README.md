@@ -9,7 +9,7 @@ macOS で、本人が受講する授業の出席画面を確認し、出席登�
 - インターネット接続と対象大学の出席システムを利用できるアカウント
 - 初回セットアップ用のターミナル
 
-GUIはターミナル内で動作します。幅62文字・高さ24行以上が必要で、幅106文字以上では操作ガイドと今回の操作履歴も表示します。
+GUIはターミナル内で動作します。幅62文字・高さ24行以上が必要で、幅106文字以上では操作ガイドと今回の操作履歴も表示します。白背景のターミナルで見づらい場合や色を使わない場合は、`ATTENDANCE_UI_THEME=light` や `NO_COLOR=1` を指定して起動できます（詳しくは[コマンド・操作早見表](COMMANDS.md#attendance)を参照）。
 
 ## 使い方
 
@@ -100,7 +100,7 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 
 リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` と配布用の `src/dependency_lock.py` を再生成してください（[手順](COMMANDS.md#tests)）。ロック情報はPythonのデータファイルとしてZIPに同梱します。旧版の自動更新が未知の `.lock` ファイルを拒否するため、`requirements.lock` 自体はZIPに追加しません。ビルド時に両方の内容が一致するか検証します。v0.2.2以前から最初に移行するリリースでは `requirements.txt` を変更しないでください。v0.2.3への移行後は、依存変更も `att update` で取得・適用できます。
 
-ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.2.8` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
+ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.3.0` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
 
 <a id="configuration"></a>
 
