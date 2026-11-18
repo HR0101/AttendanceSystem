@@ -188,6 +188,39 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(AttendanceError):
             _require_known_page(page, CONFIG, "435")
 
+    def test_require_known_page_port_validation(self):
+        from src.attendance import _require_known_page
+        for valid_url in (
+            "https://attendance.example.test/attendance/login",
+            "https://attendance.example.test/attendance/top",
+            "https://attendance.example.test/attendance/class_room/435",
+            "https://attendance.example.test:443/attendance/login",
+            "https://attendance.example.test:443/attendance/top",
+            "https://attendance.example.test:443/attendance/class_room/435",
+        ):
+            with self.subTest(valid_url=valid_url):
+                _require_known_page(Mock(url=valid_url), CONFIG, "435")
+        for invalid_url in (
+            "https://attendance.example.test:8443/attendance/top",
+            "https://attendance.example.test:8080/attendance/login",
+            "https://attendance.example.test:80/attendance/class_room/435",
+            "https://attendance.example.test:0/attendance/top",
+            "https://attendance.example.test:99999/attendance/top",
+            "https://attendance.example.test:bad/attendance/top",
+            "http://attendance.example.test/attendance/top",
+            "http://attendance.example.test:443/attendance/top",
+        ):
+            with self.subTest(invalid_url=invalid_url), self.assertRaises(AttendanceError):
+                _require_known_page(Mock(url=invalid_url), CONFIG, "435")
+
+    def test_run_attendance_rejects_redirect_to_non_standard_port(self):
+        page = Mock(
+            goto=Mock(side_effect=lambda *args, **kwargs: setattr(page, "url", "https://attendance.example.test:8443/attendance/top")),
+            url="https://attendance.example.test/attendance/class_room/435",
+        )
+        with self.assertRaises(AttendanceError):
+            run_attendance(page, CONFIG, "TEST001", "dummy", "435", "435", Mock())
+
     def test_login_button_requires_keyup(self):
         page = self.page_for("""<input id="userid" name="username">
             <input id="password" name="password">

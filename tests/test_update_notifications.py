@@ -4,6 +4,8 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
+from pathlib import Path
+import stat
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -230,6 +232,86 @@ class UpdateNotificationTests(unittest.TestCase):
                 self.assertIn("att update --notes", shown)
                 self.assertIn("適用: att update", shown)
                 self.assertEqual(output.getvalue(), "")
+
+    def test_updater_log_rotates_at_limit_and_enforces_private_permissions(self):
+        log_path = self.base / ".updates/updater.log"
+        backup_path = self.base / ".updates/updater.log.1"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        oversized = b"old-entry\n" + b"a" * u.MAX_LOG_BYTES
+        log_path.write_bytes(oversized)
+        os.chmod(log_path, 0o644)
+
+        u.log_check_failure(self.base, URLError("offline"))
+
+        self.assertTrue(backup_path.is_file())
+        self.assertEqual(backup_path.read_bytes(), oversized)
+        self.assertEqual(stat.S_IMODE(backup_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.assertIn("接続できません", log_path.read_text(encoding="utf-8"))
+        self.assertLess(log_path.stat().st_size, u.MAX_LOG_BYTES)
+
+        bounded = self.base / ".updates/bounded.log"
+        with u.open_bounded_log(bounded, max_bytes=32) as stream:
+            stream.write("first-small\n")
+        self.assertFalse(bounded.with_name("bounded.log.1").exists())
+        with u.open_bounded_log(bounded, max_bytes=32) as stream:
+            stream.write("0123456789abcdef0123456789abcdef\n")
+        self.assertFalse(bounded.with_name("bounded.log.1").exists())
+        with u.open_bounded_log(bounded, max_bytes=32) as stream:
+            stream.write("second-generation-message-0123456789\n")
+        self.assertTrue(bounded.with_name("bounded.log.1").is_file())
+        self.assertIn("first-small", bounded.with_name("bounded.log.1").read_text(encoding="utf-8"))
+        self.assertEqual(bounded.read_text(encoding="utf-8"), "second-generation-message-0123456789\n")
+        with u.open_bounded_log(bounded, max_bytes=32) as stream:
+            stream.write("third\n")
+        self.assertIn("second-generation-message", bounded.with_name("bounded.log.1").read_text(encoding="utf-8"))
+        self.assertEqual(bounded.read_text(encoding="utf-8"), "third\n")
+        self.assertFalse(bounded.with_name("bounded.log.2").exists())
+        self.assertEqual(stat.S_IMODE(bounded.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(bounded.with_name("bounded.log.1").stat().st_mode), 0o600)
+
+    def test_bounded_log_refuses_symlinks_and_non_regular_files(self):
+        updates = self.base / ".updates"
+        updates.mkdir(parents=True, exist_ok=True)
+        outside = self.base / "outside.txt"
+        outside.write_text("untouched", encoding="utf-8")
+
+        log_path = updates / "updater.log"
+        log_path.symlink_to(outside)
+        with self.assertRaises(u.UpdateError):
+            u.open_bounded_log(log_path)
+        u.log_check_failure(self.base, URLError("offline"))
+        self.assertEqual(outside.read_text(encoding="utf-8"), "untouched")
+        log_path.unlink()
+
+        dangling = updates / "dangling.log"
+        dangling.symlink_to(self.base / "missing-target.txt")
+        with self.assertRaises(u.UpdateError):
+            u.open_bounded_log(dangling)
+        self.assertFalse((self.base / "missing-target.txt").exists())
+        dangling.unlink()
+
+        log_path.write_bytes(b"x" * 64)
+        backup = updates / "updater.log.1"
+        backup.symlink_to(outside)
+        with self.assertRaises(u.UpdateError):
+            u.open_bounded_log(log_path, max_bytes=32)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "untouched")
+        backup.unlink()
+        log_path.unlink()
+
+        log_path.mkdir()
+        with self.assertRaises(u.UpdateError):
+            u.open_bounded_log(log_path)
+        log_path.rmdir()
+
+        real_dir = self.base / "real_updates"
+        real_dir.mkdir()
+        updates.rmdir()
+        updates.symlink_to(real_dir, target_is_directory=True)
+        with self.assertRaises(u.UpdateError):
+            u.open_bounded_log(updates / "updater.log")
+        self.assertEqual(list(real_dir.iterdir()), [])
 
 
 if __name__ == "__main__":

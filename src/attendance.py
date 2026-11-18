@@ -6,9 +6,13 @@ from .verification import AttendanceError, enrollment_warning, is_attended, no_a
 
 
 def _require_known_page(page, config: dict, route: str) -> None:
-    current = urlparse(page.url)
+    try:
+        current = urlparse(page.url)
+        port = current.port
+    except ValueError as exc:
+        raise AttendanceError("想定外のサイトへ移動しました。手動認証が必要な場合は画面を確認してください。") from exc
     allowed = {urlparse(config[key]).hostname for key in ("login_url", "top_url")}
-    if current.scheme != "https" or current.hostname not in allowed:
+    if current.scheme != "https" or current.hostname not in allowed or port not in (None, 443):
         raise AttendanceError("想定外のサイトへ移動しました。手動認証が必要な場合は画面を確認してください。")
     if current.path not in ("/attendance/login", "/attendance/top", f"/attendance/class_room/{route}"):
         raise AttendanceError("想定外の画面です。画面の変更または追加認証を確認してください。")

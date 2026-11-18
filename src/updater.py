@@ -4,6 +4,7 @@ import argparse
 import contextlib
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -33,6 +34,7 @@ MANIFEST_NAME = "attendance-update.json"
 MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/{MANIFEST_NAME}"
 MAX_MANIFEST = 64 * 1024
 MAX_ARCHIVE = 8 * 1024 * 1024
+MAX_LOG_BYTES = 256 * 1024
 DOWNLOAD_HOSTS = frozenset({"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
                             "github-releases.githubusercontent.com"})
 ROOT_FILES = frozenset({
@@ -516,11 +518,67 @@ def check_update(base):
         return available_message(manifest)
 
 
+def _open_regular_log_fd(path):
+    """シンボリックリンクと非通常ファイルを拒否し、0o600 で追記オープンする。"""
+    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UpdateError("ログファイルがシンボリックリンクです。") from exc
+        if exc.errno == errno.EISDIR:
+            raise UpdateError("ログファイルが通常のファイルではありません。") from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise UpdateError("ログファイルが通常のファイルではありません。")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        return fd, info.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_bounded_log(path, *, max_bytes=MAX_LOG_BYTES, encoding="utf-8"):
+    """サイズ上限に達したログを .1 へ退避し、0o600 の通常ファイルを追記モードで開く。"""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes は正の整数にしてください。")
+    path = Path(path)
+    backup = path.with_name(f"{path.name}.1")
+    if path.parent.is_symlink() or path.is_symlink() or backup.is_symlink():
+        raise UpdateError("ログファイルまたは保存先がシンボリックリンクです。")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise UpdateError("ログファイルの保存先がシンボリックリンクです。")
+    fd, size = _open_regular_log_fd(path)
+    if size >= max_bytes:
+        os.close(fd)
+        try:
+            backup_info = os.lstat(backup)
+        except FileNotFoundError:
+            backup_info = None
+        if backup_info is not None:
+            if stat.S_ISLNK(backup_info.st_mode):
+                raise UpdateError("ログの退避先がシンボリックリンクです。")
+            if not stat.S_ISREG(backup_info.st_mode):
+                raise UpdateError("ログの退避先が通常のファイルではありません。")
+        os.replace(path, backup)
+        os.chmod(backup, 0o600)
+        fd, _ = _open_regular_log_fd(path)
+    try:
+        return os.fdopen(fd, "a", encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def log_check_failure(base, exc):
     try:
-        with os.fdopen(os.open(base / ".updates/updater.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600), "a") as log:
+        with open_bounded_log(base / ".updates/updater.log") as log:
             print(update_failure_message(exc), file=log)
-    except OSError:
+    except (OSError, UpdateError):
         pass
 
 
