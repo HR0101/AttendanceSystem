@@ -1564,7 +1564,7 @@ class AttendanceScreen:
                 guide += "  F2/Ctrl+T: " + ("隠す" if self.password_visible else "パスワード表示")
             canvas.put(top + height - 5, left + 3, guide, canvas.color(1), width - 6)
             footer_text = prefix_text("error", self.form_error) if self.form_error else ("デモの変更は保存されません。" if self.demo else "パスワードはKeychainに保存されます。")
-            footer_attr = canvas.color(3) if self.form_error else curses.A_DIM
+            footer_attr = (canvas.color(3) | curses.A_BOLD) if self.form_error else curses.A_DIM
             for offset, line in enumerate(wrap_text(footer_text, width - 6)[:2]):
                 canvas.put(top + height - 4 + offset, left + 3, line, footer_attr, width - 6)
         elif self.modal == "default":

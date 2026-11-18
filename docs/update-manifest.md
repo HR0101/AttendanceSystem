@@ -62,7 +62,7 @@ Issue #17 により、外部依存ライブラリを増やさず標準ライブ�
 
 ```sh
 # 署名付きビルド（--signing-key または環境変数 RELEASE_SIGNING_KEY_FILE）
-python3 scripts/build_release.py v0.2.8 --signing-key /path/to/release-private.pem
+python3 scripts/build_release.py v0.3.0 --signing-key /path/to/release-private.pem
 
 # 分離署名の手動検証（OpenSSL / LibreSSL 共通）
 openssl dgst -sha256 -verify release-public.pem -signature dist/attendance-update.zip.sig dist/attendance-update.zip

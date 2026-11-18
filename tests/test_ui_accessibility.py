@@ -247,8 +247,8 @@ class UIAccessibilityTests(unittest.TestCase):
                 ui.open_users()
                 ui.handle_modal("d")
                 _, calls, text = self.render(ui, width=width)
-                self.assertIn("[注意] Enter: 既定と出席対象を切替", text)
-                self.assertTrue(any(attr & curses.A_BOLD for _, _, line, attr in calls if "[注意] Enter: 既定と出席対象を切替" in line))
+                self.assertIn("[注意] 変更先:", text)
+                self.assertTrue(any(attr & curses.A_BOLD for _, _, line, attr in calls if "[注意] 変更先:" in line))
 
                 prompt = SavePrompt()
                 prompt.open("テスト編集", save=Mock(), discard=Mock())
@@ -298,7 +298,7 @@ class UIAccessibilityTests(unittest.TestCase):
 
                 panel.handle("d")
                 _, calls, text = self.render(ui, width=62)
-                self.assertIn("[注意] Enter: 削除する / Esc: 戻る", text)
+                self.assertIn("[注意] この授業の自動出席予定を削除します。", text)
 
                 panel.data = None
                 ui.busy = False

@@ -100,7 +100,7 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 
 リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` と配布用の `src/dependency_lock.py` を再生成してください（[手順](COMMANDS.md#tests)）。ロック情報はPythonのデータファイルとしてZIPに同梱します。旧版の自動更新が未知の `.lock` ファイルを拒否するため、`requirements.lock` 自体はZIPに追加しません。ビルド時に両方の内容が一致するか検証します。v0.2.2以前から最初に移行するリリースでは `requirements.txt` を変更しないでください。v0.2.3への移行後は、依存変更も `att update` で取得・適用できます。
 
-ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.2.8` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
+ローカルで配布内容だけ確認する場合は `python3 scripts/build_release.py v0.3.0` を実行します。生成先は `dist/attendance-update.zip` と `dist/attendance-update.json` です。GitHubへのpushやリリース公開はこのコマンドでは行いません。
 
 <a id="configuration"></a>
 

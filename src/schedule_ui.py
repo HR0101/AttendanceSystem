@@ -382,6 +382,7 @@ class SchedulePanel:
             preview = self._build_start_preview(candidate)
         except (ScheduleError, ConfigurationError, OSError) as exc:
             self.message = str(exc)
+            self.message_level = "error"
             return
         self.start_preview = preview
         self.confirm_selection = 0
@@ -590,6 +591,7 @@ class SchedulePanel:
         invalid = self.first_invalid_field()
         if invalid is not None:
             self.field_index, self.message = invalid
+            self.message_level = "error"
             return
         base_data = copy.deepcopy(self.data)
         candidate = copy.deepcopy(base_data)
@@ -677,6 +679,7 @@ class SchedulePanel:
                 leaving = self.field_index
                 self.field_index = (self.field_index + (-1 if key in (curses.KEY_UP, curses.KEY_BTAB) else 1)) % len(self.fields)
                 self.message = self.validate_field(leaving, allow_empty=True) or ""
+                self.message_level = "error" if self.message else "info"
             else:
                 if len(self.editors) != len(self.fields):
                     self.editors = [TextCursor(value) for value in self.fields]
