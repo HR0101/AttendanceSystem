@@ -209,6 +209,167 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(RoomError):
             parse_room("73a")
 
+    def run_login_with_mocked_page(self, failed_login_html, *, logger=None):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        login_form = """<!doctype html><html lang="ja"><body>
+            <p>学籍番号とパスワードを入力してください。</p>
+            <form method="post" action="/attendance/login">
+              <input id="userid" name="username">
+              <input id="password" name="password" type="password">
+              <button name="login" disabled>ログイン</button>
+            </form>
+            <script>
+              document.querySelector('#password').addEventListener('keyup',
+                () => document.querySelector('button[name=login]').disabled = false);
+            </script>
+        </body></html>"""
+
+        def serve(route):
+            url = route.request.url
+            if route.request.method == "POST" and url == CONFIG["login_url"]:
+                route.fulfill(status=200, body=failed_login_html, content_type="text/html; charset=utf-8")
+            elif url.endswith("/attendance/class_room/7301"):
+                route.fulfill(
+                    status=200,
+                    body=login_form + "<script>history.replaceState(null, '', '/attendance/login');</script>",
+                    content_type="text/html; charset=utf-8",
+                )
+            else:
+                route.abort()
+
+        page.route("**/*", serve)
+        return run_attendance(page, CONFIG, "TEST001", "secret-pw", "731", "7301", logger or Mock())
+
+    def test_error_modal_classification_and_pii_isolation(self):
+        cases = (
+            (
+                '<div id="errorModal"><div class="dialog_title">メンテナンス</div>'
+                '<div class="dialog_body">SECRET_ID_001 現在システムメンテナンス中です。</div></div>',
+                "メンテナンス",
+            ),
+            (
+                '<div id="errorModal"><h4>利用制限</h4>'
+                '<p>ログイン試行回数の上限に達したためアカウントがロックされています。</p></div>',
+                "ロック",
+            ),
+            (
+                '<div id="errorModal"><div class="modal-title">セッション切れ</div>'
+                '<div class="modal-body">セッションがタイムアウトしました。</div></div>',
+                "セッション",
+            ),
+            (
+                '<div id="errorModal"><div class="dialog_body">出席受付時間外のため登録できません。</div></div>',
+                "受付時間外",
+            ),
+            (
+                '<div id="errorModal"><div class="dialog_body">アクセス権限がありません。</div></div>',
+                "アクセス権限",
+            ),
+        )
+        for modal_html, expected_word in cases:
+            with self.subTest(expected_word=expected_word):
+                logger = Mock()
+                page = self.browser.new_page()
+                self.addCleanup(page.close)
+                page.route(
+                    "**/*",
+                    lambda route, *, body=attendance_html() + modal_html: route.fulfill(
+                        status=200, body=body, content_type="text/html; charset=utf-8"
+                    ),
+                )
+                with self.assertRaises(AttendanceError) as ctx:
+                    run_attendance(page, CONFIG, "TEST001", "dummy", "731", "7301", logger)
+                self.assertIn(expected_word, str(ctx.exception))
+                self.assertNotIn("SECRET_ID_001", str(ctx.exception))
+                logged = repr(logger.mock_calls)
+                self.assertNotIn("SECRET_ID_001", logged)
+                self.assertNotIn("現在システムメンテナンス中", logged)
+
+    def test_error_modal_unknown_text_never_leaks_and_works_without_login_header(self):
+        logger = Mock()
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        sentinel = "LEAK_STUDENT_9999_SECRET_TOKEN"
+        html = f'<div id="errorModal"><div class="dialog_title">謎エラー</div><div class="dialog_body">{sentinel}</div></div>'
+        page.route(
+            "**/*",
+            lambda route: route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8"),
+        )
+        with self.assertRaises(AttendanceError) as ctx:
+            run_attendance(page, CONFIG, "TEST001", "dummy", "731", "7301", logger)
+        self.assertEqual(str(ctx.exception), "出席画面にエラーが表示されています。")
+        self.assertNotIn(sentinel, str(ctx.exception))
+        self.assertNotIn("謎エラー", str(ctx.exception))
+        self.assertNotIn(sentinel, repr(logger.mock_calls))
+
+    def test_post_registration_error_modal_is_classified_without_leaking(self):
+        html = attendance_html()
+        values = require_target(self.page_for(html))
+        html = html.replace('<button id="attend">', '<button type="button" id="attend" onclick="document.querySelector(\'#confirmModal\').hidden=false">')
+        html += '<div id="confirmModal" hidden><div class="dialog_body">テスト授業 2-3限 731講義室 10:00 12:00</div><form method="post"><button id="ok_confirmModal">登録</button></form></div>'
+
+        with self.assertRaisesRegex(AttendanceError, "受付時間外"):
+            self.run_with_mocked_page(
+                html,
+                expected_values=values,
+                posted_html='<div id="errorModal"><p>受付終了のため登録できません。</p></div>',
+            )
+
+        sentinel = "SENSITIVE_POST_ERROR_XYZ"
+        with self.assertRaises(AttendanceError) as ctx:
+            self.run_with_mocked_page(
+                html,
+                expected_values=values,
+                posted_html=f'<div id="errorModal"><p>{sentinel}</p></div>',
+            )
+        self.assertEqual(str(ctx.exception), "登録結果を確認できません。")
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+        with self.assertRaisesRegex(AttendanceError, "セッション"):
+            self.run_with_mocked_page(
+                html,
+                expected_values=values,
+                posted_html=(
+                    "<script>history.replaceState(null, '', '/attendance/login');</script>"
+                    '<div class="alert">セッションがタイムアウトしました。</div>'
+                ),
+            )
+
+    def test_login_failure_classification_and_safety(self):
+        with self.assertRaisesRegex(AttendanceError, "メンテナンス"):
+            self.run_login_with_mocked_page(
+                '<div id="errorModal"><div class="dialog_title">保守作業</div><div class="dialog_body">現在メンテナンス中です。</div></div>'
+            )
+
+        with self.assertRaisesRegex(AttendanceError, "ロック"):
+            self.run_login_with_mocked_page(
+                '<div class="error">パスワード連続失敗によりアカウントがロックされています。</div>'
+            )
+
+        with self.assertRaisesRegex(AttendanceError, "セッション"):
+            self.run_login_with_mocked_page(
+                '<div role="alert">セッションがタイムアウトしました。再度ログインしてください。</div>'
+            )
+
+        with self.assertRaisesRegex(AttendanceError, "メンテナンス"):
+            self.run_login_with_mocked_page(
+                '<p>学籍番号とパスワードを入力してください。</p><h2>メンテナンスのお知らせ</h2>'
+            )
+
+        sentinel = "RAW_LOGIN_SECRET_ID_777"
+        logger = Mock()
+        with self.assertRaises(AttendanceError) as ctx:
+            self.run_login_with_mocked_page(
+                f'<div id="errorModal" hidden><div class="dialog_body">メンテナンス中です</div></div>'
+                f'<p>学籍番号とパスワードを入力してください。</p>'
+                f'<div class="error">{sentinel}</div>',
+                logger=logger,
+            )
+        self.assertEqual(str(ctx.exception), "ログインを確認できません。IDまたはパスワードを確認してください。")
+        self.assertNotIn(sentinel, str(ctx.exception))
+        self.assertNotIn(sentinel, repr(logger.mock_calls))
+
 
 if __name__ == "__main__":
     unittest.main()

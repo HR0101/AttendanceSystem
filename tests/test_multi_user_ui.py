@@ -113,6 +113,37 @@ class MultiUserUITests(unittest.TestCase):
         self.assertEqual(ui.config["_active_username"], "user1")
         self.assertEqual(ui.config["default_user"], "user1")
 
+    def test_browser_pool_used_only_for_non_demo_multi_user_batch(self):
+        def run(*args, on_snapshot, **kwargs):
+            on_snapshot(VALUES, False, False)
+            return "未出席（確認のみ）"
+
+        multi_ui = self.screen(count=2, demo=False)
+        with patch("src.terminal_ui.get_credentials", side_effect=self.credentials), \
+                patch("src.browser.browser_pool") as pool, \
+                patch("src.browser.open_page", side_effect=lambda config: nullcontext(Mock())), \
+                patch("src.attendance.run_attendance", side_effect=run):
+            pool.return_value = nullcontext()
+            multi_ui.start()
+            self.wait_for_operation(multi_ui)
+        pool.assert_called_once_with()
+
+        single_ui = self.screen(count=1, demo=False)
+        with patch("src.browser.browser_pool") as pool, \
+                patch("src.browser.open_page", side_effect=lambda config: nullcontext(Mock())), \
+                patch("src.attendance.run_attendance", side_effect=run):
+            pool.return_value = nullcontext()
+            single_ui.start()
+            self.wait_for_operation(single_ui)
+        pool.assert_not_called()
+
+        demo_ui = self.screen(count=2, demo=True)
+        with patch("src.browser.browser_pool") as pool:
+            pool.return_value = nullcontext()
+            demo_ui.start()
+            self.wait_for_operation(demo_ui)
+        pool.assert_not_called()
+
     def test_only_eligible_users_are_registered_and_skipped_results_remain(self):
         ui = self.screen(count=5)
         registered = []
