@@ -1,15 +1,25 @@
 """画面で表示した授業の照合と登録可否を確認する。"""
 
-import json
-import tempfile
-import threading
-import unittest
 import curses
+import fcntl
+import io
+import json
+import os
+import pty
+import select
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import unittest
 from pathlib import Path
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
-from src.terminal_ui import AttendanceScreen, fit_text
+from src.terminal_ui import AttendanceScreen, _disable_xon_flow_control, fit_text
 from src.verification import AttendanceError
 from src.credentials import CredentialError
 from test_users import CONFIG
@@ -529,6 +539,377 @@ class TerminalUITests(unittest.TestCase):
         screen = Mock(getmaxyx=Mock(return_value=(10, 30)), get_wch=Mock(side_effect=next_key))
         with patch("src.terminal_ui.curses.has_colors", return_value=False):
             self.assertEqual(ui.run(screen), 0)
+
+
+class TerminalFlowControlTests(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    def _start_ixon_pty(self, script: str, workdir: Path):
+        master, slave = pty.openpty()
+        flags = termios.tcgetattr(slave)
+        flags[0] |= termios.IXON
+        flags[3] |= termios.ISIG
+        termios.tcsetattr(slave, termios.TCSANOW, flags)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(self.REPO_ROOT),
+            "HOME": str(workdir),
+            "TERM": "xterm-256color",
+            "ATTENDANCE_NO_UPDATE": "1",
+        }
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=workdir,
+            env=env,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+        )
+        os.close(slave)
+        return master, process
+
+    @staticmethod
+    def _drain_pty(master: int, seconds: float = 0.05) -> bytes:
+        chunks = []
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            ready, _, _ = select.select([master], [], [], 0.02)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _read_json(path: Path):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _wait_json(self, master: int, path: Path, predicate, *, timeout: float = 5.0, message: str = "state timeout"):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self._drain_pty(master, 0.05)
+            data = self._read_json(path)
+            if data is not None and predicate(data):
+                return data
+        self.fail(f"{message}; last={self._read_json(path)!r}")
+
+    def _wait_exit(self, master: int, process: subprocess.Popen, timeout: float = 5.0) -> int:
+        end = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < end:
+            self._drain_pty(master, 0.05)
+        self._drain_pty(master, 0.02)
+        rc = process.poll()
+        self.assertIsNotNone(rc, "PTY process did not exit in time")
+        return rc
+
+    @staticmethod
+    def _pty_script(setup_and_observe: str, *, catch_interrupt: bool = False) -> str:
+        run_block = (
+            "    try:\n"
+            "        rc = ui.run(screen)\n"
+            "        interrupted = False\n"
+            "    except KeyboardInterrupt:\n"
+            "        rc, interrupted = 0, True\n"
+            if catch_interrupt else
+            "    rc, interrupted = ui.run(screen), False\n"
+        )
+        return f"""
+import curses, fcntl, json, termios
+from pathlib import Path
+from unittest.mock import Mock
+from src.terminal_ui import AttendanceScreen
+
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+def write_json(name, data):
+    tmp = Path(f".{{name}}.tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(name)
+
+{setup_and_observe}
+
+def run_checked(screen):
+{run_block}    attrs = termios.tcgetattr(0)
+    write_json("after_run.json", {{
+        "rc": rc, "interrupted": interrupted,
+        "ixon": bool(attrs[0] & termios.IXON), "isig": bool(attrs[3] & termios.ISIG),
+    }})
+    return rc
+
+curses.wrapper(run_checked)
+attrs = termios.tcgetattr(0)
+write_json("after_wrapper.json", {{"ixon": bool(attrs[0] & termios.IXON), "isig": bool(attrs[3] & termios.ISIG)}})
+"""
+
+    @staticmethod
+    def _cleanup_pty(master: int, process: subprocess.Popen):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        os.close(master)
+
+    def test_disable_xon_flow_control_handles_non_tty_and_error_cases(self):
+        closed = io.StringIO()
+        closed.close()
+        for fake_stdin in (None, io.StringIO(), closed):
+            with self.subTest(stdin=type(fake_stdin).__name__), patch("src.terminal_ui.sys.stdin", fake_stdin):
+                with _disable_xon_flow_control():
+                    pass
+
+        bad_fileno = Mock(fileno=Mock(side_effect=OSError("bad fd")))
+        with patch("src.terminal_ui.sys.stdin", bad_fileno):
+            with _disable_xon_flow_control():
+                pass
+
+        tty_stdin = Mock(fileno=Mock(return_value=7))
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", side_effect=termios.error(25, "not a tty")):
+            with _disable_xon_flow_control():
+                pass
+
+        attrs = [termios.IXON | termios.ICRNL, 0, 0, termios.ISIG, 9600, 9600, [b"\x03"]]
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", return_value=attrs), \
+                patch("src.terminal_ui.termios.tcsetattr", side_effect=termios.error(5, "i/o error")):
+            with _disable_xon_flow_control():
+                pass
+
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", return_value=list(attrs)), \
+                patch("src.terminal_ui.termios.tcsetattr", side_effect=[None, termios.error(5, "vanished")]):
+            with _disable_xon_flow_control():
+                pass
+
+    def test_disable_xon_flow_control_clears_only_ixon_and_restores_exact_attrs(self):
+        tty_stdin = Mock(fileno=Mock(return_value=9))
+        old_attrs = [termios.IXON | termios.ICRNL, 1, 2, termios.ISIG | termios.ECHO, 9600, 9600, [b"\x03"]]
+        snapshot = list(old_attrs)
+
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", return_value=old_attrs), \
+                patch("src.terminal_ui.termios.tcsetattr") as tcsetattr:
+            with _disable_xon_flow_control():
+                self.assertEqual(tcsetattr.call_count, 1)
+                fd, when, applied = tcsetattr.call_args.args
+                self.assertEqual((fd, when), (9, termios.TCSANOW))
+                self.assertFalse(applied[0] & termios.IXON)
+                self.assertTrue(applied[0] & termios.ICRNL)
+                self.assertEqual(applied[1:], snapshot[1:])
+                self.assertTrue(applied[3] & termios.ISIG)
+            self.assertEqual(tcsetattr.call_count, 2)
+            self.assertEqual(tcsetattr.call_args.args, (9, termios.TCSANOW, snapshot))
+
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", return_value=list(snapshot)), \
+                patch("src.terminal_ui.termios.tcsetattr") as tcsetattr:
+            with self.assertRaises(KeyboardInterrupt):
+                with _disable_xon_flow_control():
+                    raise KeyboardInterrupt()
+            self.assertEqual(tcsetattr.call_count, 2)
+            self.assertEqual(tcsetattr.call_args.args, (9, termios.TCSANOW, snapshot))
+
+        no_ixon_attrs = [termios.ICRNL, 1, 2, termios.ISIG, 9600, 9600, [b"\x03"]]
+        with patch("src.terminal_ui.sys.stdin", tty_stdin), \
+                patch("src.terminal_ui.termios.tcgetattr", return_value=no_ixon_attrs), \
+                patch("src.terminal_ui.termios.tcsetattr") as tcsetattr:
+            with _disable_xon_flow_control():
+                pass
+            tcsetattr.assert_not_called()
+
+    def test_pty_ctrl_s_saves_account_form_immediately_and_restores_ixon(self):
+        script = self._pty_script("""
+ui = AttendanceScreen({"users": [{"username": "A", "student_id": "A1"}], "default_user": "A"}, "A1", "", Mock(), demo=True)
+ui.open_users()
+ui.open_form("add")
+ui.form_values = ["ptyuser", "PTY001", "secret"]
+ui.form_index = 0
+orig_poll = ui.poll
+last = None
+def observe_poll():
+    global last
+    orig_poll()
+    attrs = termios.tcgetattr(0)
+    state = (ui.modal, ui.busy, ui.form_index, bool(attrs[0] & termios.IXON), bool(attrs[3] & termios.ISIG),
+             tuple(u["username"] for u in ui.config["users"]))
+    if state != last:
+        last = state
+        write_json("state.json", {
+            "modal": state[0], "busy": state[1], "form_index": state[2],
+            "ixon_now": state[3], "isig_now": state[4], "users": list(state[5]),
+        })
+ui.poll = observe_poll
+""")
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            master, process = self._start_ixon_pty(script, workdir)
+            try:
+                ready = self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["modal"] == "add" and not s["ixon_now"],
+                    message="account form did not initialize with IXON disabled",
+                )
+                self.assertTrue(ready["isig_now"])
+                self.assertEqual(ready["form_index"], 0)
+                os.write(master, b"\x13")
+                saved = self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: not s["busy"] and s["modal"] is None and "ptyuser" in s["users"],
+                    message="Ctrl+S did not save account form immediately without Ctrl+Q or Enter",
+                )
+                self.assertIn("ptyuser", saved["users"])
+                os.write(master, b"q")
+                self.assertEqual(self._wait_exit(master, process), 0)
+                after_run = self._read_json(workdir / "after_run.json")
+                after_wrapper = self._read_json(workdir / "after_wrapper.json")
+                self.assertEqual(after_run, {"rc": 0, "interrupted": False, "ixon": True, "isig": True})
+                self.assertEqual(after_wrapper, {"ixon": True, "isig": True})
+            finally:
+                self._cleanup_pty(master, process)
+
+    def test_pty_ctrl_s_saves_schedule_panel_forms_and_restores_ixon(self):
+        script = self._pty_script("""
+ui = AttendanceScreen({"users": [{"username": "test", "student_id": "TEST001"}], "default_user": "test"}, "TEST001", "", Mock(), base=Path("."))
+orig_poll = ui.poll
+last = None
+def observe_poll():
+    global last
+    orig_poll()
+    attrs = termios.tcgetattr(0)
+    panel = ui.schedule_panel
+    state = (
+        ui.modal,
+        ui.busy,
+        panel.mode if ui.modal == "schedule" else None,
+        panel.data is not None if ui.modal == "schedule" else False,
+        len(panel.data["courses"]) if ui.modal == "schedule" and panel.data else 0,
+        bool(attrs[0] & termios.IXON),
+        bool(attrs[3] & termios.ISIG),
+    )
+    if state != last:
+        last = state
+        write_json("state.json", {
+            "modal": state[0], "busy": state[1], "schedule_mode": state[2], "has_data": state[3],
+            "courses": state[4], "ixon_now": state[5], "isig_now": state[6],
+        })
+ui.poll = observe_poll
+""")
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            master, process = self._start_ixon_pty(script, workdir)
+            try:
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["modal"] is None and not s["ixon_now"] and s["isig_now"],
+                    message="main screen did not start with IXON disabled",
+                )
+                os.write(master, b"s")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["modal"] == "schedule" and s["schedule_mode"] == "list" and s["has_data"] and not s["busy"],
+                    message="schedule panel did not open",
+                )
+
+                os.write(master, b"a")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "add",
+                    message="schedule add form did not open",
+                )
+                os.write(master, b"PTYCourse\t\t10:00\t731\x13")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "list" and not s["busy"] and s["courses"] == 1,
+                    message="Ctrl+S did not save schedule add form",
+                )
+                schedule = self._read_json(workdir / "schedule.json")
+                self.assertEqual(schedule["courses"][0]["course_name"], "PTYCourse")
+                self.assertEqual(schedule["courses"][0]["start_time"], "10:00")
+                self.assertEqual(schedule["courses"][0]["room"], "731")
+
+                os.write(master, b"e")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "edit",
+                    message="schedule edit form did not open",
+                )
+                os.write(master, b"2\x13")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "list" and not s["busy"],
+                    message="Ctrl+S did not save schedule edit form",
+                )
+                self.assertEqual(self._read_json(workdir / "schedule.json")["courses"][0]["course_name"], "PTYCourse2")
+
+                os.write(master, b"p")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "period",
+                    message="schedule period form did not open",
+                )
+                os.write(master, b"\t\x152099-12-31\x13")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["schedule_mode"] == "list" and not s["busy"],
+                    message="Ctrl+S did not save schedule period form",
+                )
+                self.assertEqual(self._read_json(workdir / "schedule.json")["active_until"], "2099-12-31")
+
+                os.write(master, b"q")
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: s["modal"] is None,
+                    message="schedule panel did not close",
+                )
+                os.write(master, b"q")
+                self.assertEqual(self._wait_exit(master, process), 0)
+                self.assertEqual(self._read_json(workdir / "after_run.json"), {"rc": 0, "interrupted": False, "ixon": True, "isig": True})
+                self.assertEqual(self._read_json(workdir / "after_wrapper.json"), {"ixon": True, "isig": True})
+            finally:
+                self._cleanup_pty(master, process)
+
+    def test_pty_ctrl_c_still_interrupts_and_restores_ixon(self):
+        script = self._pty_script("""
+ui = AttendanceScreen({"users": [{"username": "A", "student_id": "A1"}], "default_user": "A"}, "A1", "", Mock(), demo=True)
+orig_poll = ui.poll
+wrote = False
+def observe_poll():
+    global wrote
+    orig_poll()
+    if not wrote:
+        wrote = True
+        attrs = termios.tcgetattr(0)
+        write_json("state.json", {"ixon_now": bool(attrs[0] & termios.IXON), "isig_now": bool(attrs[3] & termios.ISIG)})
+ui.poll = observe_poll
+""", catch_interrupt=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            master, process = self._start_ixon_pty(script, workdir)
+            try:
+                self._wait_json(
+                    master, workdir / "state.json",
+                    lambda s: not s["ixon_now"] and s["isig_now"],
+                    message="UI did not enter loop with IXON off and ISIG on",
+                )
+                os.write(master, b"\x03")
+                self.assertEqual(self._wait_exit(master, process), 0)
+                self.assertEqual(self._read_json(workdir / "after_run.json"), {"rc": 0, "interrupted": True, "ixon": True, "isig": True})
+                self.assertEqual(self._read_json(workdir / "after_wrapper.json"), {"ixon": True, "isig": True})
+            finally:
+                self._cleanup_pty(master, process)
 
 
 if __name__ == "__main__":

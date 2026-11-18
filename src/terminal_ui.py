@@ -1,10 +1,13 @@
 """標準ライブラリだけで動く出席確認画面。"""
 
+import contextlib
 import curses
 import inspect
+import io
 import os
 import queue
 import sys
+import termios
 import threading
 import time
 from collections import deque
@@ -23,6 +26,34 @@ from .text_input import TextCursor
 from .unsaved_changes import SavePrompt
 from .schedule_ui import SchedulePanel
 from .updater import available_message, cached_manifest
+
+
+@contextlib.contextmanager
+def _disable_xon_flow_control():
+    """端末のソフトウェアフロー制御 (IXON) を一時解除し、Ctrl+S を画面へ渡す。"""
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+    except (AttributeError, io.UnsupportedOperation, ValueError, OSError, termios.error):
+        yield
+        return
+    if not (old_attrs[0] & termios.IXON):
+        yield
+        return
+    new_attrs = list(old_attrs)
+    new_attrs[0] &= ~termios.IXON
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+    except (OSError, termios.error):
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+        except (OSError, termios.error):
+            pass
 
 
 class AttendanceScreen:
@@ -929,6 +960,10 @@ class AttendanceScreen:
                 curses.init_pair(number, foreground, background)
         screen.keypad(True)
         screen.timeout(100)
+        with _disable_xon_flow_control():
+            return self._run_loop(screen)
+
+    def _run_loop(self, screen):
         if self.room:
             self.start()
         while True:
