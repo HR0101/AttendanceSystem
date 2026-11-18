@@ -17,7 +17,10 @@ from src.credentials import CredentialError, get_credentials
 from src.logging_utils import setup_logging
 from src.verification import AttendanceError
 from src.room import RoomError, ask_room, parse_room
-from src.scheduler import ScheduleError, agent_installed, due_course, install_agent, load_schedule, remove_agent
+from src.scheduler import (
+    ScheduleError, agent_installed, due_course, format_schedule_diagnostics,
+    install_agent, load_schedule, remove_agent, schedule_diagnostics,
+)
 from src.users import select_user
 from src.version import VERSION
 
@@ -31,11 +34,23 @@ def schedule_command(argv: list[str]) -> int:
         if args.action == "remove":
             print("自動実行を解除しました。" if remove_agent(base) else "自動実行は登録されていません。")
             return 0
-        schedule = load_schedule(base / "schedule.json")
         if args.action == "status":
-            state = "有効" if agent_installed(base) else "未登録"
-            print(f"自動実行: {state}、予定: {len(schedule['courses'])} 件、期間: {schedule['active_from']}～{schedule['active_until']}")
+            try:
+                schedule = load_schedule(base / "schedule.json")
+                schedule_error = None
+            except ScheduleError as exc:
+                schedule = None
+                schedule_error = str(exc)
+            diagnostics = schedule_diagnostics(
+                base,
+                schedule,
+                installed=agent_installed(base),
+                schedule_error=schedule_error,
+            )
+            for line in format_schedule_diagnostics(diagnostics):
+                print(line)
             return 0
+        schedule = load_schedule(base / "schedule.json")
         config = load_config(base / "config.json")
         if not config["browser"]["headless"]:
             raise ScheduleError("自動実行には browser.headless を true にしてください。")

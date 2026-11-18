@@ -29,6 +29,22 @@ def keychain_backend():
     return backend
 
 
+def has_stored_password(student_id: str) -> bool:
+    """Keychain に指定した学生番号のパスワードがあるか確認する。値は返さない。"""
+    if not student_id:
+        return False
+    backend = keychain_backend()
+    try:
+        password = backend.get_password(SERVICE, student_id)
+    except CredentialError:
+        raise
+    except Exception as exc:
+        raise CredentialError("Keychain の操作に失敗しました。") from exc
+    present = bool(password)
+    del password
+    return present
+
+
 def get_credentials(config: dict, path: Path, interactive: bool = True, username: str | None = None) -> tuple[str, str]:
     from .users import get_users, select_user, valid_username
     backend = keychain_backend()
