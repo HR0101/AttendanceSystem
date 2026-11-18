@@ -204,7 +204,7 @@ python3 scripts/check_update_notes.py
 
 ### 依存ライブラリのロックファイル
 
-`install.sh` とCIは、`requirements.lock` に記録した版とSHA-256ハッシュに一致するパッケージだけを導入します（`pip install --require-hashes`）。`requirements.txt` を変更したときや依存ライブラリを更新するときは、[uv](https://docs.astral.sh/uv/) で次を実行して再生成し、両方をコミットしてください。
+`install.sh` とCIは、`requirements.lock` に記録した版とSHA-256ハッシュに一致する wheel パッケージだけを導入します（`pip install --no-input --require-hashes --only-binary=:all:`）。更新用ZIP展開環境など `requirements.lock` がないフォルダで `install.sh` を実行した場合は、同梱の `src/dependency_lock.py` を `requirements.txt` のSHA-256と突き合わせて検証したうえで `requirements.lock` を復元し、有効なロック情報がない場合はエラーで停止します。`requirements.txt` を変更したときや依存ライブラリを更新するときは、[uv](https://docs.astral.sh/uv/) で次を実行して再生成し、両方をコミットしてください。
 
 ```sh
 uv pip compile requirements.txt --universal --generate-hashes --python-version 3.10 --exclude-newer "14 days" --no-header -o requirements.lock
@@ -213,8 +213,9 @@ python3 scripts/generate_dependency_lock.py
 
 `--universal` はmacOSとCI（Linux）、Python 3.10以降の差をまとめて記録します。`--exclude-newer "14 days"` は、公開から14日未満の版を避けます（公開直後に乗っ取られた版の混入対策）。再生成したら、追加・変更されたパッケージ名が正規のものかを確認してください。
 
-既知の脆弱性は、CIで `pip-audit` が確認します。手元で確認する場合は次を実行します。
+既知の脆弱性は、CIで `requirements-audit.lock` からハッシュ検証・wheel 限定で導入した `pip-audit` が確認します。手元で確認する場合や `requirements-audit.lock` を再生成する場合は次を実行します。
 
 ```sh
 uvx pip-audit@2.10.1 -r requirements.lock --require-hashes --disable-pip
+printf 'pip-audit==2.10.1\n' | uv pip compile - --universal --generate-hashes --python-version 3.11 --exclude-newer "14 days" --no-header -o requirements-audit.lock
 ```
