@@ -178,6 +178,18 @@ def change_student_id(base, name, student_id):
                                 {student_id: password, user["student_id"]: None})
 
 
+def _confirm_user_removal(user, users, default):
+    """削除対象と影響を表示し、明示的な yes 応答時のみ True を返す。"""
+    print(f"ユーザー「{user['username']}」（学生番号: {user['student_id']}）を削除します。")
+    print("このアプリの登録とKeychainの保存パスワードを削除します（大学側のアカウントは削除しません）。")
+    if len(users) == 1:
+        print("最後のユーザーです。削除後は att user add で再登録できます。")
+    elif user == default:
+        next_default = next(entry["username"] for entry in users if entry["student_id"] != user["student_id"])
+        print(f"既定ユーザーのため、削除後は「{next_default}」が既定ユーザーになります。")
+    return input("削除しますか？ [y/N]: ").strip().lower() in ("y", "yes")
+
+
 def user_command(base, argv):
     parser = argparse.ArgumentParser(prog="att user", description="利用者を管理します。")
     commands = parser.add_subparsers(dest="action", required=True)
@@ -192,6 +204,12 @@ def user_command(base, argv):
     rename.add_argument("new_name")
     password_command = commands.add_parser("password", help="Keychainに保存したパスワードを更新")
     password_command.add_argument("username", nargs="?", help="省略時は既定ユーザー")
+    student_id_command = commands.add_parser("student-id", help="学籍番号を変更（保存パスワードを引き継ぐ）")
+    student_id_command.add_argument("username", help="対象のユーザーネーム")
+    student_id_command.add_argument("new_student_id", help="新しい学籍番号（半角英数字）")
+    remove = commands.add_parser("remove", help="登録ユーザーと保存パスワードを削除")
+    remove.add_argument("username", help="削除するユーザーネーム")
+    remove.add_argument("-y", "--yes", action="store_true", help="確認プロンプトなしで削除")
     args = parser.parse_args(argv)
     try:
         path = base / "config.json"
@@ -243,9 +261,29 @@ def user_command(base, argv):
         elif args.action == "use":
             use_user(base, args.username)
             message = f"既定ユーザーを「{args.username}」に変更しました。"
-        else:
+        elif args.action == "rename":
             rename_user(base, args.username, args.new_name)
             message = f"ユーザーネームを「{args.new_name}」に変更しました。"
+        elif args.action == "student-id":
+            user = select_user(config, args.username)
+            change_student_id(base, user["username"], args.new_student_id)
+            if user["student_id"] == args.new_student_id:
+                message = f"ユーザー「{user['username']}」の学籍番号はすでに {args.new_student_id} です。"
+            else:
+                message = f"ユーザー「{user['username']}」の学籍番号を {user['student_id']} から {args.new_student_id} に変更しました。起動中の別画面には再起動後に反映されます。"
+        elif args.action == "remove":
+            user = select_user(config, args.username)
+            if not args.yes and not _confirm_user_removal(user, users, default):
+                print("ユーザーの削除を取り消しました。")
+                return 1
+            updated = remove_user(base, user["username"])
+            remaining = get_users(updated)
+            if not remaining:
+                message = f"ユーザー「{user['username']}」（学生番号: {user['student_id']}）を削除しました。登録ユーザーはなくなりました。再度利用する場合は att user add で登録してください。"
+            elif user == default:
+                message = f"ユーザー「{user['username']}」（学生番号: {user['student_id']}）を削除しました。既定ユーザーを「{updated['default_user']}」に切り替えました。"
+            else:
+                message = f"ユーザー「{user['username']}」（学生番号: {user['student_id']}）を削除しました。"
         print(message)
         return 0
     except (EOFError, KeyboardInterrupt):

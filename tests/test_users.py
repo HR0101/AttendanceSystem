@@ -5,7 +5,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -164,6 +164,220 @@ class UserTests(unittest.TestCase):
                 self.assertEqual(user_command(self.base, ["password"]), 1)
             self.assertNotIn("private-password", output.getvalue())
             self.assertEqual(self.path.read_bytes(), before)
+
+    def _memory_backend(self, initial):
+        values = dict(initial)
+
+        def get_password(service, account):
+            self.assertEqual(service, SERVICE)
+            return values.get(account)
+
+        def set_password(service, account, password):
+            self.assertEqual(service, SERVICE)
+            values[account] = password
+
+        def delete_password(service, account):
+            self.assertEqual(service, SERVICE)
+            del values[account]
+
+        backend = Mock()
+        backend.get_password.side_effect = get_password
+        backend.set_password.side_effect = set_password
+        backend.delete_password.side_effect = delete_password
+        return backend, values
+
+    def _write_two_users(self, **extra):
+        config = dict(
+            CONFIG,
+            users=[
+                {"username": "太郎", "student_id": "OLD001"},
+                {"username": "花子", "student_id": "NEW002"},
+            ],
+            default_user="太郎",
+            **extra,
+        )
+        self.path.write_text(json.dumps(config))
+        return config
+
+    def _run_user_cli(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = user_command(self.base, list(args))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_remove_with_confirmation_updates_default_and_deletes_keychain(self):
+        self._write_two_users(ui_selected_users=["OLD001", "NEW002"])
+        backend, values = self._memory_backend({"OLD001": "old-secret-pw", "NEW002": "new-secret-pw"})
+        for answer in ("y", "YES"):
+            with self.subTest(answer=answer):
+                self._write_two_users(ui_selected_users=["OLD001", "NEW002"])
+                values.clear()
+                values.update({"OLD001": "old-secret-pw", "NEW002": "new-secret-pw"})
+                with patch("src.user_commands.keychain_backend", return_value=backend), \
+                        patch("builtins.input", return_value=answer) as prompt:
+                    code, out, err = self._run_user_cli("remove", "太郎")
+                self.assertEqual(code, 0)
+                prompt.assert_called_once()
+                self.assertIn("太郎", out)
+                self.assertIn("OLD001", out)
+                self.assertIn("花子", out)
+                self.assertNotIn("old-secret-pw", out + err)
+                self.assertNotIn("new-secret-pw", out + err)
+                stored = load_config(self.path)
+                self.assertEqual(get_users(stored), [{"username": "花子", "student_id": "NEW002"}])
+                self.assertEqual(stored["default_user"], "花子")
+                self.assertEqual(stored["ui_selected_users"], ["NEW002"])
+                self.assertNotIn("student_id", stored)
+                self.assertNotIn("old-secret-pw", self.path.read_text())
+                self.assertEqual(values, {"NEW002": "new-secret-pw"})
+
+    def test_remove_last_user_and_non_default_user_messages(self):
+        self._write_two_users()
+        backend, values = self._memory_backend({"OLD001": "old-secret-pw", "NEW002": "new-secret-pw"})
+        with patch("src.user_commands.keychain_backend", return_value=backend), \
+                patch("builtins.input") as prompt:
+            code, out, err = self._run_user_cli("remove", "花子", "--yes")
+        self.assertEqual(code, 0)
+        prompt.assert_not_called()
+        self.assertIn("花子", out)
+        self.assertNotIn("既定ユーザーを", out)
+        self.assertNotIn("new-secret-pw", out + err)
+        self.assertEqual(load_config(self.path)["default_user"], "太郎")
+        self.assertEqual(values, {"OLD001": "old-secret-pw"})
+
+        with patch("src.user_commands.keychain_backend", return_value=backend), \
+                patch("builtins.input") as prompt:
+            code, out, err = self._run_user_cli("remove", "太郎", "-y")
+        self.assertEqual(code, 0)
+        prompt.assert_not_called()
+        self.assertIn("登録ユーザーはなくなりました", out)
+        self.assertNotIn("old-secret-pw", out + err)
+        stored = load_config(self.path)
+        self.assertEqual(get_users(stored), [])
+        self.assertEqual(stored["default_user"], "")
+        self.assertEqual(values, {})
+
+    def test_remove_declined_or_aborted_does_not_touch_config_or_keychain(self):
+        self._write_two_users()
+        before = self.path.read_bytes()
+        for response in ("n", "", "no", "maybe", EOFError(), KeyboardInterrupt()):
+            with self.subTest(response=repr(response)), \
+                    patch("src.user_commands.keychain_backend") as backend, \
+                    patch("builtins.input", side_effect=[response]):
+                code, out, err = self._run_user_cli("remove", "太郎")
+            self.assertEqual(code, 1)
+            backend.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(err, "")
+            self.assertTrue(out.strip())
+
+    def test_remove_unknown_user_rejects_before_prompting(self):
+        self._write_two_users()
+        before = self.path.read_bytes()
+        for name in ("未登録", ""):
+            with self.subTest(name=name), \
+                    patch("src.user_commands.keychain_backend") as backend, \
+                    patch("builtins.input") as prompt:
+                code, out, _ = self._run_user_cli("remove", name)
+            self.assertEqual(code, 1)
+            prompt.assert_not_called()
+            backend.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertIn("未登録", out)
+
+    def test_student_id_migrates_keychain_and_preserves_other_users(self):
+        self._write_two_users(ui_selected_users=["OLD001", "NEW002"])
+        backend, values = self._memory_backend({"OLD001": "old-secret-pw", "NEW002": "new-secret-pw"})
+        with patch("src.user_commands.keychain_backend", return_value=backend):
+            code, out, err = self._run_user_cli("student-id", "太郎", "FIXED003")
+        self.assertEqual(code, 0)
+        self.assertIn("太郎", out)
+        self.assertIn("OLD001", out)
+        self.assertIn("FIXED003", out)
+        self.assertNotIn("old-secret-pw", out + err)
+        self.assertNotIn("new-secret-pw", out + err)
+        self.assertEqual(values, {"FIXED003": "old-secret-pw", "NEW002": "new-secret-pw"})
+        stored = load_config(self.path)
+        self.assertEqual(get_users(stored), [
+            {"username": "太郎", "student_id": "FIXED003"},
+            {"username": "花子", "student_id": "NEW002"},
+        ])
+        self.assertEqual(stored["default_user"], "太郎")
+        self.assertEqual(stored["ui_selected_users"], ["FIXED003", "NEW002"])
+        self.assertNotIn("student_id", stored)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("old-secret-pw", self.path.read_text())
+
+    def test_student_id_same_id_is_noop(self):
+        self._write_two_users()
+        before = self.path.read_bytes()
+        with patch("src.user_commands.keychain_backend") as backend:
+            code, out, err = self._run_user_cli("student-id", "太郎", "OLD001")
+        self.assertEqual(code, 0)
+        backend.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIn("OLD001", out)
+        self.assertEqual(err, "")
+
+    def test_student_id_rejects_invalid_duplicate_unknown_and_orphan_keychain(self):
+        self._write_two_users()
+        before = self.path.read_bytes()
+        for invalid in ("", "Ａ１２", "A B", "../path", "NEW002"):
+            with self.subTest(invalid=invalid), patch("src.user_commands.keychain_backend") as backend:
+                code, out, _ = self._run_user_cli("student-id", "太郎", invalid)
+            self.assertEqual(code, 1)
+            backend.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertTrue(out.strip())
+
+        for unknown in ("未登録", ""):
+            with self.subTest(unknown=unknown), patch("src.user_commands.keychain_backend") as backend:
+                code, out, _ = self._run_user_cli("student-id", unknown, "FIXED003")
+            self.assertEqual(code, 1)
+            backend.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertIn("未登録", out)
+
+        backend, values = self._memory_backend({
+            "OLD001": "old-secret-pw",
+            "NEW002": "new-secret-pw",
+            "ORPHAN01": "orphan-secret-pw",
+        })
+        with patch("src.user_commands.keychain_backend", return_value=backend):
+            code, out, err = self._run_user_cli("student-id", "太郎", "ORPHAN01")
+        self.assertEqual(code, 1)
+        self.assertIn("上書きせず", out)
+        self.assertNotIn("old-secret-pw", out + err)
+        self.assertNotIn("orphan-secret-pw", out + err)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(values["ORPHAN01"], "orphan-secret-pw")
+        self.assertEqual(values["OLD001"], "old-secret-pw")
+
+    def test_remove_and_student_id_keychain_error_never_leaks_secret(self):
+        self._write_two_users()
+        before = self.path.read_bytes()
+        backend = Mock()
+        backend.get_password.side_effect = RuntimeError("super-secret-password")
+        for args in (["remove", "太郎", "--yes"], ["student-id", "太郎", "FIXED003"]):
+            with self.subTest(args=args), patch("src.user_commands.keychain_backend", return_value=backend):
+                code, out, err = self._run_user_cli(*args)
+            self.assertEqual(code, 1)
+            self.assertNotIn("super-secret-password", out + err)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_user_help_lists_all_subcommands(self):
+        for argv, expected in (
+            (["--help"], ("list", "add", "use", "rename", "password", "student-id", "remove")),
+            (["remove", "--help"], ("--yes", "-y")),
+            (["student-id", "--help"], ("username", "new_student_id")),
+        ):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with redirect_stdout(out), self.assertRaises(SystemExit) as exit_info:
+                    user_command(self.base, argv)
+                self.assertEqual(exit_info.exception.code, 0)
+                for token in expected:
+                    self.assertIn(token, out.getvalue())
 
 
 if __name__ == "__main__":
