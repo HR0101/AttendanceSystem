@@ -11,7 +11,7 @@ import sys
 import textwrap
 import uuid
 
-from .updater import UpdateError, atomic_write, file_lock, runtime_directory, write_json
+from .updater import UpdateError, atomic_write, file_lock, open_bounded_log, runtime_directory, write_json
 
 UNTRUSTED_PLAYWRIGHT_ENV_VARS = (
     "PLAYWRIGHT_DOWNLOAD_HOST",
@@ -134,7 +134,7 @@ def prepare_environment(base, spec):
         log_path = updates / "dependencies.log"
         stage = "仮想環境の作成"
         try:
-            with os.fdopen(os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600), "a") as log:
+            with open_bounded_log(log_path) as log:
                 def run(command, timeout=300):
                     log.write(f"\n段階={stage}\n")
                     log.flush()

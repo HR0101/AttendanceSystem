@@ -12,7 +12,18 @@ from src.config import ConfigurationError
 from src.room import RoomError
 from src.terminal_ui import AttendanceScreen, fit_text, launch_ui
 from src.verification import AttendanceError
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from src.config import load_config
 from src.credentials import CredentialError
+from src.terminal_ui import PASSWORD_TTL_SECONDS, AttendanceScreen, fit_text, launch_ui
+from src.verification import AttendanceError
+from test_users import CONFIG
 
 
 class TerminalUITests(unittest.TestCase):
@@ -290,6 +301,224 @@ class TerminalUITests(unittest.TestCase):
                     code = launch_ui(Path("/unused"))
                 self.assertEqual(code, expected_code)
                 self.assertIn("中断", stderr.getvalue())
+
+    def _base_with_users(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name)
+        config = dict(
+            CONFIG,
+            users=[{"username": "one", "student_id": "TEST001"}, {"username": "two", "student_id": "TEST002"}],
+            default_user="one",
+            ui_selected_users=["TEST001"],
+        )
+        (base / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return base, load_config(base / "config.json")
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_password_ttl_expiration_clears_memory_and_refetches_on_demand(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        base, config = self._base_with_users()
+        clock = [100.0]
+
+        def run_attendance_stub(page, cfg, student_id, password, room, route, logger, *args, on_snapshot, **kwargs):
+            on_snapshot({"授業名": "テスト授業", "開始時刻": "10:00"}, False, False)
+            return "未出席（確認のみ）" if cfg["dry_run"] else "出席登録成功"
+
+        with patch("src.terminal_ui.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("src.terminal_ui.get_credentials", return_value=("TEST001", "refetched-secret")) as credentials, \
+                patch("src.browser.open_page", side_effect=lambda cfg: nullcontext(Mock())), \
+                patch("src.attendance.run_attendance", side_effect=run_attendance_stub) as attendance:
+            ui = AttendanceScreen(config, "TEST001", "initial-secret", Mock(), "731", base=base)
+            self.assertEqual(ui.password_ttl, PASSWORD_TTL_SECONDS)
+            self.assertEqual(ui._password, "initial-secret")
+            clock[0] = 399.0
+            ui.poll()
+            self.assertEqual(ui._password, "initial-secret")
+            ui.start()
+            ui.poll()
+            credentials.assert_not_called()
+            self.assertEqual(attendance.call_args.args[3], "initial-secret")
+
+            clock[0] = 400.0
+            ui.poll()
+            self.assertEqual(ui._password, "")
+            self.assertIsNone(ui._password_deadline)
+            self.assertEqual(ui.password, "")
+
+            ui.start()
+            ui.poll()
+            credentials.assert_called_once()
+            self.assertFalse(credentials.call_args.kwargs["interactive"])
+            self.assertEqual(credentials.call_args.kwargs["username"], "one")
+            self.assertEqual(attendance.call_args.args[3], "refetched-secret")
+            self.assertEqual(ui._password, "")
+
+            ui.start(register=True)
+            ui.poll()
+            self.assertEqual(credentials.call_count, 2)
+            self.assertEqual(attendance.call_args.args[3], "refetched-secret")
+            self.assertEqual(ui._password, "")
+
+            ui.password = "temp-secret"
+            clock[0] = 700.0
+            ui.open_users()
+            self.assertEqual(ui._password, "")
+
+            ui.password = "temp-secret"
+            clock[0] = 1000.0
+            with patch.object(ui.schedule_panel, "work"):
+                ui.schedule_panel.open()
+            self.assertEqual(ui._password, "")
+
+            ui_no_base = AttendanceScreen({"dry_run": False}, "TEST001", "secret", Mock(), "731", password_ttl=10)
+            clock[0] = 1010.0
+            self.assertEqual(ui_no_base.password, "")
+            self.assertEqual(ui_no_base._password, "")
+            ui_no_base.start()
+            ui_no_base.poll()
+            self.assertTrue(ui_no_base.failed)
+            self.assertIn("設定ファイル", ui_no_base.message)
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_ttl_zero_and_other_user_edits_do_not_extend_active_password_ttl(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        base, config = self._base_with_users()
+        clock = [100.0]
+        with patch("src.terminal_ui.time.monotonic", side_effect=lambda: clock[0]):
+            immediate = AttendanceScreen(config, "TEST001", "secret", Mock(), password_ttl=0)
+            self.assertEqual(immediate._password, "")
+            self.assertEqual(immediate.password, "")
+
+            ui = AttendanceScreen(config, "TEST001", "active-secret", Mock(), base=base, password_ttl=300)
+            self.assertEqual(ui._password_deadline, 400.0)
+            clock[0] = 250.0
+            with patch("src.user_commands.rename_user", return_value=config), \
+                    patch("src.user_commands.change_password", return_value=config):
+                ui.account_action("rename", "two", new_name="two-renamed")
+                ui.poll()
+                self.assertEqual(ui._password_deadline, 400.0)
+                ui.account_action("password", "two", password="other-secret")
+                ui.poll()
+                self.assertEqual(ui._password_deadline, 400.0)
+            clock[0] = 400.0
+            self.assertEqual(ui.password, "")
+            self.assertEqual(ui._password, "")
+
+    def test_password_cleared_on_switch_away_close_and_launch_ui_exit(self):
+        base, config = self._base_with_users()
+        config["users"].append({"username": "three", "student_id": "TEST003"})
+        (base / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+        ui = AttendanceScreen(config, "TEST001", "active-secret", Mock(), base=base)
+        ui.clear_password()
+        self.assertEqual(ui._password, "")
+        self.assertIsNone(ui._password_deadline)
+
+        ui.password = "active-secret"
+        ui.open_users()
+        ui.pending_user_ids = {"TEST002", "TEST003"}
+        ui.apply_user_selection()
+        self.assertEqual(ui._password, "")
+
+        ui.password = "active-secret"
+        screen = Mock(getmaxyx=Mock(return_value=(24, 80)), get_wch=Mock(side_effect=["q"]))
+        with patch("src.terminal_ui.curses.has_colors", return_value=False):
+            self.assertEqual(ui.run(screen), 0)
+        self.assertEqual(ui._password, "")
+
+        launch_base, _ = self._base_with_users()
+        observed = {}
+
+        def fake_wrapper(method):
+            caller_locals = sys._getframe(1).f_locals
+            observed["password_in_launch_locals"] = "password" in caller_locals
+            instance = method.__self__
+            observed["during_ui"] = instance.password
+            observed["instance"] = instance
+            return 0
+
+        with patch("src.terminal_ui.sys.stdin.isatty", return_value=True), \
+                patch("src.terminal_ui.sys.stdout.isatty", return_value=True), \
+                patch("src.terminal_ui.setup_logging", return_value=Mock()), \
+                patch("src.terminal_ui.get_credentials", return_value=("TEST001", "launch-secret")), \
+                patch("src.terminal_ui.curses.wrapper", side_effect=fake_wrapper):
+            self.assertEqual(launch_ui(launch_base), 0)
+        self.assertFalse(observed["password_in_launch_locals"])
+        self.assertEqual(observed["during_ui"], "launch-secret")
+        self.assertEqual(observed["instance"]._password, "")
+
+    @patch("src.terminal_ui.threading.Thread")
+    def test_password_text_cursor_is_wiped_on_discard_and_submit(self, thread):
+        thread.side_effect = lambda **kwargs: Mock(start=kwargs["target"])
+        base, config = self._base_with_users()
+
+        ui = AttendanceScreen(config, "TEST001", "old-secret", Mock(), base=base)
+        ui.open_form("add")
+        ui.form_index = 2
+        for ch in "new-secret":
+            ui.handle_modal(ch)
+        add_editors = list(ui.form_editors)
+        self.assertEqual(add_editors[2].text, "new-secret")
+        self.assertGreater(add_editors[2].position, 0)
+        ui.handle_modal("\x1b")
+        ui.handle_modal(curses.KEY_UP)
+        ui.handle_modal("\n")
+        self.assertEqual(ui.form_values, [])
+        self.assertEqual(ui.form_editors, [])
+        for editor in add_editors:
+            self.assertEqual(editor.text, "")
+            self.assertEqual(editor.position, 0)
+
+        ui.open_users()
+        ui.open_form("password")
+        for idx, secret in enumerate(("typed-pw", "typed-pw")):
+            ui.form_index = idx
+            for ch in secret:
+                ui.handle_modal(ch)
+        pw_editors = list(ui.form_editors)
+        self.assertEqual([e.text for e in pw_editors], ["typed-pw", "typed-pw"])
+        ui.handle_modal("\x1b")
+        ui.handle_modal(curses.KEY_UP)
+        ui.handle_modal("\n")
+        for editor in pw_editors:
+            self.assertEqual(editor.text, "")
+            self.assertEqual(editor.position, 0)
+
+        ui.open_form("add")
+        for idx, value in enumerate(("newuser", "NEW999", "submit-secret")):
+            ui.form_index = idx
+            for ch in value:
+                ui.handle_modal(ch)
+        submit_add_editors = list(ui.form_editors)
+        with patch("src.user_commands.add_user", return_value=config):
+            ui.handle_modal("\n")
+            ui.poll()
+        self.assertIsNone(ui.submitted_form)
+        for editor in submit_add_editors:
+            self.assertEqual(editor.text, "")
+            self.assertEqual(editor.position, 0)
+
+        ui.open_users()
+        ui.open_form("password")
+        for idx, secret in enumerate(("updated-pw", "updated-pw")):
+            ui.form_index = idx
+            for ch in secret:
+                ui.handle_modal(ch)
+        submit_pw_editors = list(ui.form_editors)
+        with patch("src.user_commands.change_password", side_effect=[CredentialError("保存失敗"), config]):
+            ui.handle_modal("\n")
+            ui.poll()
+            self.assertEqual([e.text for e in submit_pw_editors], ["updated-pw", "updated-pw"])
+            ui.form_index = 1
+            ui.handle_modal("\n")
+            ui.poll()
+        self.assertIsNone(ui.submitted_form)
+        self.assertEqual(ui.form_values, [])
+        self.assertEqual(ui.form_editors, [])
+        for editor in submit_pw_editors:
+            self.assertEqual(editor.text, "")
+            self.assertEqual(editor.position, 0)
 
 
 if __name__ == "__main__":
