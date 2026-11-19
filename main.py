@@ -29,7 +29,16 @@ from src.scheduler import (
     due_course, format_schedule_diagnostics, schedule_diagnostics,
 )
 from src.users import select_user
+from src.updater import UpdateError, ensure_user_workspace, resolve_data_dir
 from src.version import VERSION
+
+
+def _resolve_base(*, initialize: bool = True) -> Path:
+    code_dir = Path(__file__).resolve().parent
+    data_dir = resolve_data_dir(code_dir)
+    if initialize and data_dir != code_dir:
+        ensure_user_workspace(data_dir, code_dir)
+    return data_dir
 
 
 def _handle_interrupt(exc: BaseException, logger=None, started: float | None = None) -> int:
@@ -52,7 +61,7 @@ def schedule_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="att schedule", description="自動出席の予定を管理します。")
     parser.add_argument("action", choices=("status", "install", "remove"))
     args = parser.parse_args(argv)
-    base = Path(__file__).resolve().parent
+    base = _resolve_base()
     try:
         if args.action == "remove":
             print("自動実行を解除しました。" if remove_agent(base) else "自動実行は登録されていません。")
@@ -84,7 +93,7 @@ def schedule_command(argv: list[str]) -> int:
         return 0
     except (EOFError, KeyboardInterrupt) as exc:
         return _handle_interrupt(exc)
-    except (ScheduleError, ConfigurationError) as exc:
+    except (ScheduleError, ConfigurationError, UpdateError, OSError) as exc:
         print(f"自動実行を設定できません: {exc}", file=sys.stderr)
         return 1
 
@@ -117,7 +126,11 @@ def main(argv: list[str] | None = None) -> int:
         return schedule_command(argv[1:])
     if argv and argv[0] == "user":
         from src.user_commands import user_command
-        return user_command(Path(__file__).resolve().parent, argv[1:])
+        try:
+            return user_command(_resolve_base(), argv[1:])
+        except (UpdateError, OSError) as exc:
+            print(f"ユーザー設定を開けません: {exc}", file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(prog="att", description="大学の出席画面を確認・登録します。")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("room", nargs="?", help="教室番号（例: 642、731、7301）。省略時は入力します。")
@@ -128,13 +141,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     parser.epilog = "更新内容: att update --notes ／ 更新: att update ／ 更新前の版に戻す: att update --rollback"
     args = parser.parse_args(argv)
-    base = Path(__file__).resolve().parent
     if args.demo and not args.ui:
         parser.error("--demo は --ui と一緒に指定してください。")
     if args.scheduled and args.user:
         parser.error("自動実行は既定ユーザーを使います。att user use で変更してください。")
     if (args.demo or args.ui) and args.scheduled:
         parser.error("画面モードと自動実行は同時に指定できません。")
+    try:
+        base = _resolve_base(initialize=not args.demo)
+    except (UpdateError, OSError) as exc:
+        print(f"設定フォルダを準備できません: {exc}", file=sys.stderr)
+        return 1
     if args.ui:
         from src.terminal_ui import launch_ui
         return launch_ui(base, args.room, args.demo, args.check, args.user)

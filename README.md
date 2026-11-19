@@ -15,6 +15,16 @@ GUIはターミナル内で動作します。幅62文字・高さ24行以上が�
 
 ### ダウンロード・初回セットアップ
 
+#### 方法1: Homebrew で 1 コマンド導入（macOS 推奨）
+
+```sh
+brew install HR0101/tap/attendance
+```
+
+仮想環境・Python 依存ライブラリ・Playwright（Chromium）・`att` コマンドまで一度に導入されます。設定ファイル・予定・ログ・ブラウザデータはアプリ本体（Cellar）から分離され、既定で `~/AttendanceSystem`（環境変数 `ATTENDANCE_HOME` で変更可）に保存されます。なお、以前に `install.sh` で `~/.local/bin/att`・`~/.local/bin/attendance` を作成している場合は、既存の個人設定が先に見つからないよう PATH の競合を避けるためリンク削除（`rm -f ~/.local/bin/att ~/.local/bin/attendance`）を行ってください。
+
+#### 方法2: git clone または GitHub の ZIP で導入
+
 Python 3.10以降を用意し、次のコマンドで取得・セットアップします。
 
 ```sh
@@ -25,7 +35,7 @@ bash install.sh
 
 ZIPで取得する場合は、[GitHubリポジトリ](https://github.com/HR0101/AttendanceSystem)の「Code → Download ZIP」からダウンロード・展開し、フォルダ内の [install.command](install.command) をダブルクリックしてください。展開したフォルダで `bash install.sh` を実行する方法も使えます。
 
-セットアップは仮想環境・依存ライブラリ・Chromiumを導入し、初回のみ `config.json` を作成します。`att` コマンドの登録とPATH設定も自動で行うため、エイリアスやPATHを手動で設定する必要はありません。管理者権限は不要で、既存の設定ファイルや同名の別コマンドは上書きしません。
+`install.sh` / `install.command` によるセットアップは仮想環境・依存ライブラリ・Chromiumを導入し、初回のみ `config.json` を作成します。`att` コマンドの登録とPATH設定も自動で行うため、エイリアスやPATHを手動で設定する必要はありません。管理者権限は不要で、既存の設定ファイルや同名の別コマンドは上書きしません。
 
 ### セットアップ後の起動
 
@@ -37,11 +47,11 @@ att --ui                 # GUIを開く
 att --check 642          # 指定教室の出席状態を確認（登録しない）
 ```
 
-Finder からフォルダ内の [start.command](start.command) をダブルクリックして GUI（`--ui`）を起動することもできます。
+Finder からフォルダ内（Homebrew 導入時は `~/AttendanceSystem` 内）の [start.command](start.command) をダブルクリックして GUI（`--ui`）を起動することもできます。
 
-今のターミナルですぐ使いたい場合や `att: command not found` が出る場合は、セットアップ完了時に表示される `source` コマンドを実行してください。通常のzsh環境では `source ~/.zshrc`、bashでは `source ~/.bash_profile` です。
+今のターミナルですぐ使いたい場合や `att: command not found` が出る場合は、`install.sh` 導入時はセットアップ完了時に表示される `source` コマンド（通常のzsh環境では `source ~/.zshrc`、bashでは `source ~/.bash_profile`）、Homebrew 導入時は Homebrew の `bin`（例: `/opt/homebrew/bin`）に PATH が通っているか確認してください。
 
-セットアップは `~/.local/bin/att` にリンクを作り、zshでは `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashでは `~/.bash_profile` にPATH設定を追加します。ダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行してください。
+`install.sh` によるセットアップは `~/.local/bin/att` にリンクを作り、zshでは `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashでは `~/.bash_profile` にPATH設定を追加します。`git clone` や ZIP でダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行してください。Homebrew で導入した場合は、実行本体は Homebrew が管理し、`~/AttendanceSystem`（または `ATTENDANCE_HOME`）に設定・予定・ログを保持します。
 
 ### 詳しい操作方法
 
@@ -69,7 +79,7 @@ v0.2.8以降は、通常起動時にGitHubの正式リリースの `attendance-u
 
 更新がなければ通知を表示しません。通信失敗も出席処理を妨げずログに残し、通常は1時間後、利用制限ではサーバー指定の解除時刻以降に再確認します。GitHub APIは使わず、ETag・304によって検証済みJSONを再利用します。
 
-Git・ZIPのどちらで導入した場合も同じ仕組みです。`config.json`、`schedule.json`、Keychainのパスワード、ログ、ブラウザの保存データ、`.venv`、`.git` は保持します。自動実行（`--scheduled`）・デモ・ヘルプ・バージョン表示・ユーザーや予定の管理では更新通知の確認を行いません。他の出席処理が動いている時に `att update` を実行した場合は準備状態で待機し、その処理の終了後にもう一度 `att update` で適用します。
+Git・ZIPのどちらで導入した場合も同じ仕組みです。`config.json`、`schedule.json`、Keychainのパスワード、ログ、ブラウザの保存データ、`.venv`、`.git` は保持します。Homebrew で導入した場合はアプリ本体を Homebrew が管理するため、新版の案内には `brew upgrade attendance` を表示し、`att update` は Cellar を直接書き換えずに `brew upgrade attendance` を案内します。自動実行（`--scheduled`）・デモ・ヘルプ・バージョン表示・ユーザーや予定の管理では更新通知の確認を行いません。他の出席処理が動いている時に `att update` を実行した場合は準備状態で待機し、その処理の終了後にもう一度 `att update` で適用します。
 
 ```sh
 att update               # 今すぐ確認・取得し、他の処理がなければ適用
@@ -96,7 +106,7 @@ v0.2.3以降は、`att update` で依存パッケージが変わる更新も自�
 
 `src/version.py` の `VERSION` と同じ版の `updates/X.Y.Z.md` に「変更内容」「利用者の操作」を記載します。CIはファイルの欠落・版不一致・空欄・未記入の目印を拒否します。PRでは変更に合わせてこのファイルも作成・追記してください。既存ファイルを変更せずコードだけ変えたPRもCIで失敗します（[記載例](updates/0.2.3.md)）。
 
-`python3 scripts/check_update_notes.py` で確認し、変更をGitHubへ反映して、その版と一致する `vX.Y.Z` タグをpushしてください。`.github/workflows/release.yml` が全テストを実行し、個人設定を含まない `attendance-update.zip` と、版番号・サイズ・SHA-256・更新内容を記載した `attendance-update.json` を作成し、GitHub Artifact Attestations でビルド来歴を付与します。`secrets.RELEASE_SIGNING_KEY`（またはローカル実行時の `--signing-key` / `RELEASE_SIGNING_KEY_FILE`）が設定されている場合は ECDSA P-256 署名（JSON 内 `signature` と `attendance-update.zip.sig`）も生成します。MarkdownはGitHub Releaseの説明にも使います。アセットをドラフトに添付してから正式リリースとして公開するため、利用者はそろった配布データを取得できます。通常のコミットをpushするだけでは更新を配信しません。
+`python3 scripts/check_update_notes.py` と `python3 scripts/generate_homebrew_formula.py --check` で確認し、変更をGitHubへ反映して、その版と一致する `vX.Y.Z` タグをpushしてください。`.github/workflows/release.yml` が全テストを実行し、個人設定を含まない `attendance-update.zip`・`attendance-update.json` とタグ用 `attendance.rb`（Homebrew Formula）を作成し、GitHub Artifact Attestations でビルド来歴を付与します。`secrets.RELEASE_SIGNING_KEY`（またはローカル実行時の `--signing-key` / `RELEASE_SIGNING_KEY_FILE`）が設定されている場合は ECDSA P-256 署名（JSON 内 `signature` と `attendance-update.zip.sig`）も生成します。また `secrets.HOMEBREW_TAP_TOKEN` が設定されている場合は `HR0101/homebrew-tap` の `Formula/attendance.rb` も自動更新します。MarkdownはGitHub Releaseの説明にも使います。アセットをドラフトに添付してから正式リリースとして公開するため、利用者はそろった配布データを取得できます。通常のコミットをpushするだけでは更新を配信しません。
 
 リリース用のワークフローは、テスト（依存ライブラリを導入し、読み取り権限のみ）と公開（外部パッケージを導入せず、書き込み権限あり）を別のジョブに分けています。依存ライブラリを変更する場合は `requirements.lock` と配布用の `src/dependency_lock.py` を再生成してください（[手順](COMMANDS.md#tests)）。ロック情報はPythonのデータファイルとしてZIPに同梱します。旧版の自動更新が未知の `.lock` ファイルを拒否するため、`requirements.lock` 自体はZIPに追加しません。ビルド時に両方の内容が一致するか検証します。v0.2.2以前から最初に移行するリリースでは `requirements.txt` を変更しないでください。v0.2.3への移行後は、依存変更も `att update` で取得・適用できます。
 

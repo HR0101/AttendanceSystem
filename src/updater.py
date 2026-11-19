@@ -15,6 +15,7 @@ import os
 import platform
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -54,6 +55,90 @@ REQUIRED = ROOT_FILES | {f"src/{name}.py" for name in (
 
 class UpdateError(Exception):
     pass
+
+
+def managed_by_homebrew():
+    """Homebrew 管理下の実行かどうかを返す。"""
+    return os.environ.get("ATTENDANCE_MANAGED_BY", "").strip().lower() == "homebrew"
+
+
+def resolve_data_dir(code_dir):
+    """個人設定・ログ等の保存先ディレクトリを解決する。未指定時は code_dir を使う。"""
+    raw = os.environ.get("ATTENDANCE_HOME", "").strip()
+    if not raw:
+        return Path(code_dir)
+    expanded = Path(os.path.expanduser(raw))
+    if expanded.is_symlink():
+        raise UpdateError("ATTENDANCE_HOME にシンボリックリンクは指定できません。")
+    parent = expanded.parent.resolve()
+    target = parent / expanded.name
+    if target.is_symlink():
+        raise UpdateError("ATTENDANCE_HOME にシンボリックリンクは指定できません。")
+    if target.exists() and not target.is_dir():
+        raise UpdateError("ATTENDANCE_HOME がフォルダではありません。")
+    return target
+
+
+def resolve_executable(base):
+    """LaunchAgent や Finder ランチャーが起動する att コマンドパスを返す。"""
+    raw = os.environ.get("ATTENDANCE_EXECUTABLE", "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw))
+    return Path(base) / "att"
+
+
+def _write_exclusive_file(path, data, mode):
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, mode)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        os.chmod(path, mode)
+        return True
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def ensure_user_workspace(data_dir, code_dir):
+    """分離された個人設定フォルダ（例: ~/AttendanceSystem）を初回のみ安全に準備する。"""
+    data_dir = Path(data_dir)
+    code_dir = Path(code_dir)
+    if data_dir == code_dir:
+        return
+    if data_dir.is_symlink():
+        raise UpdateError("ATTENDANCE_HOME にシンボリックリンクは指定できません。")
+    if data_dir.exists() and not data_dir.is_dir():
+        raise UpdateError("ATTENDANCE_HOME がフォルダではありません。")
+    data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if data_dir.is_symlink():
+        raise UpdateError("ATTENDANCE_HOME にシンボリックリンクは指定できません。")
+
+    config_path = data_dir / "config.json"
+    example_path = code_dir / "config.example.json"
+    if not config_path.exists() and not config_path.is_symlink() and example_path.is_file():
+        _write_exclusive_file(config_path, example_path.read_bytes(), 0o600)
+
+    if managed_by_homebrew():
+        launcher_path = data_dir / "start.command"
+        if not launcher_path.exists() and not launcher_path.is_symlink():
+            executable = shlex.quote(str(resolve_executable(data_dir)))
+            script = (
+                "#!/bin/bash\n"
+                "launcher_dir=$(cd \"$(dirname \"$0\")\" && pwd -P) || exit 1\n"
+                "export ATTENDANCE_HOME=\"${ATTENDANCE_HOME:-$launcher_dir}\"\n"
+                f"{executable} --ui \"$@\"\n"
+                "status=$?\n"
+                "if [ \"$status\" -ne 0 ]; then\n"
+                "  echo \"処理に失敗しました。logs フォルダを確認してください。\"\n"
+                "fi\n"
+                "read -r -p \"Enter キーで終了します。\"\n"
+                "exit \"$status\"\n"
+            ).encode("utf-8")
+            _write_exclusive_file(launcher_path, script, 0o755)
 
 
 def header_value(headers, name):
@@ -701,9 +786,10 @@ def available_message(manifest):
     from .version import VERSION
     if version_tuple(manifest["version"]) <= version_tuple(VERSION):
         return None
+    apply_cmd = "brew upgrade attendance" if managed_by_homebrew() else "att update"
     return (f"アップデートがあります: v{manifest['version']}（現在 {VERSION}）\n"
             "  更新内容を確認: att update --notes\n"
-            "  アップデートする: att update")
+            f"  アップデートする: {apply_cmd}")
 
 
 def cached_manifest(base):
@@ -1057,6 +1143,12 @@ def update_command(base, argv):
     if args.notes:
         show_update_notes(base)
         return 0
+    if managed_by_homebrew():
+        if args.rollback:
+            raise UpdateError("Homebrew で導入されているため、att update --rollback は利用できません。必要に応じて brew の手順をご確認ください。")
+        print("Homebrew で管理されています。更新するには次のコマンドを実行してください:")
+        print("  brew upgrade attendance")
+        return 0
     if args.rollback:
         if not (base / ".updates/backup/journal.json").is_file():
             raise UpdateError("復元できる更新前の版がありません。")
@@ -1133,39 +1225,50 @@ def scheduled_failure_message(exc):
 
 def run_application(base, argv=None, *, use_runtime=False):
     argv = sys.argv[1:] if argv is None else argv
-    updates = base / ".updates"
+    code_dir = Path(base)
+    log_target = code_dir
     scheduled = "--scheduled" in argv
+    homebrew = managed_by_homebrew()
     automatic = (not os.environ.get("ATTENDANCE_NO_UPDATE") and not scheduled
                  and "--demo" not in argv and "--help" not in argv and "-h" not in argv
                  and "--version" not in argv
                  and (not argv or argv[0] not in {"update", "user", "schedule"}))
-    manual_update = bool(argv and argv[0] == "update" and not any(flag in argv for flag in ("--help", "-h", "--notes")))
+    manual_update = bool(not homebrew and argv and argv[0] == "update"
+                         and not any(flag in argv for flag in ("--help", "-h", "--notes")))
+    no_workspace = any(flag in argv for flag in ("--help", "-h", "--version", "--demo"))
     try:
+        data_base = resolve_data_dir(code_dir)
+        log_target = data_base
+        if homebrew and no_workspace:
+            return importlib.import_module("main").main(argv)
+        ensure_user_workspace(data_base, code_dir)
+        updates = data_base / ".updates"
         with file_lock(updates / "runtime.lock") as runtime:
-            if (updates / "transaction/journal.json").exists():
-                fcntl.flock(runtime, fcntl.LOCK_UN)
-                fcntl.flock(runtime, fcntl.LOCK_EX)
-                recover(base)
-                fcntl.flock(runtime, fcntl.LOCK_SH)
-            if use_runtime:
-                activate_runtime(base, argv, runtime)
+            if not homebrew:
+                if (updates / "transaction/journal.json").exists():
+                    fcntl.flock(runtime, fcntl.LOCK_UN)
+                    fcntl.flock(runtime, fcntl.LOCK_EX)
+                    recover(code_dir)
+                    fcntl.flock(runtime, fcntl.LOCK_SH)
+                if use_runtime:
+                    activate_runtime(code_dir, argv, runtime)
             shown_message = None
             if automatic:
                 if "--ui" not in argv:
-                    shown_message = cached_update_message(base)
+                    shown_message = cached_update_message(data_base)
                     if shown_message:
                         print(shown_message, file=sys.stderr)
-                start_update_check(base)
+                start_update_check(data_base)
             code = 1
             try:
                 if argv and argv[0] == "update":
-                    code = update_command(base, argv[1:])
+                    code = update_command(data_base, argv[1:])
                 else:
                     code = importlib.import_module("main").main(argv)
             finally:
                 if automatic and "--ui" not in argv:
                     # 入力中の端末へワーカーから割り込まず、完了済みの新情報だけを案内する。
-                    message = cached_update_message(base)
+                    message = cached_update_message(data_base)
                     if message and message != shown_message:
                         print(message, file=sys.stderr)
                 # 明示的な更新が成功した時だけ、他の実行がなければ適用する。
@@ -1180,7 +1283,7 @@ def run_application(base, argv=None, *, use_runtime=False):
                                 code = 1
                     else:
                         try:
-                            message = finish_update(base)
+                            message = finish_update(code_dir)
                             if message:
                                 print(message, file=sys.stderr)
                         except Exception as exc:
@@ -1194,7 +1297,7 @@ def run_application(base, argv=None, *, use_runtime=False):
         message = update_failure_message(exc)
         print(message, file=sys.stderr)
         if scheduled:
-            log_scheduled_failure(base, type(exc).__name__, message)
+            log_scheduled_failure(log_target, type(exc).__name__, message)
         return 1
     except Exception as exc:
         if not scheduled and not isinstance(exc, ModuleNotFoundError):
@@ -1202,7 +1305,7 @@ def run_application(base, argv=None, *, use_runtime=False):
         message = scheduled_failure_message(exc)
         print(message, file=sys.stderr)
         if scheduled:
-            log_scheduled_failure(base, type(exc).__name__, message)
+            log_scheduled_failure(log_target, type(exc).__name__, message)
         return 1
 
 

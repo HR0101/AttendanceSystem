@@ -8,6 +8,16 @@
 
 ## 初回セットアップ
 
+### Homebrew（1コマンド導入）
+
+```sh
+brew install HR0101/tap/attendance
+```
+
+個人設定（`config.json`・`schedule.json`・`logs/`・`browser_data/`・`start.command`）は既定で `~/AttendanceSystem`（または環境変数 `ATTENDANCE_HOME`）に保存されます。
+
+### git clone / ZIP
+
 ```sh
 git clone https://github.com/HR0101/AttendanceSystem.git
 cd AttendanceSystem
@@ -16,16 +26,16 @@ bash install.sh
 
 Python 3.10以降が必要です。ZIPで取得した場合は、展開したフォルダで `bash install.sh` を実行するか、`install.command` をダブルクリックしてください。
 
-セットアップは仮想環境・依存ライブラリ・Chromiumを準備し、初回のみ `config.json` を作ります。`~/.local/bin/att` にリンクを作り、zshなら `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashなら `~/.bash_profile` にPATH設定を追加します。管理者権限は不要です。既存の設定ファイルを保持し、同名の別コマンドは上書きしません。
+`install.sh` によるセットアップは仮想環境・依存ライブラリ・Chromiumを準備し、初回のみ `config.json` を作ります。`~/.local/bin/att` にリンクを作り、zshなら `~/.zshrc`（`ZDOTDIR` 設定時はその配下）、bashなら `~/.bash_profile` にPATH設定を追加します。管理者権限は不要です。既存の設定ファイルを保持し、同名の別コマンドは上書きしません。
 
-完了後は新しいターミナルを開いて実行します。今のターミナルですぐ使う場合は、セットアップ完了時に表示される `source` コマンドを実行してください。
+完了後は新しいターミナルを開いて実行します。今のターミナルですぐ使う場合は、セットアップ完了時に表示される `source` コマンドを実行してください（Homebrew 導入時は Homebrew の `bin` に PATH が通っていればそのまま使えます）。
 
 ```sh
 att user add             # 自分の認証情報を登録
 att --ui                 # GUIを開く
 ```
 
-ダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行します。
+`git clone` / ZIP でダウンロードしたフォルダは削除・移動せず保管してください。移動する場合は `~/.local/bin/att` のリンクだけを削除し、移動先で `bash install.sh` を再実行します。Homebrew 導入時は本体を Homebrew が管理し、`~/AttendanceSystem`（または `ATTENDANCE_HOME`）に設定とログを保持します。
 
 <a id="update"></a>
 
@@ -34,10 +44,11 @@ att --ui                 # GUIを開く
 通常起動では正式リリースの更新情報だけをバックグラウンドで確認し、新しい版がある時にコマンドを案内します。成功した情報は原則24時間再利用し、通信を待たずに出席操作を開始できます。UIでは画面内に通知し、起動後に確認が完了した場合も反映します。CLIでは入力中に通知を割り込ませず、保存済みの情報を起動時、新情報を取得できた場合は終了時に案内します。終了時も通信の完了を待ちません。手動の `att update` と `att update --notes` はその時点の情報を取得します。更新がない時は通知を表示しません。ユーザー・認証情報・授業予定は保持します。
 
 ```sh
-att update               # 手動で最新の正式リリースへ更新
+att update               # 手動で最新の正式リリースへ更新（Homebrew導入時は案内を表示）
 att update --notes       # 更新内容を表示（取得・適用なし）
 att --version            # バージョンを表示
 att update --rollback    # 直前の更新前の版へ戻す
+brew upgrade attendance  # Homebrew で導入した場合のアップデート
 ATTENDANCE_NO_UPDATE=1 att --ui  # 更新の確認・通知を止めて起動
 ```
 
@@ -221,6 +232,7 @@ chmod 600 schedule.json               # 本人だけが読み書きできるよ�
 
 ```sh
 python3 scripts/check_update_notes.py
+python3 scripts/generate_homebrew_formula.py --check
 .venv/bin/python -m unittest discover -s tests
 ```
 
