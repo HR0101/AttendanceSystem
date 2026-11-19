@@ -21,6 +21,7 @@ from .config import private_file_lock, read_private_text
 from .config import ConfigurationError, load_config
 from .credentials import CredentialError, has_stored_password
 from .room import RoomError, parse_room
+from .updater import resolve_executable
 from .users import select_user
 
 
@@ -795,7 +796,7 @@ def install_agent(base: Path, schedule: dict) -> Path:
         raise ScheduleError("有効な授業を設定してから自動実行を開始してください。")
     if _today() > schedule["active_until"]:
         raise ScheduleError("設定した授業期間は終了しています。")
-    executable = base / "att"
+    executable = resolve_executable(base)
     path = agent_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or (path.exists() and not _owned_agent(path, executable)):
@@ -812,6 +813,8 @@ def install_agent(base: Path, schedule: dict) -> Path:
         "RunAtLoad": False,
         "Umask": 0o077,
     }
+    if os.environ.get("ATTENDANCE_HOME", "").strip():
+        plist["EnvironmentVariables"] = {"ATTENDANCE_HOME": str(base)}
     data = plistlib.dumps(plist)
     previous_data = path.read_bytes() if path.exists() else None
     fd, temporary = tempfile.mkstemp(prefix=".attendance-", suffix=".plist", dir=path.parent)
@@ -843,7 +846,7 @@ def remove_agent(base: Path) -> bool:
     path = agent_path()
     if not path.exists():
         return False
-    executable = base / "att"
+    executable = resolve_executable(base)
     if not _owned_agent(path, executable):
         raise ScheduleError(_agent_conflict_message(path, executable, action="remove"))
     subprocess.run(["launchctl", "bootout", _target()], capture_output=True, check=False)
@@ -853,7 +856,7 @@ def remove_agent(base: Path) -> bool:
 
 def agent_installed(base: Path) -> bool:
     path = agent_path()
-    if not path.exists() or not _owned_agent(path, base / "att"):
+    if not path.exists() or not _owned_agent(path, resolve_executable(base)):
         return False
     return _launchctl_loaded()
 
@@ -861,7 +864,7 @@ def agent_installed(base: Path) -> bool:
 def agent_status(base: Path, *, installed: bool | None = None) -> dict:
     """LaunchAgent plist と登録パス・読み込み状態・起動時刻を調べる。"""
     path = agent_path()
-    executable = base / "att"
+    executable = resolve_executable(base)
     target = _target()
     quoted = shlex.quote(str(path))
     status = {

@@ -28,7 +28,7 @@ from .users import change_student_id_config, get_users, remove_user_config, sele
 from .text_input import TextCursor
 from .unsaved_changes import SavePrompt
 from .schedule_ui import SchedulePanel
-from .updater import available_message, cached_manifest
+from .updater import available_message, cached_manifest, managed_by_homebrew
 
 _UNSET = object()
 
@@ -1167,9 +1167,10 @@ class AttendanceScreen:
                          else "処理中… 完了までお待ちください。")
             canvas.put(5, 1, busy_hint if self.busy else "Q: 終了")
             if self.update_version:
+                update_action = "brew upgrade attendance" if managed_by_homebrew() else "att update"
                 canvas.put(7, 1, prefix_text("update", f"更新あり: v{self.update_version}"), curses.A_BOLD)
                 canvas.put(8, 1, "内容: att update --notes")
-                canvas.put(9, 1, "適用: att update")
+                canvas.put(9, 1, f"適用: {update_action}")
             if self.save_prompt.active:
                 canvas.put(11 if self.update_version else 7, 1, prefix_text("warning", "未保存の変更があります。画面を広げてください。"), curses.A_BOLD)
             screen.refresh()
@@ -1180,8 +1181,9 @@ class AttendanceScreen:
         left = (width - total) // 2
         main_width = total - 32 if wide else total
         if self.update_version:
+            update_action = "brew upgrade attendance" if managed_by_homebrew() else "att update"
             canvas.put(0, left, prefix_text("update", f"アップデートがあります: v{self.update_version}"), canvas.color(4) | curses.A_BOLD, total)
-            canvas.put(4, left, "内容: att update --notes / 適用: att update", canvas.color(4), total)
+            canvas.put(4, left, f"内容: att update --notes / 適用: {update_action}", canvas.color(4), total)
         name = self.config.get("_active_username", self.student_id)
         default = select_user(self.config)
         is_default = default and default["student_id"] == self.student_id
