@@ -48,20 +48,58 @@ jobs:
           else
             python3 scripts/build_release.py "$RELEASE_TAG"
           fi
+      - name: Generate Homebrew formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          TARBALL_URL="https://github.com/${REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+          TARBALL_PATH="/tmp/attendance-source-${RELEASE_TAG}.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 2 "$TARBALL_URL" -o "$TARBALL_PATH"
+          TARBALL_SHA256="$(shasum -a 256 "$TARBALL_PATH" | awk '{print $1}')"
+          python3 scripts/generate_homebrew_formula.py \
+            --tag "$RELEASE_TAG" \
+            --sha256 "$TARBALL_SHA256" \
+            --output dist/attendance.rb
+          ruby -c dist/attendance.rb
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/attendance-update.zip
             dist/attendance-update.json
+            dist/attendance.rb
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          assets=(dist/attendance-update.zip dist/attendance-update.json)
+          assets=(dist/attendance-update.zip dist/attendance-update.json dist/attendance.rb)
           if [ -f dist/attendance-update.zip.sig ]; then
             assets+=(dist/attendance-update.zip.sig)
           fi
           gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --notes-file "updates/${RELEASE_TAG#v}.md" --draft
           gh release edit "$RELEASE_TAG" --draft=false --latest
+      - name: Update Homebrew tap (optional)
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping automatic tap update."
+            exit 0
+          fi
+          rm -rf /tmp/homebrew-tap
+          gh repo clone "$TAP_REPO" /tmp/homebrew-tap
+          mkdir -p /tmp/homebrew-tap/Formula
+          cp dist/attendance.rb /tmp/homebrew-tap/Formula/attendance.rb
+          git -C /tmp/homebrew-tap config user.name "github-actions[bot]"
+          git -C /tmp/homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C /tmp/homebrew-tap add Formula/attendance.rb
+          if git -C /tmp/homebrew-tap diff --cached --quiet; then
+            echo "Formula/attendance.rb already up to date."
+            exit 0
+          fi
+          git -C /tmp/homebrew-tap commit -m "Update attendance to ${RELEASE_TAG}"
+          git -C /tmp/homebrew-tap push origin HEAD
