@@ -4,7 +4,7 @@
 class Attendance < Formula
   desc "University attendance confirmation and registration CLI/TUI for macOS"
   homepage "https://github.com/HR0101/AttendanceSystem"
-  version "0.3.1"
+  version "0.3.2"
   license "MIT"
   head "https://github.com/HR0101/AttendanceSystem.git", branch: "main"
 
@@ -42,8 +42,14 @@ class Attendance < Formula
   end
 
   resource "playwright" do
-    url "https://files.pythonhosted.org/packages/44/fa/468f313a56d33a6420705147c8d47bef558f087856edf38c5b13eef8aa6c/playwright-1.64.1-py3-none-macosx_11_0_universal2.whl", using: :nounzip
-    sha256 "6a6f99adad1ae40e6ee62efe89785db861ce7ddd57651521cb31894183cc4ae3"
+    on_arm do
+      url "https://files.pythonhosted.org/packages/72/4f/572bbbe60a5787ca61a84bad934c3ce19c08c2bc9c0e9781bf0d99cad1a6/playwright-1.64.1-py3-none-macosx_11_0_arm64.whl", using: :nounzip
+      sha256 "59f7b041284ce8d1b72098ae50ca48a2d83692eec25154ab5ba79d4b6b4fe8a9"
+    end
+    on_intel do
+      url "https://files.pythonhosted.org/packages/8d/c8/cc677856d89a0c077673b40ab915ed5597bf1347b205cabe70121c431ca9/playwright-1.64.1-py3-none-macosx_10_13_x86_64.whl", using: :nounzip
+      sha256 "29453ff76e25c17d0b45658cacd6b92e9eec46e8db21e134fb3b7143df50f013"
+    end
   end
 
   resource "pyee" do
