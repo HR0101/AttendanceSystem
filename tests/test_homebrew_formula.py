@@ -91,6 +91,8 @@ class HomebrewFormulaTests(unittest.TestCase):
         self.assertIn("dist/attendance.rb", workflow)
         self.assertIn("HOMEBREW_TAP_TOKEN", workflow)
         self.assertIn("homebrew-tap", workflow)
+        # clone 時の認証は push に引き継がれないため，push でも gh の credential helper を使う
+        self.assertIn('credential.helper=!gh auth git-credential" push origin HEAD', workflow)
 
 
 if __name__ == "__main__":

@@ -102,4 +102,5 @@ jobs:
             exit 0
           fi
           git -C /tmp/homebrew-tap commit -m "Update attendance to ${RELEASE_TAG}"
-          git -C /tmp/homebrew-tap push origin HEAD
+          # gh repo clone の認証は clone にしか効かないため、push でも gh の credential helper を明示する。
+          git -C /tmp/homebrew-tap -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin HEAD
