@@ -30,6 +30,29 @@ class HomebrewFormulaTests(unittest.TestCase):
         self.assertIn("using: :nounzip", formula)
         self.assertNotIn("0o", formula)
 
+    def test_playwright_wheels_are_native_per_architecture(self):
+        # universal2 wheel は同梱 node が x86_64 のみのため Apple Silicon で Rosetta 2 が必要になる
+        playwright_specs = [spec for spec in gen.MACOS_WHEEL_SPECS if spec[0] == "playwright"]
+        arches = {spec[4]: spec[2] for spec in playwright_specs}
+        self.assertEqual(set(arches), {gen.ARCH_ARM, gen.ARCH_INTEL})
+        self.assertTrue(arches[gen.ARCH_ARM].endswith("_arm64.whl"))
+        self.assertTrue(arches[gen.ARCH_INTEL].endswith("_x86_64.whl"))
+
+        formula = (ROOT / "Formula/attendance.rb").read_text(encoding="utf-8")
+        self.assertNotIn("playwright-1.64.1-py3-none-macosx_11_0_universal2.whl", formula)
+        self.assertIn('  resource "playwright" do\n    on_arm do\n', formula)
+        self.assertIn("    on_intel do\n", formula)
+
+    def test_verify_wheels_rejects_unknown_architecture(self):
+        original = gen.MACOS_WHEEL_SPECS
+        broken = tuple((*spec[:4], "riscv") if spec[0] == "playwright" else spec for spec in original)
+        gen.MACOS_WHEEL_SPECS = broken
+        try:
+            with self.assertRaises(ValueError):
+                gen.verify_wheels_against_lock(ROOT)
+        finally:
+            gen.MACOS_WHEEL_SPECS = original
+
     def test_render_formula_with_release_tag_and_sha256(self):
         digest = "a" * 64
         rendered = gen.render_formula(ROOT, tag=f"v{VERSION}", tarball_sha256=digest)
@@ -68,6 +91,8 @@ class HomebrewFormulaTests(unittest.TestCase):
         self.assertIn("dist/attendance.rb", workflow)
         self.assertIn("HOMEBREW_TAP_TOKEN", workflow)
         self.assertIn("homebrew-tap", workflow)
+        # clone 時の認証は push に引き継がれないため，push でも gh の credential helper を使う
+        self.assertIn('credential.helper=!gh auth git-credential" push origin HEAD', workflow)
 
 
 if __name__ == "__main__":
