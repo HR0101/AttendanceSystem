@@ -8,7 +8,7 @@ from datetime import date
 from contextlib import nullcontext
 
 from .config import ConfigurationError, load_config, private_file_lock
-from .room import RoomError, parse_room
+from .room import RoomError, normalize_room_digits, parse_room
 from .scheduler import (
     WEEKDAYS, ScheduleError, agent_installed, calendar_intervals, install_agent,
     load_schedule, next_scheduled_run, registration_time, remove_agent, save_schedule,
@@ -545,12 +545,12 @@ class SchedulePanel:
                         return "同じ曜日・開始時刻に複数の授業は設定できません。"
             return None
         if index == 3:
-            if not stripped:
-                return None if (allow_empty and raw == "") else "QR番号は半角数字3桁で入力してください（例: 642、731）。"
+            if allow_empty and raw == "":
+                return None
             try:
                 parse_room(stripped)
-            except RoomError:
-                return "QR番号は半角数字3桁で入力してください（例: 642、731）。"
+            except RoomError as exc:
+                return str(exc)
             return None
         if index == 4:
             if stripped:
@@ -683,6 +683,8 @@ class SchedulePanel:
             else:
                 if len(self.editors) != len(self.fields):
                     self.editors = [TextCursor(value) for value in self.fields]
+                if self.mode in ("add", "edit") and self.field_index == 3 and isinstance(key, str):
+                    key = normalize_room_digits(key)
                 self.fields[self.field_index] = self.editors[self.field_index].edit(self.fields[self.field_index], key, limit=1000)
             return
         if key in (curses.KEY_UP, curses.KEY_DOWN) and courses:

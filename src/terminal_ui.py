@@ -20,7 +20,7 @@ from pathlib import Path
 from .config import ConfigurationError, load_config
 from .credentials import CredentialError, get_credentials
 from .logging_utils import setup_logging
-from .room import RoomError, parse_room
+from .room import RoomError, normalize_room_digits, parse_room
 from .scheduler import agent_installed
 from .verification import AttendanceError
 from .terminal_layout import Canvas, fit_text, init_colors, no_color_enabled, prefix_text, text_width, wrap_text
@@ -1698,8 +1698,8 @@ class AttendanceScreen:
                 else:
                     self.start()
             elif self.selected == 0:
-                if isinstance(key, str) and key and all(char in "0123456789０１２３４５６７８９" for char in key):
-                    key = unicodedata.normalize("NFKC", key)
+                if isinstance(key, str):
+                    key = normalize_room_digits(key)
                 edited = self.room_editor.edit(self.room, key, limit=4, accepts=lambda value: value.isascii() and value.isdecimal())
                 if edited != self.room:
                     self.room = edited
