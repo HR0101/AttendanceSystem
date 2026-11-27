@@ -369,7 +369,7 @@ class FieldValidationTests(unittest.TestCase):
         # 3("73") -> 4: QR番号の案内
         panel.handle(curses.KEY_DOWN)
         self.assertEqual(panel.field_index, 4)
-        self.assertIn("半角数字3桁", panel.message)
+        self.assertIn("半角・全角可", panel.message)
         self.assertEqual(panel.fields[3], "73")
 
         # 4("9:05") -> 5: 登録時刻の案内
@@ -402,7 +402,7 @@ class FieldValidationTests(unittest.TestCase):
             (1, "mon～sun", "月"),
             (2, "HH:MM", "14:00"),  # DATA の mon 14:00 と重複する時刻を入れてみる
             (2, "同じ曜日・開始時刻", "15:00"),
-            (3, "半角数字3桁", "642"),
+            (3, "半角・全角可", "642"),
             (4, "HH:MM", "15:10"),
             (5, "登録時刻以降", "15:20"),
         ]

@@ -65,19 +65,29 @@ class SchedulePanelTests(unittest.TestCase):
     def test_add_edit_disable_delete_from_form(self):
         with patch("src.schedule_ui.agent_installed", return_value=False):
             self.panel.handle("a")
-            self.panel.fields = ["追加授業", "火曜日", "11:00", "642", "11:03", "11:10"]
+            self.panel.fields = ["追加授業", "火曜日", "11:00", "", "11:03", "11:10"]
+            self.panel.field_index = 3
+            for digit in "６4２":
+                self.ui.handle_modal(digit)
+            self.assertEqual(self.panel.fields[3], "642")
             self.panel.field_index = 5
             self.ui.handle_modal("\n")
             self.ui.poll()
             self.assertEqual(load_schedule(self.path)["courses"][1]["weekday"], "tue")
+            self.assertEqual(load_schedule(self.path)["courses"][1]["room"], "642")
             self.assertEqual(load_schedule(self.path)["courses"][1]["register_time"], "11:03")
             self.assertEqual(load_schedule(self.path)["courses"][1]["register_until"], "11:10")
             self.panel.handle(curses.KEY_DOWN)
             self.panel.handle("\n")
-            self.panel.fields[3] = "611"
+            self.panel.field_index = 3
+            self.ui.handle_modal("\x15")
+            for digit in "７４０１":
+                self.ui.handle_modal(digit)
+            self.assertEqual(self.panel.fields[3], "7401")
             self.panel.submit()
             self.ui.poll()
-            self.assertEqual(load_schedule(self.path)["courses"][1]["room"], "611")
+            course = load_schedule(self.path)["courses"][1]
+            self.assertEqual((course["room"], course["route"]), ("741", "7401"))
             self.panel.handle("t")
             self.ui.poll()
             self.assertFalse(load_schedule(self.path)["courses"][1]["enabled"])
