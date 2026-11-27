@@ -48,7 +48,11 @@ class VersionBumpPolicyTests(unittest.TestCase):
         self._write_state("0.3.3")
         self.git("init", "-q")
         self.base = self.commit("Initial v0.3.3")
-        self.git("tag", "-a", "v0.3.3", "-m", "Release v0.3.3")
+        self.git(
+            "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid",
+            "tag", "-a", "v0.3.3", "-m", "Release v0.3.3",
+        )
 
     def _write_state(self, version: str, *, formula_version: str | None = None, write_notes: bool = True):
         (self.root / "src/version.py").write_text(f'VERSION = "{version}"\n', encoding="utf-8")
