@@ -231,6 +231,7 @@ chmod 600 schedule.json               # 本人だけが読み書きできるよ�
 ## 開発用テスト
 
 ```sh
+python3 scripts/check_version_bump.py
 python3 scripts/check_update_notes.py
 python3 scripts/generate_homebrew_formula.py --check
 .venv/bin/python -m unittest discover -s tests

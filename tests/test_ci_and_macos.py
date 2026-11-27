@@ -21,6 +21,7 @@ from src import credentials, dependencies, scheduler, updater
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/tests.yml"
 RELEASE_WORKFLOW_PATH = ROOT / ".github/workflows/release.yml"
+PR_VERSION_BOT_WORKFLOW_PATH = ROOT / ".github/workflows/pr-version-bot.yml"
 GITLEAKS_CONFIG_PATH = ROOT / ".gitleaks.toml"
 SHA_REF_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 
@@ -165,9 +166,11 @@ class WorkflowAndSecretsConfigTests(unittest.TestCase):
 
         runs = [step.get("run", "") for step in test_job["steps"] if "run" in step]
         names = [step.get("name", "") for step in test_job["steps"]]
+        self.assertIn("Validate version bump", names)
         self.assertIn("Validate update notes", names)
         self.assertIn("Verify dependency lock sync", names)
         self.assertIn("Audit dependencies", names)
+        self.assertIn("python scripts/check_version_bump.py --ci", runs)
         self.assertIn("python scripts/check_update_notes.py --ci", runs)
         self.assertTrue(any("python -m pip install" in run and all(flag in run for flag in ("--require-hashes", "--only-binary=:all:", "-r requirements.lock")) for run in runs))
         self.assertIn("python -m playwright install --with-deps chromium", runs)
@@ -188,8 +191,10 @@ class WorkflowAndSecretsConfigTests(unittest.TestCase):
 
         names = [step.get("name", "") for step in steps]
         runs = [step.get("run", "") for step in steps if "run" in step]
+        self.assertIn("Validate version bump", names)
         self.assertIn("Validate update notes", names)
         self.assertIn("Verify dependency lock sync", names)
+        self.assertIn("python scripts/check_version_bump.py --ci", runs)
         self.assertIn("python scripts/check_update_notes.py --ci", runs)
         self.assertTrue(any("python -m pip install" in run and all(flag in run for flag in ("--require-hashes", "--only-binary=:all:", "-r requirements.lock")) for run in runs))
         self.assertIn("python -m playwright install chromium", runs)
@@ -210,7 +215,7 @@ class WorkflowAndSecretsConfigTests(unittest.TestCase):
         self.assertEqual(steps[1]["env"]["GITLEAKS_CONFIG"], ".gitleaks.toml")
 
     def test_all_third_party_actions_are_sha_pinned(self):
-        for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH, PR_VERSION_BOT_WORKFLOW_PATH):
             workflow = load_workflow(path)
             for job_id, job in workflow["jobs"].items():
                 for step in job.get("steps", []):
@@ -218,6 +223,24 @@ class WorkflowAndSecretsConfigTests(unittest.TestCase):
                     if uses and not uses.startswith("./"):
                         with self.subTest(workflow=path.name, job=job_id, uses=uses):
                             self.assertRegex(uses, SHA_REF_PATTERN)
+
+    def test_pr_version_bot_workflow_is_secure_and_complete(self):
+        workflow = load_workflow(PR_VERSION_BOT_WORKFLOW_PATH)
+        self.assertEqual(set(workflow["on"]), {"pull_request"})
+        self.assertNotIn("pull_request_target", workflow["on"])
+        self.assertEqual(workflow["permissions"], {"contents": "read", "pull-requests": "write"})
+
+        bot_job = workflow["jobs"]["version-bot"]
+        self.assertEqual(bot_job["runs-on"], "ubuntu-latest")
+        steps = bot_job["steps"]
+        self.assertEqual(steps[0]["uses"], "actions/checkout@11d5960a326750d5838078e36cf38b85af677262")
+        self.assertEqual(steps[0]["with"], {"persist-credentials": False, "fetch-depth": 0})
+        self.assertEqual(steps[1]["uses"], "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065")
+        self.assertEqual(steps[1]["with"], {"python-version": "3.11"})
+
+        runs = [step.get("run", "") for step in steps if "run" in step]
+        self.assertTrue(any("python scripts/check_version_bump.py --ci --include-notes" in run for run in runs))
+        self.assertIn("python scripts/post_pr_version_comment.py", runs)
 
     def test_gitleaks_config_allowlists_only_synthetic_http_test_fixture(self):
         config = tomllib.loads(GITLEAKS_CONFIG_PATH.read_text(encoding="utf-8"))
